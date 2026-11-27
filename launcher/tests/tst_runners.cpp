@@ -63,6 +63,7 @@ private slots:
     void moveCopiesAcrossDrives();
     void rebuildThere();
     void closingDuringARebuildKeepsTheOldLocation();
+    void closingAfterTheSettingsAreGoneHasNothingToRollBack();
     void refusesWhileBusy();
     void runnersFolderKeepsInstalledRunners();
     void freeSpaceWarning();
@@ -703,6 +704,27 @@ void TestRunners::closingDuringARebuildKeepsTheOldLocation()
     QCOMPARE(Runners::find(id)->dataDir(), QDir(Paths::runnersDir()).filePath(id));
     QCOMPARE(m.status(id).state, RunnerManager::State::Installed);
     QVERIFY(m.isRunnable(id));
+    resetLocations();
+}
+
+/// The destructor rolls a move-and-rebuild back through the settings. `Services` owns both and today
+/// declares the settings first, but nothing in either class requires that: with the settings destroyed
+/// first the manager must find nothing to roll back rather than reach into a dead object.
+void TestRunners::closingAfterTheSettingsAreGoneHasNothingToRollBack()
+{
+    if (!m_haveGit)
+        QSKIP("git is not installed");
+    QTemporaryDir dir;
+    const QString id = QStringLiteral("victory-dexnom");
+    const QString elsewhere = dir.filePath(QStringLiteral("I"));
+    auto* settings = new AppSettings(dir.filePath(QStringLiteral("settings.ini")));
+    auto* manager = new RunnerManager;
+    manager->setSettings(settings);
+    ensureBuilt(*manager, id);
+    QString error;
+    QVERIFY2(manager->relocate(id, elsewhere, RunnerManager::Relocation::Rebuild, &error), qPrintable(error));
+    delete settings;
+    delete manager;
     resetLocations();
 }
 
