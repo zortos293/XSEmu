@@ -134,9 +134,11 @@ public:
     bool overlayDefault() const;
     void setOverlayDefault(bool on);
 
+    // A personal SteamGridDB key (advanced, empty by default): art then comes from SteamGridDB
+    // directly instead of through XSEmu's proxy.
     QString steamGridDbKey() const;
     void setSteamGridDbKey(const QString& key);
-    bool artLookups() const; // the user's switch for cover lookups (on; nothing happens without a key)
+    bool artLookups() const; // on by default: the launcher downloads game art from SteamGridDB
     void setArtLookups(bool on);
 
     // The in-game bar while the game plays in a window: always shown (false, the default) or

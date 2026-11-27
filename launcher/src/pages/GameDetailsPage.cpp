@@ -1,5 +1,6 @@
 #include "GameDetailsPage.h"
 
+#include "ArtworkCard.h"
 #include "ImportSettingsDialog.h"
 #include "RunProfileEditor.h"
 #include "RunsWithPicker.h"
@@ -96,11 +97,12 @@ public:
     Button* findArt() const { return m_findArt; }
     std::function<void()> onBack;
 
-    void set(const QString& title, const QString& meta, const QPixmap& cover, const QPixmap& hero, bool canFindArt)
+    void set(const QString& title, const QString& meta, const QPixmap& cover, const QPixmap& hero, const QPixmap& logo, bool canFindArt)
     {
         m_title = title;
         m_meta = meta;
         m_hero = hero;
+        m_logo = logo;
         m_cover->setCover(cover, title);
         m_findArt->setVisible(hero.isNull() && canFindArt);
         layoutChildren();
@@ -163,11 +165,17 @@ protected:
 
         const qreal x = 32 + 96 + 20;
         const qreal textW = r.width() - x - 32;
-        const QFont tf = Theme::font(28, 600, -0.02);
-        p.setFont(tf);
-        p.setPen(art ? QColor(Qt::white) : c.text);
-        p.drawText(QRectF(x, r.height() - 24 - 4 - 16 - 6 - 34, textW, 34), Qt::AlignLeft | Qt::AlignVCenter,
-                   QFontMetrics(tf).elidedText(m_title, Qt::ElideRight, int(textW)));
+        const QRectF titleRect(x, r.height() - 24 - 4 - 16 - 6 - 34, textW, 34);
+        if (art && !m_logo.isNull()) {
+            const QRectF box(x, titleRect.bottom() - 72, qMin<qreal>(textW, 360), 72);
+            const QSizeF fit = QSizeF(m_logo.size()).scaled(box.size(), Qt::KeepAspectRatio);
+            p.drawPixmap(QRectF(box.left(), box.bottom() - fit.height(), fit.width(), fit.height()), m_logo, QRectF(m_logo.rect()));
+        } else {
+            const QFont tf = Theme::font(28, 600, -0.02);
+            p.setFont(tf);
+            p.setPen(art ? QColor(Qt::white) : c.text);
+            p.drawText(titleRect, Qt::AlignLeft | Qt::AlignVCenter, QFontMetrics(tf).elidedText(m_title, Qt::ElideRight, int(textW)));
+        }
         p.setFont(Theme::font(13));
         p.setPen(art ? QColor(255, 255, 255, 0xBF) : c.text2);
         p.drawText(QRectF(x, r.height() - 24 - 4 - 16, textW, 16), Qt::AlignLeft | Qt::AlignVCenter, m_meta);
@@ -187,6 +195,7 @@ private:
     QString m_title;
     QString m_meta;
     QPixmap m_hero;
+    QPixmap m_logo;
     bool m_backHover = false;
 };
 
@@ -381,6 +390,7 @@ GameDetailsPage::GameDetailsPage(Services& services, QWidget* parent)
     , m_gameCard(new InfoCard(QStringLiteral("Game")))
     , m_cacheCard(new InfoCard(QStringLiteral("Shader cache")))
     , m_runCard(new InfoCard(QStringLiteral("Last run")))
+    , m_artCard(new ArtworkCard(services))
     , m_overrides(new InfoCard(QStringLiteral("Per-game overrides")))
     , m_overridesNote(new Label({}, Label::Style::Caption, Theme::Role::Text3))
     , m_profileCard(new InfoCard(QStringLiteral("Run profile")))
@@ -424,6 +434,7 @@ GameDetailsPage::GameDetailsPage(Services& services, QWidget* parent)
     left->setSpacing(16);
     left->addWidget(m_gameCard);
     left->addWidget(m_runCard);
+    left->addWidget(m_artCard);
     left->addStretch(1);
     auto* right = new QVBoxLayout;
     right->setSpacing(16);
@@ -479,7 +490,7 @@ GameDetailsPage::GameDetailsPage(Services& services, QWidget* parent)
         openLogs->setEnabled(QFileInfo(LaunchErrors::logsFolder(m_game)).isDir());
         QAction* findArt = nullptr;
         if (m_s.covers.canLookUp())
-            findArt = menu.addAction(QStringLiteral("Find art again"));
+            findArt = menu.addAction(QStringLiteral("Refresh artwork"));
         menu.addSeparator();
         QAction* share = menu.addAction(QStringLiteral("Share settings..."));
         QAction* paste = menu.addAction(QStringLiteral("Paste settings code\tCtrl+Shift+V"));
@@ -627,7 +638,8 @@ void GameDetailsPage::refresh()
     else
         meta << QStringLiteral("Not played");
     m_hero->set(g.title(), meta.join(QStringLiteral(" · ")), m_s.art(id, CoverCache::Kind::Grid), m_s.art(id, CoverCache::Kind::Hero),
-                m_s.covers.canLookUp());
+                m_s.art(id, CoverCache::Kind::Logo), m_s.covers.canLookUp());
+    m_artCard->setGame(g);
 
     // actions and the shader state
     const QList<WarmupRun> recent = m_s.settings.recentWarmups();

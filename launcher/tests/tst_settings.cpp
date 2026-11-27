@@ -42,7 +42,7 @@ void TestSettings::defaultsFollowTheHouseRules()
     QCOMPARE(s.theme(), AppSettings::ThemeMode::System);
     QCOMPARE(s.launchNeedMb(), 0);
     QCOMPARE(s.librarySort(), QStringLiteral("recent"));
-    QVERIFY(!s.artLookups());
+    QVERIFY(s.artLookups());
     QVERIFY(s.steamGridDbKey().isEmpty());
 }
 

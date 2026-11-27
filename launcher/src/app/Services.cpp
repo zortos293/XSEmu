@@ -33,8 +33,8 @@ Services::Services(QObject* parent)
             m_art.clear();
             return;
         }
-        m_art.remove(titleId + QStringLiteral("|grid"));
-        m_art.remove(titleId + QStringLiteral("|hero"));
+        for (CoverCache::Kind kind : CoverCache::kKinds)
+            m_art.remove(titleId + QLatin1Char('|') + CoverCache::kindName(kind));
     });
     connect(&settings, &AppSettings::changed, this, [this](const QString& key) {
         if (key == QLatin1String(AppSettings::Key::Theme))
@@ -50,7 +50,7 @@ Services::Services(QObject* parent)
 
 QPixmap Services::art(const QString& titleId, CoverCache::Kind kind)
 {
-    const QString key = titleId + (kind == CoverCache::Kind::Grid ? QStringLiteral("|grid") : QStringLiteral("|hero"));
+    const QString key = titleId + QLatin1Char('|') + CoverCache::kindName(kind);
     if (const auto it = m_art.constFind(key); it != m_art.constEnd())
         return *it;
     const QString path = covers.artPath(titleId, kind);
