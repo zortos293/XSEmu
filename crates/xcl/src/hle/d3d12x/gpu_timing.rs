@@ -1455,7 +1455,29 @@ unsafe fn retry_parked() {
     }
 }
 
+thread_local! {
+    /// submissions this thread is reporting right now: XCL's own queue wrapper reports the lists a
+    /// caller hands it, so a caller that reports the same call again would arm the recording twice
+    /// and count one submission as two
+    static REPORTING: Cell<u32> = const { Cell::new(0) };
+}
+
+struct Reporting(());
+
+impl Drop for Reporting {
+    fn drop(&mut self) { REPORTING.with(|d| d.set(d.get() - 1)); }
+}
+
 pub(super) unsafe fn submit(raw: *mut c_void, lists: &[*mut c_void], f: impl FnOnce()) {
+    if !REPORTING.with(|d| d.get() > 0) {
+        REPORTING.with(|d| d.set(d.get() + 1));
+        let _reporting = Reporting(());
+        return submit_once(raw, lists, f);
+    }
+    f()
+}
+
+unsafe fn submit_once(raw: *mut c_void, lists: &[*mut c_void], f: impl FnOnce()) {
     if raw.is_null() || lists.is_empty() {
         return f();
     }
@@ -2037,9 +2059,9 @@ mod tests {
             assert!(called.get());
             before_close(raw);
             list.Close().unwrap();
-            // The queue's own wrapper reports a submission (XCL's ExecuteCommandLists goes through
-            // `submit`), so wrapping it here as well counted the same submission twice.
-            first.ExecuteCommandLists(&executable);
+            submit(first.as_raw(), &[raw], || {
+                first.ExecuteCommandLists(&executable)
+            });
             let first_id = queue_token(first.as_raw()).unwrap();
             let (fence, value) = fence_of(first_id, index);
             crate::gpu::fence::wait(&fence, value, &dev, None, 5_000).unwrap();
@@ -2049,7 +2071,9 @@ mod tests {
 
             let unblock = Unblock(gate.clone());
             replay.Wait(&gate, 1).unwrap();
-            replay.ExecuteCommandLists(&executable);
+            submit(replay.as_raw(), &[raw], || {
+                replay.ExecuteCommandLists(&executable)
+            });
             let replay_id = queue_token(replay.as_raw()).unwrap();
             let (fence, value) = fence_of(replay_id, index);
             assert_ne!(first_id, replay_id);
