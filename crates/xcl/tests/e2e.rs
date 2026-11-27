@@ -69,16 +69,41 @@ fn launcher_uses_configured_exe_in_an_ambiguous_folder() {
     .unwrap();
     std::fs::write(title.join("xcl.toml"), "exe = 'game.exe'\n").unwrap();
 
-    let output = Command::new(env!("CARGO_BIN_EXE_XSEmu"))
+    // What this test proves is the selection the run records, and that record is written as the run
+    // starts. The run itself is not waited for: a game folder that is not a PE file leaves the
+    // process up on a runner (reported separately), and waiting for it hung the job rather than
+    // failing it.
+    let mut child = Command::new(env!("CARGO_BIN_EXE_XSEmu"))
         .arg("run")
         .arg(&game)
         .env("XCL_DATA_ROOT", &data)
-        .output();
-    let boot = std::fs::read_to_string(title.join("cache").join("boot.json"));
-    std::fs::remove_dir_all(&root).unwrap();
+        .spawn()
+        .unwrap();
+    let record = title.join("cache").join("boot.json");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+    let boot = loop {
+        // Only a record that parses is a record: the writer creates the file before its contents are
+        // in it, and half of one would fail the test that this poll is here to make determinate.
+        if let Ok(text) = std::fs::read_to_string(&record) {
+            if serde_json::from_str::<serde_json::Value>(&text).is_ok() {
+                break Ok(text);
+            }
+        }
+        if let Ok(Some(status)) = child.try_wait() {
+            break Err(format!("the run exited ({status}) without writing {}", record.display()));
+        }
+        if std::time::Instant::now() > deadline {
+            break Err(format!("no {} after 120 s", record.display()));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    };
+    let _ = child.kill();
+    let _ = child.wait();
+    // The run may still hold a file of its own folder for a moment after it is killed (a child of
+    // its own, a mapped image), and cleaning up a temporary folder is not what this test asserts.
+    let _ = std::fs::remove_dir_all(&root);
 
-    let output = output.unwrap();
-    let boot = boot.unwrap_or_else(|error| panic!("boot record missing: {error}; {output:?}"));
+    let boot = boot.unwrap_or_else(|error| panic!("boot record missing: {error}"));
     let boot: serde_json::Value = serde_json::from_str(&boot).unwrap();
     let exe = Path::new(boot["exe_path"].as_str().unwrap());
     assert_eq!(exe.file_name().unwrap(), "game.exe");

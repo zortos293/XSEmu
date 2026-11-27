@@ -1779,10 +1779,47 @@ pub(super) fn keep_with(by: usize, view: usize) -> bool {
     false
 }
 
+/// (one memory) Whether the sampled texture `view`, kept with a mapped GPU-written texture on
+/// whose tiles it stands (`keep_with`), stays mapped as a placement over `va..end` retires it:
+/// that texture's memory is clear of `va..end`, and `view`'s pages are that texture's - only
+/// its own console size reaches into `va..end`. Seen: an R9G9B9E5 view at an address off the
+/// 64 KiB grid, 983040 bytes in its console layout (64KB_D), on the tiles of the R32_UINT
+/// texture there, 921600 bytes in 256B_D; the next R32_UINT texture, placed 921600 bytes on,
+/// unmapped the view and it read zero. `XCL_KEEP_TILE_VIEWS=0`: unmapped, as before.
+pub(super) fn kept_clear_of(view: usize, va: usize, end: usize) -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*ON.get_or_init(|| std::env::var("XCL_KEEP_TILE_VIEWS").map_or(true, |v| v.trim() != "0")) {
+        return false;
+    }
+    let kept = {
+        let g = PAGES.lock().unwrap();
+        g.values().flatten().find_map(|p| {
+            let v = p.targets.get(&view).filter(|v| v.sampled && v.mapped)?;
+            p.kept.of.iter().filter(|(_, views)| views.contains(&view)).find_map(|(by, _)| p.targets.get(by))
+                .filter(|t| t.mapped && t.same_tiles(v) && !(t.va < end && va < t.end()))
+                .map(|t| (v.va, v.end() - v.va, t.end() - t.va))
+        })
+    };
+    let Some((at, bytes, keeper)) = kept else { return false };
+    static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+    if n <= 8 || n.is_power_of_two() {
+        crate::xlog_info!("D3D12.X: one memory: a sampled texture at {at:#x} ({bytes} bytes in its console layout) stays mapped as the texture at {va:#x} is placed: it stands on the tiles of the GPU-written one at its address ({keeper} bytes), which that placement does not reach (XCL_KEEP_TILE_VIEWS; {n} so far)");
+    }
+    true
+}
+
 /// Whether `resource` is a texture on pages that is unmapped (`unmap_superseded`: it gave way
 /// to a placement over it).
 pub(super) fn unmapped(resource: usize) -> bool {
     PAGES.lock().unwrap().values().flatten().any(|p| p.targets.get(&resource).is_some_and(|t| !t.mapped))
+}
+
+/// (`e5_copy`) Whether the sampled texture `view` shows what the GPU writes to `target`: both
+/// mapped, tile for tile on the same pages.
+pub(super) fn shows(view: usize, target: usize) -> bool {
+    let g = PAGES.lock().unwrap();
+    g.values().flatten().any(|p| matches!((p.targets.get(&view), p.targets.get(&target)), (Some(v), Some(t)) if v.mapped && t.mapped && v.same_tiles(t)))
 }
 
 /// Bytes of tiles of mapped sampled textures that have no memory (`note_content`) – what a page
@@ -2039,6 +2076,8 @@ unsafe fn place_in_arena(dev: &ID3D12Device, desc: &D3D12_RESOURCE_DESC, p: Plac
         }
         TextureInitial::Undefined => {
             let dev10 = dev10.unwrap();
+            // a console R9G9B9E5 target made castable R11G11B10_FLOAT (`castable`)
+            let castable = super::castable::wanted(desc.Format, desc.Flags).then_some(*desc);
             let desc = D3D12_RESOURCE_DESC1 {
                 Dimension: desc.Dimension, Alignment: desc.Alignment, Width: desc.Width, Height: desc.Height,
                 DepthOrArraySize: desc.DepthOrArraySize, MipLevels: desc.MipLevels, Format: desc.Format,
@@ -2046,17 +2085,27 @@ unsafe fn place_in_arena(dev: &ID3D12Device, desc: &D3D12_RESOURCE_DESC, p: Plac
             };
             let mut out: Option<ID3D12Resource> = None;
             let clear = (!clear.is_null()).then_some(clear.cast::<D3D12_CLEAR_VALUE>());
-            let mut placed = dev10.CreatePlacedResource2(&heap, offset as u64, &desc, D3D12_BARRIER_LAYOUT_UNDEFINED, clear, None, &mut out);
-            // a clear value is only a hint for fast clears: one the PC refuses for this resource
-            // (a format its views cannot have) is dropped rather than the resource
-            if let (Err(e), Some(c)) = (&placed, clear) {
-                if e.code() == windows::Win32::Foundation::E_INVALIDARG {
-                    static DROPPED: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-                    if DROPPED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 8 {
-                        crate::xlog_warn!("D3D12.X: texture format {} flags {:#x} refused clear format {} – placed without a clear value", desc.Format.0, desc.Flags.0, (*c).Format.0);
+            let place = |formats: Option<&[windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT]>, out: &mut Option<ID3D12Resource>| {
+                let mut placed = dev10.CreatePlacedResource2(&heap, offset as u64, &desc, D3D12_BARRIER_LAYOUT_UNDEFINED, clear, formats, out);
+                // a clear value is only a hint for fast clears: one the PC refuses for this resource
+                // (a format its views cannot have) is dropped rather than the resource
+                if let (Err(e), Some(c)) = (&placed, clear) {
+                    if e.code() == windows::Win32::Foundation::E_INVALIDARG {
+                        static DROPPED: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+                        if DROPPED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 8 {
+                            crate::xlog_warn!("D3D12.X: texture format {} flags {:#x} refused clear format {} – placed without a clear value", desc.Format.0, desc.Flags.0, (*c).Format.0);
+                        }
+                        placed = dev10.CreatePlacedResource2(&heap, offset as u64, &desc, D3D12_BARRIER_LAYOUT_UNDEFINED, None, formats, out);
                     }
-                    placed = dev10.CreatePlacedResource2(&heap, offset as u64, &desc, D3D12_BARRIER_LAYOUT_UNDEFINED, None, None, &mut out);
                 }
+                placed
+            };
+            let mut placed = place(castable.map(|_| &super::castable::FORMATS[..]), &mut out);
+            let mut castable = castable;
+            if let (Err(e), Some(d)) = (&placed, castable.as_ref()) {
+                super::castable::refused(super::castable::ARENA, d, &format!("{:#x}", e.code().0));
+                castable = None;
+                placed = place(None, &mut out);
             }
             if let Err(e) = placed {
                 ARENAS.lock().unwrap().release(id, p, now);
@@ -2067,6 +2116,9 @@ unsafe fn place_in_arena(dev: &ID3D12Device, desc: &D3D12_RESOURCE_DESC, p: Plac
                 return Some(crate::util::E_FAIL);
             };
             super::real::adopt(out.as_raw(), super::real::Kind::Resource);
+            if let Some(d) = castable.as_ref() {
+                super::castable::made(super::castable::ARENA, out.as_raw(), d);
+            }
             super::residency::link(out.as_raw() as usize, heap.as_raw() as usize);
             *ppv = out.into_raw();
             crate::util::S_OK
@@ -2840,8 +2892,13 @@ mod tests {
         unsafe {
             let factory: IDXGIFactory4 = CreateDXGIFactory1().expect("DXGI factory");
             let Ok(adapter) = factory.EnumAdapters1(0) else { return };
-            if adapter.GetDesc1().is_ok_and(|d| d.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0) {
-                return;
+            // a CI runner's adapter is not WARP-flagged but has no local video memory of its own,
+            // and what these prove (arenas living in it) needs some
+            let hardware = adapter.GetDesc1().is_ok_and(|d| {
+                d.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 == 0 && d.DedicatedVideoMemory != 0
+            });
+            if !hardware {
+                return crate::gpu::recomp::runner::skip_test("no hardware adapter: no local video memory");
             }
             let mut dev: Option<ID3D12Device> = None;
             let _ = D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_11_0, &mut dev);
@@ -2929,8 +2986,13 @@ mod tests {
         unsafe {
             let factory: IDXGIFactory4 = CreateDXGIFactory1().expect("DXGI factory");
             let Ok(adapter) = factory.EnumAdapters1(0) else { return };
-            if adapter.GetDesc1().is_ok_and(|d| d.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0) {
-                return;
+            // a CI runner's adapter is not WARP-flagged but has no local video memory of its own,
+            // and what these prove (arenas living in it) needs some
+            let hardware = adapter.GetDesc1().is_ok_and(|d| {
+                d.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 == 0 && d.DedicatedVideoMemory != 0
+            });
+            if !hardware {
+                return crate::gpu::recomp::runner::skip_test("no hardware adapter: no local video memory");
             }
             let mut dev: Option<ID3D12Device> = None;
             let _ = D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_11_0, &mut dev);
@@ -3004,8 +3066,13 @@ mod tests {
         unsafe {
             let factory: IDXGIFactory4 = CreateDXGIFactory1().expect("DXGI factory");
             let Ok(adapter) = factory.EnumAdapters1(0) else { return };
-            if adapter.GetDesc1().is_ok_and(|d| d.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0) {
-                return;
+            // a CI runner's adapter is not WARP-flagged but has no local video memory of its own,
+            // and what these prove (arenas living in it) needs some
+            let hardware = adapter.GetDesc1().is_ok_and(|d| {
+                d.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 == 0 && d.DedicatedVideoMemory != 0
+            });
+            if !hardware {
+                return crate::gpu::recomp::runner::skip_test("no hardware adapter: no local video memory");
             }
             let mut dev: Option<ID3D12Device> = None;
             let _ = D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_11_0, &mut dev);

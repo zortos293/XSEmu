@@ -66,7 +66,8 @@ struct Heap {
     /// for each page of `pages`, the frame (present count) a slot of it was last used in
     /// (`slot`, `lookup`, `table_bound`)
     used: Vec<u32>,
-    /// the `EVICTED` pages: what their image slots named (`evict_words`)
+    /// the `EVICTED` pages: what their image slots named (`evict_words`; nothing, for a page
+    /// of buffer views only)
     evicted: std::collections::HashMap<u32, Named>,
     /// (frame, page): in that frame a list bound a table taken to reach the heap's end from
     /// that page (`table_pages`), and the pages from there on are marked as used in it
@@ -207,8 +208,8 @@ const UNMAPPED: u32 = u32::MAX;
 /// a page with no place in the shared heap whose slots were looked up (`lookup`): one the
 /// lookup would have given a place before, counted by the usage line
 const READ: u32 = u32::MAX - 1;
-/// a page whose place in the shared heap another page took (`evict`) while its image slots
-/// named its descriptors there: it gets a place again when one of its slots is used
+/// a page whose place in the shared heap another page took (`evict`): it gets a place again,
+/// and its PC descriptors there, when one of its slots is used (`place_again`)
 const EVICTED: u32 = u32::MAX - 2;
 
 /// Whether a page's entry is its place in the shared heap.
@@ -222,6 +223,150 @@ fn placed(first: u32) -> bool {
 fn evicting() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var("XCL_DESCRIPTOR_EVICT").map_or(true, |v| v != "0"))
+}
+
+/// Whether the recordings that are alive keep the pages their tables reach (`Tables`,
+/// `recordings_live`): with eviction, but `XCL_DESCRIPTOR_EVICT_RECORDINGS=0`.
+pub(super) fn keeping() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| evicting() && std::env::var("XCL_DESCRIPTOR_EVICT_RECORDINGS").map_or(true, |v| v != "0"))
+}
+
+/// Tables are kept by where they start, one `Reach` for the console addresses of a page's
+/// slots (not the page itself: a heap need not start at a multiple of them).
+const REACH_SHIFT: u32 = 13;
+const _: () = assert!(PAGE_SLOTS * SLOT == 1 << REACH_SHIFT);
+/// `Reach`es kept of one recording at most (`Tables::more`).
+const REACHES_KEPT: usize = 4096;
+
+/// The tables of a recording that start in the same `1 << REACH_SHIFT` console addresses: the
+/// lowest and the highest start, and the most slots one has by its root signature.
+#[derive(Clone, Copy, PartialEq, Debug)]
+struct Reach {
+    lo: u32,
+    hi: u32,
+    slots: u32,
+}
+
+impl Reach {
+    /// The slots a table at console address `from` (at most `hi`) has to have to reach what
+    /// every table here that starts at or after it reaches.
+    fn slots_from(&self, from: u32) -> u32 {
+        self.hi.saturating_sub(from).div_ceil(SLOT).saturating_add(self.slots)
+    }
+}
+
+/// The descriptor tables a recording bound. The PC list it became holds the places their
+/// pages had in the shared heap, for as long as it can run: until the list is recorded again
+/// or is gone, which for a bundle or a list the title runs every frame is long after it was
+/// recorded. So their pages may not lose their place meanwhile (`recordings_live`). Kept as
+/// `Reach`es, at most `REACHES_KEPT` (`more`: there were others).
+#[derive(Default, Clone)]
+pub struct Tables {
+    reaches: std::collections::HashMap<u32, Reach>,
+    /// the table noted last: mostly the next one too
+    last: Option<(u32, u32)>,
+    more: bool,
+}
+
+impl Tables {
+    /// The recording binds the table at console address `addr32`, `slots` slots.
+    pub fn note(&mut self, addr32: u32, slots: u32) {
+        if self.more || self.last == Some((addr32, slots)) {
+            return;
+        }
+        self.last = Some((addr32, slots));
+        self.widen(Reach { lo: addr32, hi: addr32, slots }, REACHES_KEPT);
+    }
+
+    fn widen(&mut self, r: Reach, kept: usize) {
+        let n = self.reaches.len();
+        match self.reaches.entry(r.lo >> REACH_SHIFT) {
+            std::collections::hash_map::Entry::Occupied(mut e) => {
+                let x = e.get_mut();
+                *x = Reach { lo: x.lo.min(r.lo), hi: x.hi.max(r.hi), slots: x.slots.max(r.slots) };
+            }
+            std::collections::hash_map::Entry::Vacant(e) if n < kept => {
+                e.insert(r);
+            }
+            std::collections::hash_map::Entry::Vacant(_) => self.more = true,
+        }
+    }
+
+    /// A new recording.
+    pub fn clear(&mut self) {
+        self.reaches.clear();
+        self.last = None;
+        self.more = false;
+    }
+
+    /// `other`'s tables as well (for those of every recording: without a limit).
+    pub fn join(&mut self, other: &Tables) {
+        for &r in other.reaches.values() {
+            self.widen(r, usize::MAX);
+        }
+        self.more |= other.more;
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.reaches.is_empty() && !self.more
+    }
+}
+
+/// the frame + 1 in which `recordings_due` last said yes, and in which `recordings_live` last
+/// kept the recordings' pages in use (0: never)
+static KEEP_ASKED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static KEPT_AT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Whether `recordings_live` is owed: once a frame (the first submit asks), from when tables
+/// are followed.
+pub fn recordings_due() -> bool {
+    use std::sync::atomic::Ordering::Relaxed;
+    if !keeping() || !tables_followed() {
+        return false;
+    }
+    let now = super::present::presents() + 1;
+    KEEP_ASKED.swap(now, Relaxed) != now
+}
+
+/// `all`: the tables of every recording that is alive (`recordings` of them). The pages they
+/// reach are in use in this frame, as when a list binds them (`table_bound`) – a recording
+/// that is not made again binds nothing anew, and what it runs with are the places its pages
+/// had when it was made. With `evict` asking for this to have been done lately, no such page
+/// loses its place. Where a recording bound more tables than are kept, every page of the
+/// shader-visible heaps is in use.
+pub fn recordings_live(all: &Tables, recordings: usize) {
+    use std::sync::atomic::Ordering::Relaxed;
+    let now = super::present::presents();
+    {
+        let mut heaps = HEAPS.lock().unwrap();
+        if all.more {
+            for h in heaps.iter_mut().filter(|h| h.visible) {
+                h.used.fill(now as u32);
+            }
+        } else if let Some(u) = crate::gpu::uma::get() {
+            let base = u.base();
+            for r in all.reaches.values() {
+                let (a, b) = (base + r.lo as usize, base + r.hi as usize);
+                for i in 0..heaps.len() {
+                    let (shadow, bytes) = (heaps[i].shadow, (heaps[i].n * SLOT) as usize);
+                    if heaps[i].pages.is_empty() || b < shadow || a >= shadow + bytes {
+                        continue;
+                    }
+                    let from = a.max(shadow);
+                    bound_in(&mut heaps, i, ((from - shadow) / SLOT as usize) as u32, r.slots_from((from - base) as u32), now as u32);
+                }
+            }
+        }
+        report_usage(Some(&heaps));
+    }
+    if KEPT_AT.swap(now + 1, Relaxed) == 0 {
+        crate::xlog_info!(
+            "console descriptor heaps: the shared heap is nearly given out, so tables are followed: from here the pages that the tables of the recordings alive reach ({recordings} recordings, {} runs of tables{}) are in use every frame, and a list or bundle recorded once keeps its descriptors' places for as long as it can run (XCL_DESCRIPTOR_EVICT_RECORDINGS=0: off)",
+            all.reaches.len(),
+            if all.more { ", one with more than are kept: every page of the shader-visible heaps" } else { "" }
+        );
+    }
 }
 
 /// Frames a page must have been out of use before another takes its place
@@ -627,7 +772,9 @@ unsafe fn page_words(h: &Heap, p: usize) -> Option<&'static mut [[u32; 8]]> {
 /// Room in the full shared heap for `need` descriptors: the page of a shader-visible heap
 /// longest out of use (`victim`) loses its place. Its image slots name the null views until
 /// it has a place again (`evict_words`), which it gets when one of its slots is used (`slot`,
-/// `lookup`, `table_bound`). Only shader-visible heaps: a CPU-only heap is where a title
+/// `lookup`, `table_bound`), with its PC descriptors – also a page of buffer views only. No
+/// page goes while the pages of the recordings alive were not kept in use lately
+/// (`recordings_live`): their PC lists hold the places. Only shader-visible heaps: a CPU-only heap is where a title
 /// makes its views and copies them from, as memory too, so the descriptors of its pages are
 /// named from slots XCL does not see used. What is not known here: a T# copied as memory out
 /// of the page before, which names the place another page has now. False: no page can go.
@@ -644,6 +791,14 @@ fn evict(heaps: &mut [Heap], need: u32, now: u32) -> bool {
     if followed == 0 || now.wrapping_sub((followed - 1) as u32) < evict_idle() {
         return false;
     }
+    if keeping() && evict_idle() != 0 {
+        let kept = KEPT_AT.load(Relaxed);
+        if kept == 0 || now.wrapping_sub((kept - 1) as u32) >= evict_idle() {
+            static ONCE: std::sync::Once = std::sync::Once::new();
+            ONCE.call_once(|| crate::xlog_warn!("console descriptor heaps: no page gives up its place: the pages of the recordings alive were not kept in use in the last {} frames (no submit asked for it; XCL_DESCRIPTOR_EVICT_RECORDINGS=0: pages go without)", evict_idle()));
+            return false;
+        }
+    }
     let pages = heaps.iter().enumerate().filter(|(_, h)| h.visible).flat_map(|(i, h)| {
         h.pages.iter().zip(&h.used).enumerate().filter(|(_, (&f, _))| placed(f)).map(move |(p, (_, &used))| (i, p, page_descriptors(h.n, p as u32), used))
     });
@@ -654,10 +809,11 @@ fn evict(heaps: &mut [Heap], need: u32, now: u32) -> bool {
     let h = &mut heaps[i];
     let (first, count) = (h.pages[p], page_descriptors(h.n, p as u32));
     let named = unsafe { page_words(h, p) }.map_or_else(Vec::new, |slots| evict_words(slots, first, count));
-    h.pages[p] = if named.is_empty() { UNMAPPED } else { EVICTED };
-    if !named.is_empty() {
-        h.evicted.insert(p as u32, named);
-    }
+    // (also when no image slot named it: the views made in the page are in the heap's own PC
+    // heap and must be copied to the place it gets next – as `UNMAPPED` it would get a place
+    // that still holds the descriptors of the page before it)
+    h.pages[p] = EVICTED;
+    h.evicted.insert(p as u32, named);
     if let Some(res) = RES.lock().unwrap().as_mut() {
         for index in first..first + count {
             res.by_shared_index.remove(&index);
@@ -707,9 +863,15 @@ pub fn table_bound(addr32: u32, slots: u32) {
     let cpu = u.base() + addr32 as usize;
     let mut heaps = HEAPS.lock().unwrap();
     let Some(i) = heaps.iter().position(|h| !h.pages.is_empty() && cpu >= h.shadow && cpu < h.shadow + (h.n * SLOT) as usize) else { return };
+    let k = ((cpu - heaps[i].shadow) / SLOT as usize) as u32;
+    bound_in(&mut heaps, i, k, slots, super::present::presents() as u32);
+    report_usage(Some(&heaps));
+}
+
+/// `table_bound` for a table of `slots` slots at slot `k` of heap `i`, in frame `now`.
+fn bound_in(heaps: &mut [Heap], i: usize, k: u32, slots: u32, now: u32) {
     let h = &mut heaps[i];
-    let now = super::present::presents() as u32;
-    let (pages, wide) = table_pages(h.n, ((cpu - h.shadow) / SLOT as usize) as u32, slots);
+    let (pages, wide) = table_pages(h.n, k, slots);
     if wide {
         if h.tail.is_some_and(|(frame, first)| frame == now && first <= pages.start) {
             return;
@@ -721,10 +883,9 @@ pub fn table_bound(addr32: u32, slots: u32) {
         let Some(used) = heaps[i].used.get_mut(p as usize) else { break };
         *used = now;
         if room && heaps[i].pages[p as usize] == EVICTED {
-            room = page_of(&mut heaps, i, p * PAGE_SLOTS, now).is_some();
+            room = page_of(heaps, i, p * PAGE_SLOTS, now).is_some();
         }
     }
-    report_usage(Some(&heaps));
 }
 
 /// The shared range starting at `first` (`count` descriptors) that `holder` had is free again.
@@ -809,14 +970,22 @@ pub fn register(obj: usize, n: u32, pc_cpu: u64, pc_gpu: u64, inc: u32, sampler:
     // avoid touching unused pages with `write_bytes` (which would mark them dirty for write-watch).
     let (p, memory) = if let Some(p) = unsafe { title_memory(u, bytes as usize) } {
         (p as *mut u8, Memory::Title)
-    } else if u.is_sparse_window(0) {
-        let Some((addr, _)) = (unsafe { super::sparse::alloc_in(0, bytes as usize, 256) }) else {
-            return false;
-        };
-        (addr as *mut u8, Memory::Sparse)
+    } else if let Some(addr) = u.is_sparse_window(0).then(|| unsafe { super::sparse::alloc_in(0, bytes as usize, 256) }).flatten() {
+        (addr.0 as *mut u8, Memory::Sparse)
     } else {
+        // Window 0 only: a descriptor table reaches its slots through a 32-bit console address, and
+        // translation resolves that in window 0. A heap anywhere else would be one the title cannot
+        // name, so a machine without window-0 storage has no console heap (and says so below).
         let Some(p) = u.alloc_in(0, bytes as usize, 256) else { return false };
         unsafe { std::ptr::write_bytes(p, 0, bytes as usize) };
+        if u.is_sparse_window(0) {
+            // The adapter could not make the 4 GiB sparse windows (a software adapter cannot), so the
+            // heap lives in the committed window: a descriptor table still reaches its slots.
+            static SAID: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+            if !SAID.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                crate::xlog_warn!("console descriptor heaps: the sparse VRAM windows are not open, so heaps are kept in the committed window (descriptor tables still work, the 32-bit slot aliasing does not)");
+            }
+        }
         (p, Memory::Uma)
     };
     {
@@ -1085,9 +1254,10 @@ fn owners_kept() -> bool {
 }
 
 /// The unordered-access view of each slot is kept (`note_native_uav`): for the native-view
-/// traces, and for the FSR4 stand-in (what a pass may write).
+/// traces, for the FSR4 stand-in (what a pass may write), and for the stand-in for the indirect
+/// light (`title_gta6_ambient`: whether a view it finds away from its place can be written).
 pub(super) fn native_uavs_kept() -> bool {
-    super::present::native_view_trace_configured() || super::fsr4_standin::wants_views()
+    super::present::native_view_trace_configured() || super::fsr4_standin::wants_views() || super::title_gta6_ambient::wanted()
 }
 
 /// The view in slot `s` names `res` (0: none).
@@ -1424,6 +1594,9 @@ mod tests {
             println!("SKIPPED texture3d_uav_companion_reads_written_mip: {e}");
             return;
         }
+        if let Some(why) = sparse_windows_missing() {
+            return crate::gpu::recomp::runner::skip_test(&why);
+        }
         unsafe {
             let raw = real::device_raw();
             let dev = ID3D12Device::from_raw_borrowed(&raw).unwrap();
@@ -1631,6 +1804,66 @@ mod tests {
         assert!(seen_page(&mut [], 0).is_none(), "a heap outside the shared heap");
     }
 
+    /// A recording's tables are kept by where they start: one reach for the addresses of a
+    /// page's slots, up to the limit; those of every recording are joined without one.
+    #[test]
+    fn a_recordings_tables_are_kept_by_where_they_start() {
+        let mut t = Tables::default();
+        assert!(t.is_empty());
+        t.note(0x1_0040, 4);
+        t.note(0x1_0040, 4);
+        t.note(0x1_1000, 300);
+        t.note(0x1_0020, 1);
+        assert_eq!(t.reaches.len(), 1);
+        assert_eq!(t.reaches[&(0x1_0000 >> REACH_SHIFT)], Reach { lo: 0x1_0020, hi: 0x1_1000, slots: 300 });
+        t.note(0x1_2000, u32::MAX);
+        assert_eq!(t.reaches.len(), 2);
+        let mut all = Tables::default();
+        all.note(0x1_0000, 2);
+        all.join(&t);
+        assert_eq!(all.reaches[&(0x1_0000 >> REACH_SHIFT)], Reach { lo: 0x1_0000, hi: 0x1_1000, slots: 300 });
+        assert!(!all.more && !all.is_empty());
+        for k in 0..REACHES_KEPT as u32 + 8 {
+            t.note(0x100_0000 + (k << REACH_SHIFT), 1);
+        }
+        assert!(t.more && t.reaches.len() == REACHES_KEPT);
+        let mut every = Tables::default();
+        every.join(&t);
+        every.join(&all);
+        assert!(every.more && every.reaches.len() == REACHES_KEPT, "joined without a limit");
+        t.clear();
+        assert!(t.is_empty() && !t.more && t.last.is_none());
+    }
+
+    /// What `recordings_live` marks for a reach holds the pages of every table kept in it,
+    /// wherever the heap starts among the addresses.
+    #[test]
+    fn a_reach_covers_the_pages_of_its_tables() {
+        let (n, shadow) = (400 * PAGE_SLOTS, 0x4_0C40u32);
+        let pages_of = |addr: u32, slots: u32| table_pages(n, (addr - shadow) / SLOT, slots).0;
+        for sizes in [[1u32, 3, 64, 257, 600], [1, 16, 300, 5000, u32::MAX]] {
+            let (mut t, mut tables, mut x) = (Tables::default(), Vec::new(), 0x2545_F491u32);
+            for _ in 0..60 {
+                x = x.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                let addr = shadow + (x >> 8) % (n * SLOT - 4);
+                let slots = sizes[(x >> 3) as usize % sizes.len()];
+                t.note(addr, slots);
+                tables.push((addr, slots));
+            }
+            let mut marked = vec![false; (n / PAGE_SLOTS) as usize];
+            for r in t.reaches.values() {
+                let from = r.lo.max(shadow);
+                for p in table_pages(n, (from - shadow) / SLOT, r.slots_from(from)).0 {
+                    marked[p as usize] = true;
+                }
+            }
+            for (addr, slots) in tables {
+                assert!(pages_of(addr, slots).all(|p| marked[p as usize]), "the table at {addr:#x} of {slots} slots");
+            }
+            assert!(sizes.contains(&u32::MAX) || marked.iter().any(|m| !m), "not every page is marked for small tables");
+        }
+    }
+
     /// The page that goes: the one longest out of use that is large enough and was not used in
     /// the last frames, whatever the frame counter's wrap.
     #[test]
@@ -1775,8 +2008,21 @@ mod tests {
         }
     }
 
+    /// The 4 GiB sparse VRAM windows (a software adapter such as the CI runner's WARP cannot reserve
+    /// them). Tests that prove what only they do skip with this reason; XCL_REQUIRE_GPU=window makes
+    /// the skip a failure.
+    fn sparse_windows_missing() -> Option<String> {
+        if crate::hle::d3d12x::sparse::windows_ready() {
+            return None;
+        }
+        Some("no 4 GiB sparse memory window: this adapter cannot reserve one".to_string())
+    }
+
     #[test]
     fn slots_copy_and_release() {
+        if let Some(why) = sparse_windows_missing() {
+            return crate::gpu::recomp::runner::skip_test(&why);
+        }
         let Some(u) = crate::gpu::uma::get() else { return };
         let rel = |p: u64| (p as usize - u.base()) as u32;
         // views: 4 slots over a PC heap at 0x1000 (increment 32, GPU 0x5000); samplers: 2 at 0x9000
@@ -1823,6 +2069,9 @@ mod tests {
         use windows::Win32::Graphics::Dxgi::*;
         if crate::gpu::uma::get().is_none() {
             return;
+        }
+        if let Some(why) = sparse_windows_missing() {
+            return crate::gpu::recomp::runner::skip_test(&why);
         }
         let dev = unsafe {
             let mut dev: Option<ID3D12Device> = None;

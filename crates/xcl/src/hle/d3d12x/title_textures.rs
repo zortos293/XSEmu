@@ -633,7 +633,7 @@ pub(super) unsafe fn retire_overlapping(va: usize, len: usize, by: usize) {
         (retired, clone_resources(&unmap_ptrs))
     };
     if super::texture_alias::enabled() || super::texture_alias::one_memory() {
-        to_unmap.retain(|r| !super::vram::keep_with(by, r.as_raw() as usize));
+        to_unmap.retain(|r| !super::vram::keep_with(by, r.as_raw() as usize) && !super::vram::kept_clear_of(r.as_raw() as usize, va, va.saturating_add(len)));
     }
     for r in &to_unmap {
         super::vram::unmap_superseded(r);

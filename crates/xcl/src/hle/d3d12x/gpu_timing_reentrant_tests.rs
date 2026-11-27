@@ -180,7 +180,7 @@ struct Captured {
 impl Captured {
     unsafe fn of(raw: *mut c_void, label: usize) -> Self {
         let (_, generation) = list_token(raw).expect("the real list must own a timing recording");
-        let index = STATE.lock().unwrap().lists[&(raw as usize)];
+        let index = super::lock().lists[&(raw as usize)];
         Self {
             index,
             generation,
@@ -247,7 +247,7 @@ unsafe fn verify_spans(queue: &ID3D12CommandQueue, lists: &[Captured]) {
     frequency(raw, &mut hz).ok().unwrap();
     assert_ne!(hz, 0);
     {
-        let state = STATE.lock().unwrap();
+        let state = super::lock();
         let mut batch = Batch {
             frame: state.frame,
             queue: id,
@@ -288,7 +288,7 @@ unsafe fn verify_spans(queue: &ID3D12CommandQueue, lists: &[Captured]) {
 
 unsafe fn verify_in_flight(queue: &ID3D12CommandQueue, lists: &[Captured]) {
     let id = queue_token(queue.as_raw()).expect("tracked queue");
-    let state = STATE.lock().unwrap();
+    let state = super::lock();
     let flights: Vec<_> = state
         .flights
         .values()
@@ -321,13 +321,13 @@ fn warp_adopted_queue_wait_reenters_profiled_submit() {
         });
         let gate = Gate(dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap());
 
-        let first_frame = STATE.lock().unwrap().frame;
+        let first_frame = super::lock().frame;
         assert_eq!(stats::waits_for_test(first_frame, id), 0);
         submit(raw, &[list.list.as_raw()], || {
             queue.Wait(&gate.0, 1).unwrap();
             list.execute(&queue);
         });
-        let last_frame = STATE.lock().unwrap().frame;
+        let last_frame = super::lock().frame;
         assert_eq!(
             (first_frame..=last_frame)
                 .map(|frame| stats::waits_for_test(frame, id))
@@ -509,7 +509,7 @@ fn warp_adopted_native_transfers_and_barriers_are_classified() {
         crate::gpu::fence::wait(&drain, 1, &dev, None, 5_000).unwrap();
         assert_eq!(markers.read(), [FIRST, SECOND, 0]);
         {
-            let state = STATE.lock().unwrap();
+            let state = super::lock();
             let q = &state.queues[&(queue.as_raw() as usize)];
             let mut batch = q.info.batch(state.frame);
             state.slots[state.lists[&(raw as usize)]].collect(&mut batch);

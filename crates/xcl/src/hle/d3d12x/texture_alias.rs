@@ -443,11 +443,34 @@ pub(super) fn forget(resource: usize) {
     }
 }
 
+/// (`dsv_trace`) The live placements that start at `va` on any device: (resource, PC format,
+/// size, mips, flags).
+pub(super) fn placed_at(va: usize) -> Vec<(usize, i32, (u64, u32, u16), u16, i32)> {
+    let g = LIVE.lock().unwrap();
+    let Some(live) = g.as_ref() else { return Vec::new() };
+    live.at.iter().filter(|(k, _)| k.1 == va).flat_map(|(_, rs)| rs.iter())
+        .filter_map(|r| live.by_res.get(r).map(|p| (*r, p.format, p.size, p.mips, p.flags)))
+        .collect()
+}
+
 /// The title's GPU work wrote `resource` (a copy or resolve into it).
 pub(super) fn note_gpu_write(resource: usize) {
     if let Some(p) = LIVE.lock().unwrap().as_mut().and_then(|live| live.by_res.get_mut(&resource)) {
         p.gpu = true;
     }
+}
+
+/// (`e5_copy`) The newest live placement at `resource`'s address, of its size, mips and samples,
+/// that takes unordered access and has the PC format `format`.
+pub(super) fn writer_at(resource: usize, format: i32) -> Option<usize> {
+    let g = LIVE.lock().unwrap();
+    let live = g.as_ref()?;
+    let p = live.by_res.get(&resource)?;
+    live.at.get(&(p.device, p.va))?.iter().rev().copied().find(|&r| {
+        r != resource && live.by_res.get(&r).is_some_and(|o| {
+            o.format == format && o.flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS.0 != 0 && (o.size, o.mips, o.samples) == (p.size, p.mips, p.samples)
+        })
+    })
 }
 
 /// The pairs so far and what is kept apart now, for the activity lines (None: no placement has
@@ -547,6 +570,19 @@ mod tests {
         let mut buffer = desc(DXGI_FORMAT_UNKNOWN, 65536, 1, 1, 1);
         buffer.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
         assert!(Shape::of(&buffer).is_none() && Shape::of(&desc(DXGI_FORMAT_NV12, 64, 64, 1, 1)).is_none());
+    }
+
+    /// A console R9G9B9E5 target made castable R11G11B10_FLOAT (`castable`) is one layout with
+    /// the R32_UINT and R9G9B9E5 textures a title places at its address; as R16G16B16A16_FLOAT
+    /// it was not.
+    #[test]
+    fn a_castable_rgb9e5_target_shares_with_its_32_bit_placements() {
+        let target = shape(DXGI_FORMAT_R11G11B10_FLOAT, 1920, 1080);
+        for f in [DXGI_FORMAT_R32_UINT, DXGI_FORMAT_R9G9B9E5_SHAREDEXP] {
+            assert!(target.shares(&shape(f, 1920, 1080)) && target.key() == shape(f, 1920, 1080).key(), "{f:?}");
+        }
+        assert!(!shape(DXGI_FORMAT_R16G16B16A16_FLOAT, 1920, 1080).shares(&shape(DXGI_FORMAT_R32_UINT, 1920, 1080)));
+        assert!(shape(DXGI_FORMAT_R9G9B9E5_SHAREDEXP, 1280, 720).shares(&shape(DXGI_FORMAT_R32_UINT, 1280, 720)));
     }
 
     /// The standard 64 KiB tiles: 65 536 bytes of elements each, a block-compressed format's

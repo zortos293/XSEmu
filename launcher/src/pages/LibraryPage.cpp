@@ -107,11 +107,12 @@ public:
     Button* play() const { return m_play; }
     Button* details() const { return m_details; }
 
-    void set(const QString& title, const QString& meta, const QPixmap& art)
+    void set(const QString& title, const QString& meta, const QPixmap& art, const QPixmap& logo)
     {
         m_title = title;
         m_meta = meta;
         m_art = art;
+        m_logo = logo;
         m_details->setVariant(art.isNull() ? Button::Variant::Secondary : Button::Variant::OnArt);
         update();
     }
@@ -166,10 +167,16 @@ protected:
         p.setFont(Theme::font(12, 600, 0.06));
         p.setPen(caps);
         p.drawText(QRectF(28, 24, textW, 16), Qt::AlignLeft | Qt::AlignVCenter, QStringLiteral("JUMP BACK IN"));
-        const QFont tf = Theme::font(30, 700, -0.025);
-        p.setFont(tf);
-        p.setPen(title);
-        p.drawText(QRectF(28, 66, textW, 34), Qt::AlignLeft | Qt::AlignVCenter, QFontMetrics(tf).elidedText(m_title, Qt::ElideRight, int(textW)));
+        if (art && !m_logo.isNull()) {
+            const QRectF box(28, 46, qMin<qreal>(textW, 320), 54);
+            const QSizeF fit = QSizeF(m_logo.size()).scaled(box.size(), Qt::KeepAspectRatio);
+            p.drawPixmap(QRectF(box.left(), box.bottom() - fit.height(), fit.width(), fit.height()), m_logo, QRectF(m_logo.rect()));
+        } else {
+            const QFont tf = Theme::font(30, 700, -0.025);
+            p.setFont(tf);
+            p.setPen(title);
+            p.drawText(QRectF(28, 66, textW, 34), Qt::AlignLeft | Qt::AlignVCenter, QFontMetrics(tf).elidedText(m_title, Qt::ElideRight, int(textW)));
+        }
         p.setFont(Theme::font(13));
         p.setPen(meta);
         p.drawText(QRectF(28, 106, textW, 16), Qt::AlignLeft | Qt::AlignVCenter, m_meta);
@@ -181,6 +188,7 @@ private:
     QString m_title;
     QString m_meta;
     QPixmap m_art;
+    QPixmap m_logo;
 };
 
 // "Recently played ⌄": the sort menu on the right of ALL GAMES.
@@ -617,7 +625,8 @@ void LibraryPage::refreshState()
         const QString shaders = shaderStatus(shownShaderState(m_s.settings, m_heroGame.titleId(), recent, cache)).text;
         if (!shaders.isEmpty())
             meta << sentenceCase(shaders);
-        m_hero->set(m_heroGame.title(), meta.join(QStringLiteral(" \u00B7 ")), m_s.art(m_heroGame.titleId(), CoverCache::Kind::Hero));
+        m_hero->set(m_heroGame.title(), meta.join(QStringLiteral(" \u00B7 ")), m_s.art(m_heroGame.titleId(), CoverCache::Kind::Hero),
+                    m_s.art(m_heroGame.titleId(), CoverCache::Kind::Logo));
     }
     if (active) {
         const Game g = m_s.emulator.game();

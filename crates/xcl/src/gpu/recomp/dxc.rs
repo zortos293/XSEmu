@@ -19,6 +19,8 @@ use windows::core::{Interface, GUID, HRESULT, PCWSTR};
 use windows::Win32::Graphics::Direct3D::Dxc::{DxcBuffer, IDxcBlob, IDxcCompiler3, IDxcResult, IDxcUtils, IDxcValidator, CLSID_DxcCompiler, CLSID_DxcUtils, CLSID_DxcValidator, DXC_CP_ACP, DXC_CP_UTF8};
 
 type CreateInstance = unsafe extern "system" fn(*const GUID, *const GUID, *mut *mut c_void) -> HRESULT;
+/// DxcCreateInstance2: the same with the `IMalloc` the instance allocates through.
+type CreateInstance2 = unsafe extern "system" fn(*mut c_void, *const GUID, *const GUID, *mut *mut c_void) -> HRESULT;
 
 /// A dotted version, `10.0.26100.0` or `1.9.2602.17`, as four numbers (missing ones are 0).
 fn parse_version(s: &str) -> Option<[u32; 4]> {
@@ -396,6 +398,96 @@ fn validate(dxil: &[u8]) -> Result<(), String> {
     }
 }
 
+/// The DxcCreateInstance2 of the dxcompiler.dll in use (None: it has none).
+fn create2_fn() -> Option<CreateInstance2> {
+    static F: OnceLock<Option<usize>> = OnceLock::new();
+    let f = (*F.get_or_init(|| {
+        use windows_sys::Win32::System::LibraryLoader::{GetModuleHandleExW, GetProcAddress, GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS, GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT};
+        let &(_, create) = load().ok()?;
+        unsafe {
+            let mut module = std::mem::zeroed();
+            if GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, create as *const u16, &mut module) == 0 {
+                return None;
+            }
+            GetProcAddress(module, b"DxcCreateInstance2\0".as_ptr()).map(|g| g as usize)
+        }
+    }))?;
+    Some(unsafe { std::mem::transmute::<usize, CreateInstance2>(f) })
+}
+
+/// A compile worker's DXC allocates in a heap of the worker's own (`crate::dxc_heap`), which
+/// is destroyed when the worker has been idle: for how long. None: DXC allocates in the
+/// process heap, as it did (`XCL_DXC_PRIVATE_HEAP=0`, or a dxcompiler.dll without
+/// DxcCreateInstance2). `XCL_DXC_HEAP_IDLE_S`: the idle seconds (10); `XCL_DXC_HEAP_CHECK=1`:
+/// every block is looked up in its heap before it is freed (counts blocks that are another
+/// allocator's). A heap has no limit: DXC does not survive an allocation that fails.
+fn own_heap() -> Option<std::time::Duration> {
+    static SET: OnceLock<Option<std::time::Duration>> = OnceLock::new();
+    *SET.get_or_init(|| {
+        if std::env::var("XCL_DXC_PRIVATE_HEAP").is_ok_and(|v| v == "0") {
+            return None;
+        }
+        if create2_fn().is_none() {
+            crate::xlog_info!("DXC: this dxcompiler.dll has no DxcCreateInstance2: its memory stays in the process heap");
+            return None;
+        }
+        let idle = std::env::var("XCL_DXC_HEAP_IDLE_S").ok().and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(10).max(1);
+        let check = std::env::var("XCL_DXC_HEAP_CHECK").is_ok_and(|v| v == "1");
+        crate::dxc_heap::check(check);
+        crate::xlog_info!(
+            "DXC: each compile worker's compiler allocates in a heap of its own, destroyed when the worker has been idle for {idle} s and DXC left nothing in it (XCL_DXC_HEAP_IDLE_S; XCL_DXC_PRIVATE_HEAP=0: the process heap, as before){}",
+            if check { "; every block is looked up before it is freed (XCL_DXC_HEAP_CHECK)" } else { "" }
+        );
+        Some(std::time::Duration::from_secs(idle))
+    })
+}
+
+thread_local! {
+    /// whether this thread is a compile worker of the pool, and whether its heap stays for
+    /// good (DXC left something in it: `worker_idle`)
+    static WORKER: std::cell::Cell<(bool, bool)> = const { std::cell::Cell::new((false, false)) };
+    /// a compile worker's heap, from its first compile until it has been idle
+    static HEAP: RefCell<Option<crate::dxc_heap::WorkerHeap>> = const { RefCell::new(None) };
+}
+
+/// How long a compile worker waits for a job before it gives its heap up (None: it has none
+/// to give up).
+fn worker_wait() -> Option<std::time::Duration> {
+    if WORKER.get().1 || !HEAP.with(|h| h.borrow().is_some()) {
+        return None;
+    }
+    own_heap()
+}
+
+/// A compile worker has been idle: its compiler is released and its heap destroyed, which
+/// gives back all that DXC took for its compiles. A heap DXC left something in stays, for
+/// this worker's further compiles.
+fn worker_idle() {
+    static ENDED: AtomicU64 = AtomicU64::new(0);
+    COMPILER.with(|c| c.borrow_mut().take());
+    let Some(heap) = HEAP.with(|h| h.borrow_mut().take()) else { return };
+    match heap.end() {
+        Ok(peak) => {
+            let n = ENDED.fetch_add(1, Ordering::Relaxed) + 1;
+            if n <= 8 || n.is_power_of_two() {
+                let (made, ended, bytes) = crate::dxc_heap::counts();
+                crate::xlog_info!("DXC: an idle compile worker's heap is destroyed: DXC had {} MB allocated in it at most ({n} so far; {} heaps alive with {} MB allocated)", peak >> 20, made.saturating_sub(ended), bytes >> 20);
+            }
+        }
+        Err(heap) => {
+            let (blocks, bytes) = heap.live();
+            crate::xlog_warn!(
+                "DXC: an idle compile worker's heap stays: with its compiler released DXC still has {blocks} blocks ({} KB) in it and {} references to its allocator, so this worker keeps it ({} blocks of another allocator were handed to the heaps: counted with XCL_DXC_HEAP_CHECK=1)",
+                bytes >> 10,
+                heap.held(),
+                crate::dxc_heap::foreign()
+            );
+            HEAP.with(|h| *h.borrow_mut() = Some(heap));
+            WORKER.set((true, true));
+        }
+    }
+}
+
 fn compiler() -> Result<IDxcCompiler3, String> {
     COMPILER.with(|c| {
         if let Some(x) = c.borrow().as_ref() {
@@ -403,7 +495,21 @@ fn compiler() -> Result<IDxcCompiler3, String> {
         }
         let create = create_fn()?;
         let mut p = std::ptr::null_mut();
-        let hr = unsafe { create(&CLSID_DxcCompiler, &IDxcCompiler3::IID, &mut p) };
+        // (a pool worker: through the allocator of its own heap)
+        let own = if WORKER.get().0 { own_heap() } else { None };
+        let malloc = own.and_then(|_| {
+            HEAP.with(|h| {
+                let mut h = h.borrow_mut();
+                if h.is_none() {
+                    *h = crate::dxc_heap::WorkerHeap::new();
+                }
+                h.as_ref().map(|heap| heap.imalloc())
+            })
+        });
+        let hr = match (malloc, create2_fn()) {
+            (Some(malloc), Some(create2)) => unsafe { create2(malloc, &CLSID_DxcCompiler, &IDxcCompiler3::IID, &mut p) },
+            _ => unsafe { create(&CLSID_DxcCompiler, &IDxcCompiler3::IID, &mut p) },
+        };
         if hr.is_err() || p.is_null() {
             return Err(format!("DxcCreateInstance: {hr:?}"));
         }
@@ -563,13 +669,22 @@ struct Queue {
 static QUEUE: std::sync::Mutex<Queue> = std::sync::Mutex::new(Queue { title: std::collections::VecDeque::new(), background: std::collections::VecDeque::new() });
 static QUEUED: std::sync::Condvar = std::sync::Condvar::new();
 
-fn next_job() -> Job {
+/// The next job. `idle`: how long to wait for one at most (None: until there is one); None is
+/// returned when none came.
+fn next_job(idle: Option<std::time::Duration>) -> Option<Job> {
     let mut q = QUEUE.lock().unwrap_or_else(|e| e.into_inner());
+    let start = std::time::Instant::now();
     loop {
         if let Some(j) = q.title.pop_front().or_else(|| q.background.pop_front()) {
-            return j;
+            return Some(j);
         }
-        q = QUEUED.wait(q).unwrap_or_else(|e| e.into_inner());
+        q = match idle {
+            None => QUEUED.wait(q).unwrap_or_else(|e| e.into_inner()),
+            Some(idle) => {
+                let left = idle.checked_sub(start.elapsed()).filter(|left| !left.is_zero())?;
+                QUEUED.wait_timeout(q, left).unwrap_or_else(|e| e.into_inner()).0
+            }
+        };
     }
 }
 
@@ -579,7 +694,11 @@ fn pool() -> bool {
         let mut started = false;
         for k in 0..compile_threads() {
             started |= std::thread::Builder::new().name(format!("xcl-dxc-{k}")).stack_size(DXC_STACK).spawn(move || loop {
-                let job = next_job();
+                WORKER.set((true, WORKER.get().1));
+                let Some(job) = next_job(worker_wait()) else {
+                    worker_idle();
+                    continue;
+                };
                 let _slot = wait_for_memory();
                 let extra: Vec<&str> = job.extra.iter().map(|s| s.as_str()).collect();
                 let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| compile_with_dxc(&job.src, &job.entry, &job.profile, &extra)))
@@ -736,6 +855,12 @@ enum Backend {
     Dxc,
     Direct,
     DirectOnly,
+}
+
+/// The direct DXIL backend makes the programs it can (`XCL_SHADER_BACKEND` is not "hlsl"): a
+/// program without outlined functions takes it milliseconds to a second, whatever its size.
+pub fn direct_backend() -> bool {
+    backend() != Backend::Dxc
 }
 
 fn backend() -> Backend {
@@ -983,6 +1108,20 @@ pub(super) fn note_translation(from_disk: bool) {
     (if from_disk { &TRANSLATED_HITS } else { &TRANSLATIONS }).fetch_add(1, Ordering::Relaxed);
 }
 
+/// Wave64 compute programs translated for a GPU with 32-lane waves: those every lane of which
+/// computes on its own (`lane_independent`), and the others.
+static LANE_INDEPENDENT: AtomicU64 = AtomicU64::new(0);
+static LANE_WAVE_FORM: AtomicU64 = AtomicU64::new(0);
+
+pub(super) fn note_lane_census(qualifies: bool) {
+    (if qualifies { &LANE_INDEPENDENT } else { &LANE_WAVE_FORM }).fetch_add(1, Ordering::Relaxed);
+}
+
+/// (qualifying, other) programs of `note_lane_census`.
+pub fn lane_census() -> (u64, u64) {
+    (LANE_INDEPENDENT.load(Ordering::Relaxed), LANE_WAVE_FORM.load(Ordering::Relaxed))
+}
+
 /// A pipeline the driver built (or refused) in `t`.
 pub fn note_driver(t: std::time::Duration) {
     DRIVER_BUILDS.fetch_add(1, Ordering::Relaxed);
@@ -1005,8 +1144,12 @@ pub fn stage_summary() -> String {
             DXC_RETRIES.load(Ordering::Relaxed)
         ),
     };
+    // always there and without a digit of its own: `warm_children::merge_summaries` sums the
+    // numbers of lines that read the same
+    let (yes, no) = lane_census();
+    let lanes = format!("; lane-independent compute {yes}, wave form {no}");
     format!(
-        "translation {} from disk, {} made; DXC {} hits, {} compiled in {:.0} thread-s; driver {} pipelines in {:.0} thread-s{direct}",
+        "translation {} from disk, {} made; DXC {} hits, {} compiled in {:.0} thread-s; driver {} pipelines in {:.0} thread-s{direct}{lanes}",
         TRANSLATED_HITS.load(Ordering::Relaxed),
         TRANSLATIONS.load(Ordering::Relaxed),
         c.hits.load(Ordering::Relaxed),
@@ -1219,13 +1362,61 @@ where
         ))
     })?;
     if std::fs::create_dir_all(&dir).is_ok() {
-        // write to a temporary name first: another thread / process may be reading
-        let tmp = file.with_extension(format!("tmp{}", std::process::id()));
-        if std::fs::write(&tmp, &b).is_ok() && std::fs::rename(&tmp, &file).is_err() {
-            let _ = std::fs::remove_file(&tmp);
-        }
+        store_dxil(&dir, &file, &b);
     }
     Ok((b, false))
+}
+
+/// Whether DXIL files with the same bytes share them (`store_dxil`): `XCL_DXIL_DEDUP=0`, each
+/// file its own, as before.
+fn dedup() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var("XCL_DXIL_DEDUP").map_or(true, |v| v.trim() != "0"))
+}
+
+/// The file in cache folder `dir` that keeps DXIL `b` by its bytes (`store_dxil`).
+fn content_file(dir: &Path, b: &[u8]) -> PathBuf {
+    dir.join("content").join(format!("{:016x}-{:x}.dxil", crate::gpu::shader::fnv64(b), b.len()))
+}
+
+/// Keep DXIL `b` as cache file `file` in folder `dir`, under another name first: another thread
+/// or process may be reading. A file kept already with the same bytes (`content_file`) gives
+/// them: the new file is another name of it (a hard link), so a module that many programs
+/// compile to is on the disk once – of a retail game's 181,133 cache files 69,871 were copies of
+/// others, 3.9 of 30 GB. A first one is kept under its bytes' name as well. Readers see a file as
+/// before, and an old build reads them all. Where a link cannot be made (another file system, a
+/// file with as many names as NTFS allows) the file gets its own bytes.
+fn store_dxil(dir: &Path, file: &Path, b: &[u8]) {
+    let tmp = file.with_extension(format!("tmp{}", std::process::id()));
+    let mut done = false;
+    if dedup() {
+        let content = content_file(dir, b);
+        if std::fs::read(&content).is_ok_and(|kept| kept == b) {
+            done = std::fs::hard_link(&content, &tmp).is_ok();
+            if done {
+                DEDUPED.fetch_add(1, Ordering::Relaxed);
+            }
+        } else if std::fs::write(&tmp, b).is_ok() {
+            done = true;
+            if !content.exists() && content.parent().is_some_and(|d| std::fs::create_dir_all(d).is_ok()) {
+                let _ = std::fs::hard_link(&tmp, &content);
+            }
+        }
+    }
+    if !done && std::fs::write(&tmp, b).is_err() {
+        return;
+    }
+    if std::fs::rename(&tmp, file).is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+}
+
+/// DXIL files this process kept as another name of one with the same bytes (`store_dxil`).
+static DEDUPED: AtomicU64 = AtomicU64::new(0);
+
+/// (DXIL files kept as a hard link of the same bytes, this process.)
+pub fn deduplicated() -> u64 {
+    DEDUPED.load(Ordering::Relaxed)
 }
 
 /// DXC compiles of programs the disk cache did not have: (running now, finished) – the XCL
@@ -1296,6 +1487,36 @@ pub fn compile_cached(src: &str, entry: &str, profile: &str) -> Result<(Vec<u8>,
 #[cfg(test)]
 mod cache_tests {
     use super::*;
+
+    /// Two programs that compile to the same DXIL share its bytes on disk; one with other bytes
+    /// gets its own; each reads back as it was kept.
+    #[test]
+    fn dxil_with_the_same_bytes_is_kept_once() {
+        let dir = std::env::temp_dir().join(format!("xcl-dxil-dedup-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let (one, other) = (b"DXBC one module".to_vec(), b"DXBC another module".to_vec());
+        let (a, b, c) = (dir.join("0000000000000001.dxil"), dir.join("0000000000000002.dxil"), dir.join("0000000000000003.dxil"));
+        store_dxil(&dir, &a, &one);
+        let before = deduplicated();
+        store_dxil(&dir, &b, &one);
+        store_dxil(&dir, &c, &other);
+        assert_eq!(deduplicated() - before, 1, "the second file of the same bytes is a link");
+        assert_eq!((std::fs::read(&a).unwrap(), std::fs::read(&b).unwrap(), std::fs::read(&c).unwrap()), (one.clone(), one.clone(), other.clone()));
+        assert_eq!(std::fs::read(content_file(&dir, &one)).unwrap(), one);
+        assert_eq!(std::fs::read_dir(dir.join("content")).unwrap().count(), 2);
+        // (a file of the content's name holding other bytes is not linked to)
+        let wrong = b"DXBC same hash, other bytes".to_vec();
+        std::fs::write(content_file(&dir, &wrong), b"something else").unwrap();
+        let d = dir.join("0000000000000004.dxil");
+        store_dxil(&dir, &d, &wrong);
+        assert_eq!(std::fs::read(&d).unwrap(), wrong);
+        // (a key file deleted, as a broken one is, leaves the bytes of the others)
+        std::fs::remove_file(&a).unwrap();
+        assert_eq!(std::fs::read(&b).unwrap(), one);
+        assert!(std::fs::read_dir(&dir).unwrap().flatten().all(|e| !e.file_name().to_string_lossy().contains(".tmp")), "no file under another name is left");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
 

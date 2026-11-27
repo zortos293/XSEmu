@@ -19,10 +19,10 @@
 //! present of the interface plane alone) is passed over for the next one, for as long as it
 //! takes (0: the first frame is dumped, whatever it holds).
 //!
-//! `XCL_DUMP_TARGETS_EACH=<W>x<H>[,<W>x<H>…]`: images of those PC sizes are also copied after
-//! every pass of the dumped frame that writes them (after a UAV barrier), so a target several
-//! passes write in turn is seen at each step: at most `XCL_DUMP_TARGETS_EACH_MAX` (48) copies,
-//! counted against the same `XCL_DUMP_TARGETS_MAX_MB`.
+//! `XCL_DUMP_TARGETS_EACH=<W>x<H>[@<format>][,…]`: images of those PC sizes (and, with `@`, that
+//! DXGI format number alone) are also copied after every pass of the dumped frame that writes
+//! them (after a UAV barrier), so a target several passes write in turn is seen at each step: at
+//! most `XCL_DUMP_TARGETS_EACH_MAX` (48) copies, counted against the same `XCL_DUMP_TARGETS_MAX_MB`.
 
 use std::collections::HashMap;
 use std::ffi::c_void;
@@ -105,18 +105,52 @@ impl Recorded {
     /// left unsubmitted for a whole frame (they would hold `XCL_DUMP_TARGETS_EACH_MAX` forever).
     fn next_frame(&mut self) {
         self.frame.clear();
-        self.snaps.clear();
+        park(std::mem::take(&mut self.snaps));
         self.gen += 1;
         let gen = self.gen;
-        let before: usize = self.list_snaps.values().map(Vec::len).sum();
+        let mut stale = Vec::new();
         for snaps in self.list_snaps.values_mut() {
-            snaps.retain(|s| s.gen + 1 >= gen);
+            let (keep, old): (Vec<Snap>, Vec<Snap>) = std::mem::take(snaps).into_iter().partition(|s| s.gen + 1 >= gen);
+            *snaps = keep;
+            stale.extend(old);
         }
         self.list_snaps.retain(|_, s| !s.is_empty());
-        let after: usize = self.list_snaps.values().map(Vec::len).sum();
-        self.snaps_stale += before - after;
+        self.snaps_stale += stale.len();
+        park(stale);
         self.snap_bytes = self.list_snaps.values().flatten().map(|s| s.bytes).sum();
     }
+}
+
+/// Readback buffers a copy may still be writing, and the images copied from, by the allocator
+/// of the list holding the copy: a buffer goes only when that allocator is reset or released,
+/// which D3D12 allows only once the GPU has finished every list recorded from it.
+struct Parked(Vec<(usize, ID3D12Resource)>);
+
+// only touched under the lock
+unsafe impl Send for Parked {}
+
+static PARKED: Mutex<Parked> = Mutex::new(Parked(Vec::new()));
+
+fn park(snaps: impl IntoIterator<Item = Snap>) {
+    let mut p = PARKED.lock().unwrap();
+    for s in snaps {
+        p.0.push((s.allocator, s.copy.0));
+        p.0.push((s.allocator, s.src));
+    }
+}
+
+/// `allocator` was reset or released: the GPU is done with the copies its lists recorded.
+pub(super) fn allocator_done(allocator: usize) {
+    let done: Vec<_> = {
+        let mut p = PARKED.lock().unwrap();
+        if p.0.is_empty() {
+            return;
+        }
+        let (done, kept) = std::mem::take(&mut p.0).into_iter().partition(|e| e.0 == allocator);
+        p.0 = kept;
+        done
+    };
+    drop(done);
 }
 
 /// An image copied right after a pass that wrote it (`XCL_DUMP_TARGETS_EACH`).
@@ -126,30 +160,42 @@ struct Snap {
     bytes: u64,
     /// the frame boundary count when it was made
     gen: u32,
+    /// the allocator of the list the copy is recorded on
+    allocator: usize,
+    /// the image copied, held while the copy may run
+    src: ID3D12Resource,
     copy: (ID3D12Resource, D3D12_PLACED_SUBRESOURCE_FOOTPRINT, DXGI_FORMAT),
 }
 
-/// `XCL_DUMP_TARGETS_EACH`: the PC sizes (width, height) copied after each pass writing them.
-fn each() -> &'static [(u64, u32)] {
-    static EACH: OnceLock<Vec<(u64, u32)>> = OnceLock::new();
+/// `XCL_DUMP_TARGETS_EACH`: the PC sizes (width, height, DXGI format if named) copied after each
+/// pass writing them.
+fn each() -> &'static [(u64, u32, Option<i32>)] {
+    static EACH: OnceLock<Vec<(u64, u32, Option<i32>)>> = OnceLock::new();
     EACH.get_or_init(|| sizes(&std::env::var("XCL_DUMP_TARGETS_EACH").unwrap_or_default()))
 }
 
-fn sizes(list: &str) -> Vec<(u64, u32)> {
+fn sizes(list: &str) -> Vec<(u64, u32, Option<i32>)> {
     list.split(',').filter_map(|s| {
-        let (w, h) = s.trim().split_once(['x', 'X'])?;
-        Some((w.trim().parse().ok()?, h.trim().parse().ok()?))
+        let (size, format) = match s.split_once('@') {
+            Some((size, f)) => (size, Some(f.trim().parse().ok()?)),
+            None => (s, None),
+        };
+        let (w, h) = size.trim().split_once(['x', 'X'])?;
+        Some((w.trim().parse().ok()?, h.trim().parse().ok()?, format))
     }).collect()
 }
 
 /// The pass just recorded on `list` wrote `writes`: those of an `XCL_DUMP_TARGETS_EACH` size
 /// are copied now, behind a UAV barrier, and kept with `what` (the pass) if the list is
 /// submitted in the dumped frame.
-pub(super) unsafe fn after_pass(list: *mut c_void, writes: &[usize], what: impl FnOnce() -> String) {
+pub(super) unsafe fn after_pass(list: *mut c_void, allocator: usize, writes: &[usize], what: impl FnOnce() -> String) {
     if each().is_empty() || !recording() || writes.is_empty() {
         return;
     }
     let Some(l) = ID3D12GraphicsCommandList::from_raw_borrowed(&list) else { return };
+    if allocator == 0 {
+        return;
+    }
     // a bundle holds neither copies nor barriers, and is never submitted on its own
     if l.GetType() == D3D12_COMMAND_LIST_TYPE_BUNDLE {
         return;
@@ -162,7 +208,7 @@ pub(super) unsafe fn after_pass(list: *mut c_void, writes: &[usize], what: impl 
         let p = res as *mut c_void;
         let Some(resource) = ID3D12Resource::from_raw_borrowed(&p) else { continue };
         let d = resource.GetDesc();
-        if d.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || d.SampleDesc.Count != 1 || !each().contains(&(d.Width, d.Height)) {
+        if d.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || d.SampleDesc.Count != 1 || !each().iter().any(|&(w, h, f)| (w, h) == (d.Width, d.Height) && f.is_none_or(|f| f == d.Format.0)) {
             continue;
         }
         let mut g = RECORDED.lock().unwrap();
@@ -184,7 +230,7 @@ pub(super) unsafe fn after_pass(list: *mut c_void, writes: &[usize], what: impl 
         r.snap_bytes += bytes;
         r.held.entry(res).or_insert_with(|| resource.clone());
         let pass = r.lists.get(&(list as usize)).map_or(0, Vec::len) + 1;
-        r.list_snaps.entry(list as usize).or_default().push(Snap { res, what: format!("{label}, pass {pass} of its list"), bytes, gen: r.gen, copy: (buffer, fp, d.Format) });
+        r.list_snaps.entry(list as usize).or_default().push(Snap { res, what: format!("{label}, pass {pass} of its list"), bytes, gen: r.gen, allocator, src: resource.clone(), copy: (buffer, fp, d.Format) });
     }
 }
 
@@ -223,7 +269,9 @@ pub(super) fn reset(list: usize) {
     if recording() {
         if let Some(r) = RECORDED.lock().unwrap().as_mut() {
             r.lists.remove(&list);
-            r.list_snaps.remove(&list);
+            if let Some(snaps) = r.list_snaps.remove(&list) {
+                park(snaps);
+            }
         }
     }
 }
@@ -475,12 +523,28 @@ fn usage(frame: &[(usize, Op)], res: usize) -> Vec<String> {
 struct Item {
     n: usize,
     copy: Option<(ID3D12Resource, D3D12_PLACED_SUBRESOURCE_FOOTPRINT, DXGI_FORMAT)>,
+    /// a copy after a pass: its list's allocator and the image, so the buffer is parked, not
+    /// dropped, once written (`park`)
+    after_pass: Option<(usize, ID3D12Resource)>,
 }
 
 pub(super) struct Pending {
     frame: u64,
     items: Vec<Item>,
     _held: HashMap<usize, ID3D12Resource>,
+    /// the presenter's fence passed and the files are written: what it holds may go
+    done: bool,
+}
+
+/// A dump dropped before its presenter fence passed (the present failed after `capture`, or the
+/// copies did not finish in 60 s) keeps its buffers and images for good: a copy may still run.
+impl Drop for Pending {
+    fn drop(&mut self) {
+        if !self.done {
+            std::mem::forget(std::mem::take(&mut self.items));
+            std::mem::forget(std::mem::take(&mut self._held));
+        }
+    }
 }
 
 unsafe impl Send for Pending {}
@@ -538,12 +602,13 @@ pub(super) unsafe fn capture(list: &ID3D12GraphicsCommandList, planes: &[ID3D12R
             used += total;
             super::present::readback_copy(list, &resource, &d).map(|(b, f)| (b, f, d.Format))
         };
-        items.push(Item { n, copy });
+        items.push(Item { n, copy, after_pass: None });
     }
     crate::xlog_info!(
         "target dump: {} copies after passes kept, {} made on lists the frame did not submit, {} dropped as their lists stayed unsubmitted a whole frame, {} refused for XCL_DUMP_TARGETS_EACH_MAX or the budget",
         recorded.snaps.len(), recorded.list_snaps.values().map(Vec::len).sum::<usize>(), recorded.snaps_stale, recorded.snaps_refused
     );
+    park(recorded.list_snaps.into_values().flatten());
     let first = items.last().map_or(0, |i| i.n + 1);
     let mut step: HashMap<usize, usize> = HashMap::new();
     for (k, s) in recorded.snaps.into_iter().enumerate() {
@@ -555,9 +620,9 @@ pub(super) unsafe fn capture(list: &ID3D12GraphicsCommandList, planes: &[ID3D12R
             "target dump: #{n} {:#x} after pass (copy {} of it in the frame): {}: PC {}x{} format {}, row pitch {} B",
             s.res, at, s.what, fp.Width, fp.Height, s.copy.2.0, fp.RowPitch
         );
-        items.push(Item { n, copy: Some(s.copy) });
+        items.push(Item { n, copy: Some(s.copy), after_pass: Some((s.allocator, s.src)) });
     }
-    Some(Pending { frame: frame_no, items, _held: recorded.held })
+    Some(Pending { frame: frame_no, items, _held: recorded.held, done: false })
 }
 
 /// Writes the copies once `fence` reaches `value` (the presenter's signal after them), on a
@@ -567,45 +632,58 @@ pub(super) fn write_after(p: Pending, fence: ID3D12Fence, value: u64) {
     unsafe impl Send for Job {}
     let job = Job(p, fence);
     let _ = std::thread::Builder::new().name("xcl-target-dump".into()).spawn(move || {
-        let Job(p, fence) = job;
+        let Job(mut p, fence) = job;
         let start = std::time::Instant::now();
         while unsafe { fence.GetCompletedValue() } < value {
             if start.elapsed() > std::time::Duration::from_secs(60) {
-                crate::xlog_warn!("target dump: frame {}: the copies did not finish in 60 s; nothing written", p.frame);
+                crate::xlog_warn!("target dump: frame {}: the copies did not finish in 60 s; nothing written, and the copies' buffers are kept for good", p.frame);
                 return;
             }
             std::thread::sleep(std::time::Duration::from_millis(20));
         }
-        let Some(boot) = crate::state::boot() else { return };
-        let dir = boot.logs_dir().join(format!("targets_{}", p.frame));
-        if let Err(e) = std::fs::create_dir_all(&dir) {
-            crate::xlog_warn!("target dump: {}: {e}", dir.display());
-            return;
-        }
-        for item in &p.items {
-            let Some((buffer, fp, format)) = &item.copy else { continue };
-            let mut ptr: *mut c_void = std::ptr::null_mut();
-            if unsafe { buffer.Map(0, None, Some(&mut ptr)) }.is_err() || ptr.is_null() {
-                continue;
+        write_items(&p);
+        let mut parked = PARKED.lock().unwrap();
+        for item in std::mem::take(&mut p.items) {
+            if let (Some((buffer, ..)), Some((allocator, src))) = (item.copy, item.after_pass) {
+                parked.0.push((allocator, buffer));
+                parked.0.push((allocator, src));
             }
-            let (w, h, pitch) = (fp.Footprint.Width as usize, fp.Footprint.Height as usize, fp.Footprint.RowPitch as usize);
-            let len = ((pitch * h) as u64).min(unsafe { buffer.GetDesc() }.Width.saturating_sub(fp.Offset)) as usize;
-            let rows = unsafe { std::slice::from_raw_parts((ptr as *const u8).add(fp.Offset as usize), len) };
-            let _ = std::fs::write(dir.join(format!("{:02}.raw", item.n)), rows);
-            let zero = rows.iter().all(|&b| b == 0);
-            let shown = shown_as(fp.Footprint.Format, *format, w, h, pitch, len);
-            if let Some((f, b)) = shown {
-                let _ = std::fs::write(dir.join(format!("{:02}.bmp", item.n)), bmp(w, h, |x, y| texel_rgb(f, &rows[y * pitch + x * b..y * pitch + x * b + b]).unwrap_or([0; 3])));
-            }
-            unsafe { buffer.Unmap(0, None) };
-            crate::xlog_info!(
-                "target dump: #{} written: {:02}.raw ({w}x{h}, row pitch {pitch} B, {len} B{}){}",
-                item.n, item.n, if zero { ", all zero" } else { "" },
-                if shown.is_some() { format!(", {:02}.bmp", item.n) } else { " (format not shown as an image)".into() }
-            );
         }
-        crate::xlog_info!("target dump: frame {} written to {}", p.frame, dir.display());
+        p.done = true;
     });
+}
+
+/// The files of a dump whose presenter fence has passed.
+fn write_items(p: &Pending) {
+    let Some(boot) = crate::state::boot() else { return };
+    let dir = boot.logs_dir().join(format!("targets_{}", p.frame));
+    if let Err(e) = std::fs::create_dir_all(&dir) {
+        crate::xlog_warn!("target dump: {}: {e}", dir.display());
+        return;
+    }
+    for item in &p.items {
+        let Some((buffer, fp, format)) = &item.copy else { continue };
+        let mut ptr: *mut c_void = std::ptr::null_mut();
+        if unsafe { buffer.Map(0, None, Some(&mut ptr)) }.is_err() || ptr.is_null() {
+            continue;
+        }
+        let (w, h, pitch) = (fp.Footprint.Width as usize, fp.Footprint.Height as usize, fp.Footprint.RowPitch as usize);
+        let len = ((pitch * h) as u64).min(unsafe { buffer.GetDesc() }.Width.saturating_sub(fp.Offset)) as usize;
+        let rows = unsafe { std::slice::from_raw_parts((ptr as *const u8).add(fp.Offset as usize), len) };
+        let _ = std::fs::write(dir.join(format!("{:02}.raw", item.n)), rows);
+        let zero = rows.iter().all(|&b| b == 0);
+        let shown = shown_as(fp.Footprint.Format, *format, w, h, pitch, len);
+        if let Some((f, b)) = shown {
+            let _ = std::fs::write(dir.join(format!("{:02}.bmp", item.n)), bmp(w, h, |x, y| texel_rgb(f, &rows[y * pitch + x * b..y * pitch + x * b + b]).unwrap_or([0; 3])));
+        }
+        unsafe { buffer.Unmap(0, None) };
+        crate::xlog_info!(
+            "target dump: #{} written: {:02}.raw ({w}x{h}, row pitch {pitch} B, {len} B{}){}",
+            item.n, item.n, if zero { ", all zero" } else { "" },
+            if shown.is_some() { format!(", {:02}.bmp", item.n) } else { " (format not shown as an image)".into() }
+        );
+    }
+    crate::xlog_info!("target dump: frame {} written to {}", p.frame, dir.display());
 }
 
 #[cfg(test)]
@@ -649,7 +727,8 @@ mod tests {
 
     #[test]
     fn each_takes_a_list_of_sizes() {
-        assert_eq!(sizes("1280x720, 640X360,bad,1920x"), [(1280, 720), (640, 360)]);
+        assert_eq!(sizes("1280x720, 640X360,bad,1920x"), [(1280, 720, None), (640, 360, None)]);
+        assert_eq!(sizes("1280x720@26,512x512@x"), [(1280, 720, Some(26))]);
         assert!(sizes("").is_empty());
     }
 

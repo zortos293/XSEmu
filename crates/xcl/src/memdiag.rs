@@ -38,10 +38,12 @@
 //! thread stacks, other allocations with a guard page, the title's image and the other images
 //! XCL's loader mapped. Once at the start: whether the Windows heap figures count a 32 MiB block.
 //! The walk also names every other private allocation by its owner (XCL_MEMDIAG_OWNERS=0: off),
-//! one line: the Windows heaps' segments (by their signature) and the blocks the heaps got from
-//! VirtualAlloc (by the list links and sizes at their start), memory that can be executed, and
-//! the rest by the image most pointers in one or two of its resident pages go into (the driver,
-//! the D3D12 runtime, XCL, the title), or none; by size, with the largest ones.
+//! one line: the Windows heaps' segments (the NT heap's by their signature and its blocks from
+//! VirtualAlloc by the list links and sizes at their start; the segment heap's, which XCL's
+//! manifest asks for, by the word at +0x10 that is the same in all of them once their own
+//! address is taken out), memory that can be executed, and the rest by the image most pointers
+//! in up to nine of its resident pages go into (the driver, the D3D12 runtime, XCL, the title),
+//! or none; by size, with the largest ones and what each reserves.
 //! Nothing here changes what XCL does.
 
 use std::alloc::{GlobalAlloc, Layout, System};
@@ -494,7 +496,7 @@ const NAMES: [&str; 11] = [
 
 /// The address-space walk: committed and (sampled) resident bytes by owner.
 fn walk() {
-    use windows_sys::Win32::System::Memory::{VirtualQuery, MEMORY_BASIC_INFORMATION, MEM_COMMIT, MEM_IMAGE, MEM_MAPPED, MEM_PRIVATE};
+    use windows_sys::Win32::System::Memory::{VirtualQuery, MEMORY_BASIC_INFORMATION, MEM_COMMIT, MEM_IMAGE, MEM_MAPPED, MEM_PRIVATE, MEM_RESERVE};
     use windows_sys::Win32::System::ProcessStatus::K32GetMappedFileNameW;
     use windows_sys::Win32::System::Threading::GetCurrentProcess;
     let started = std::time::Instant::now();
@@ -509,6 +511,8 @@ fn walk() {
     let mut named = Named::default();
     let owners = on("XCL_MEMDIAG_OWNERS");
     let mut owned: Vec<Owned> = Vec::new();
+    // (the allocation the walk is in and what of it is reserved only, before its first committed region)
+    let mut ahead = (0usize, 0u64);
     let zero = resident && on("XCL_MEMDIAG_ZERO");
     let mut samples: Vec<(usize, usize, bool)> = Vec::new();
     let mut at = 0x1_0000usize;
@@ -519,6 +523,13 @@ fn walk() {
         }
         let (base, size) = (m.BaseAddress as usize, m.RegionSize);
         at = base + size;
+        if owners && m.State == MEM_RESERVE && m.Type == MEM_PRIVATE {
+            let allocation = m.AllocationBase as usize;
+            match owned.last_mut() {
+                Some(o) if o.base == allocation => o.size += size as u64,
+                _ => ahead = (allocation, if ahead.0 == allocation { ahead.1 } else { 0 } + size as u64),
+            }
+        }
         if m.State != MEM_COMMIT {
             continue;
         }
@@ -551,7 +562,7 @@ fn walk() {
         };
         parts[part].committed += size as u64;
         if part == 4 && !named.note(&places, base, size, m.AllocationBase as usize, m.Protect & 0x100 != 0) && owners {
-            owned_note(&mut owned, m.AllocationBase as usize, base, size, m.Protect);
+            owned_note(&mut owned, ahead, m.AllocationBase as usize, base, size, m.Protect);
         }
         if resident {
             // (readable, and no guard page: a read would take the guard away)
@@ -840,36 +851,83 @@ fn sample_resident(samples: &[(usize, usize, bool)], parts: &mut [Part], window:
     }
 }
 
-/// A private allocation no place names: its committed bytes and the first of its committed
-/// regions that can be read.
+/// Pages asked for of one allocation at most: the first page of its first readable region, the
+/// page at that region's middle, and the first page of `SPOTS` later regions.
+const SPOTS: usize = 7;
+
+/// A private allocation no place names: its committed bytes, its whole size, and where the
+/// owners line reads it.
 struct Owned {
     base: usize,
     committed: u64,
-    /// `(start, length)`, `(0, 0)`: none can be read
+    /// committed and reserved
+    size: u64,
+    /// `(start, length)` of the first committed region that can be read, `(0, 0)`: none can
     first: (usize, usize),
+    /// the starts of later readable regions: the 2nd, 3rd, 5th, 9th and so on (0: none)
+    spots: [usize; SPOTS],
+    /// readable regions so far
+    readable: u32,
     /// some of it can be executed
     code: bool,
 }
 
 /// A committed region `[base, base + len)` of the allocation at `allocation` (the walk goes up
-/// the address space, so an allocation's regions follow one another).
-fn owned_note(owned: &mut Vec<Owned>, allocation: usize, base: usize, len: usize, protect: u32) {
+/// the address space, so an allocation's regions follow one another). `ahead`: an allocation
+/// and what the walk found reserved of it so far.
+fn owned_note(owned: &mut Vec<Owned>, ahead: (usize, u64), allocation: usize, base: usize, len: usize, protect: u32) {
     if !matches!(owned.last(), Some(o) if o.base == allocation) {
-        owned.push(Owned { base: allocation, committed: 0, first: (0, 0), code: false });
+        let size = if ahead.0 == allocation { ahead.1 } else { 0 };
+        owned.push(Owned { base: allocation, committed: 0, size, first: (0, 0), spots: [0; SPOTS], readable: 0, code: false });
     }
     let o = owned.last_mut().unwrap();
     o.committed += len as u64;
+    o.size += len as u64;
     o.code |= protect & 0xF0 != 0;
     // (readable, and no guard page: a read would take the guard away)
-    if o.first.1 == 0 && protect & 0x100 == 0 && protect & 0xEE != 0 {
-        o.first = (base, len);
+    if protect & 0x100 == 0 && protect & 0xEE != 0 {
+        if o.readable == 0 {
+            o.first = (base, len);
+        } else if o.readable.is_power_of_two() {
+            if let Some(spot) = o.spots.get_mut(o.readable.trailing_zeros() as usize) {
+                *spot = base;
+            }
+        }
+        o.readable += 1;
     }
+}
+
+/// The pages the owners line asks for of an allocation (0: none; one page is asked for once).
+fn owned_asks(o: &Owned) -> [usize; SPOTS + 2] {
+    let mut at = [0usize; SPOTS + 2];
+    if o.first.1 != 0 {
+        at[0] = o.first.0;
+        let middle = o.first.0 + (o.first.1 / 2 & !0xFFF);
+        at[1] = if middle == o.first.0 { 0 } else { middle };
+        at[2..].copy_from_slice(&o.spots);
+    }
+    at
+}
+
+/// The segment heap's segments among `starts`, each an allocation's base and the word at +0x10
+/// of it: a segment keeps there a signature made of its own address and of values every
+/// segment of the heap shares, so with the address taken out many allocations show one value.
+/// The bases of those that share theirs with `SHARED` and more, sorted.
+fn heap_segments(starts: &[(usize, usize)]) -> Vec<usize> {
+    const SHARED: usize = 8;
+    let mut keys: std::collections::HashMap<usize, usize> = std::collections::HashMap::new();
+    for &(base, word) in starts {
+        *keys.entry(base ^ word).or_default() += 1;
+    }
+    let mut out: Vec<usize> = starts.iter().filter(|&&(base, word)| keys[&(base ^ word)] >= SHARED).map(|s| s.0).collect();
+    out.sort_unstable();
+    out
 }
 
 /// Whom a private allocation belongs to, as far as a page or two of it tell.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 enum Owner {
-    /// a segment of a Windows heap: the heaps' signature at +0x10
+    /// a segment of a Windows heap: the NT heap's signature at +0x10, or `heap_segments`
     HeapSegment,
     /// a block a Windows heap got from VirtualAlloc: its first two words link it to other
     /// allocations or to a heap, and the two sizes after them fit it
@@ -897,9 +955,14 @@ fn owned_size(bytes: u64) -> usize {
 }
 
 /// The owner of an allocation of `committed` bytes by `pages` of it (the first is its first
-/// page when `at_base`). `bases`: the bases of the private allocations, sorted; `heaps`: the
-/// Windows heaps' handles; `images`: `(start, end)` of every image, sorted.
-fn owner(pages: &[&[u8]], at_base: bool, code: bool, committed: u64, bases: &[usize], heaps: &[usize], images: &[(usize, usize)]) -> Owner {
+/// page when `at_base`). `segment`: `heap_segments` found it; `bases`: the bases of the
+/// private allocations, sorted; `heaps`: the Windows heaps' handles; `images`: `(start, end)`
+/// of every image, sorted.
+#[allow(clippy::too_many_arguments)]
+fn owner(pages: &[&[u8]], at_base: bool, segment: bool, code: bool, committed: u64, bases: &[usize], heaps: &[usize], images: &[(usize, usize)]) -> Owner {
+    if segment {
+        return Owner::HeapSegment;
+    }
     let Some(first) = pages.first() else {
         return Owner::Away;
     };
@@ -999,15 +1062,11 @@ fn owners_line(owned: &[Owned], heaps: u64) {
     let handles: Vec<usize> = handles.iter().take(n).map(|&h| h as usize).collect();
     let bases: Vec<usize> = owned.iter().map(|o| o.base).collect();
     let mut by: std::collections::HashMap<Owner, Sizes> = std::collections::HashMap::new();
-    let mut largest: Vec<(u64, Owner)> = Vec::new();
-    let mut pages = [[0u8; 4096]; 2];
-    // (the first page of the first readable region, and the page at its middle)
-    let asked = |o: &Owned| [o.first.0, o.first.0 + (o.first.1 / 2 & !0xFFF)];
-    for chunk in owned.chunks(8192) {
-        let mut info: Vec<PSAPI_WORKING_SET_EX_INFORMATION> = chunk
+    let mut largest: Vec<(u64, u64, Owner)> = Vec::new();
+    let resident = |at: &[usize]| -> Vec<bool> {
+        let mut info: Vec<PSAPI_WORKING_SET_EX_INFORMATION> = at
             .iter()
-            .flat_map(asked)
-            .map(|a| {
+            .map(|&a| {
                 let mut i: PSAPI_WORKING_SET_EX_INFORMATION = unsafe { std::mem::zeroed() };
                 i.VirtualAddress = a as *mut _;
                 i
@@ -1015,24 +1074,46 @@ fn owners_line(owned: &[Owned], heaps: u64) {
             .collect();
         let bytes = (info.len() * std::mem::size_of::<PSAPI_WORKING_SET_EX_INFORMATION>()) as u32;
         let known = unsafe { K32QueryWorkingSetEx(GetCurrentProcess(), info.as_mut_ptr().cast(), bytes) } != 0;
-        for (o, i) in chunk.iter().zip(info.chunks(2)) {
-            let (mut read, mut at_base) = (0usize, false);
-            for (k, a) in asked(o).into_iter().enumerate() {
-                if !known || o.first.1 == 0 || (k == 1 && a == o.first.0) || unsafe { i[k].VirtualAttributes.Flags } & 1 == 0 {
-                    continue;
-                }
-                let mut done = 0usize;
-                if unsafe { ReadProcessMemory(GetCurrentProcess(), a as *const _, pages[read].as_mut_ptr().cast(), 4096, &mut done) } != 0 && done == 4096 {
-                    at_base |= k == 0 && a == o.base;
-                    read += 1;
+        at.iter().zip(&info).map(|(&a, i)| known && a != 0 && unsafe { i.VirtualAttributes.Flags } & 1 != 0).collect()
+    };
+    let read = |at: usize, to: &mut [u8]| {
+        let mut done = 0usize;
+        let ok = unsafe { ReadProcessMemory(GetCurrentProcess(), at as *const _, to.as_mut_ptr().cast(), to.len(), &mut done) };
+        ok != 0 && done == to.len()
+    };
+    // (a segment of the segment heap is 1 MiB or 16 MiB; any power of two from 1 MiB to 64 MiB is looked at)
+    let candidates: Vec<usize> = owned.iter().filter(|o| o.first.0 == o.base && o.size.is_power_of_two() && (1 << 20..=64 << 20).contains(&o.size)).map(|o| o.base).collect();
+    let mut starts: Vec<(usize, usize)> = Vec::new();
+    for chunk in candidates.chunks(16384) {
+        for (&base, _) in chunk.iter().zip(resident(chunk)).filter(|x| x.1) {
+            let mut word = [0u8; 8];
+            if read(base + 0x10, &mut word) {
+                starts.push((base, usize::from_le_bytes(word)));
+            }
+        }
+    }
+    let segments = heap_segments(&starts);
+    let mut in_segments = 0u64;
+    let mut pages = vec![[0u8; 4096]; SPOTS + 2];
+    for chunk in owned.chunks(1024) {
+        let asked: Vec<usize> = chunk.iter().flat_map(owned_asks).collect();
+        let there = resident(&asked);
+        for (k, o) in chunk.iter().enumerate() {
+            let (mut got, mut at_base) = (0usize, false);
+            for j in k * (SPOTS + 2)..(k + 1) * (SPOTS + 2) {
+                if there[j] && read(asked[j], &mut pages[got]) {
+                    at_base |= got == 0 && asked[j] == o.base;
+                    got += 1;
                 }
             }
-            let got: Vec<&[u8]> = pages[..read].iter().map(|p| &p[..]).collect();
-            let who = owner(&got, at_base, o.code, o.committed, &bases, &handles, &images);
+            let seen: Vec<&[u8]> = pages[..got].iter().map(|p| &p[..]).collect();
+            let who = owner(&seen, at_base, segments.binary_search(&o.base).is_ok(), o.code, o.committed, &bases, &handles, &images);
             let size = &mut by.entry(who).or_default()[owned_size(o.committed)];
             *size = (size.0 + 1, size.1 + o.committed);
-            if !matches!(who, Owner::HeapSegment | Owner::HeapBlock) {
-                largest.push((o.committed, who));
+            if matches!(who, Owner::HeapSegment | Owner::HeapBlock) {
+                in_segments += o.committed;
+            } else {
+                largest.push((o.committed, o.size, who));
                 largest.sort_unstable_by(|a, b| b.0.cmp(&a.0));
                 largest.truncate(SHOWN);
             }
@@ -1040,7 +1121,7 @@ fn owners_line(owned: &[Owned], heaps: u64) {
     }
     let name = |who: Owner| match who {
         Owner::HeapSegment => "Windows heap segments".to_string(),
-        Owner::HeapBlock => "blocks the Windows heaps got from VirtualAlloc".to_string(),
+        Owner::HeapBlock => "blocks the NT heaps got from VirtualAlloc".to_string(),
         Owner::Code => "memory that can be executed".to_string(),
         Owner::Image(k) => format!("pointing into {}", names.get(k).map_or("?", |n| n.as_str())),
         Owner::Zero => "all zeros where read".to_string(),
@@ -1065,12 +1146,13 @@ fn owners_line(owned: &[Owned], heaps: u64) {
         }
         shown.push(format!("pointing into {} other images {}", pointing.len() - SHOWN, sizes_text(&others)));
     }
-    let largest: Vec<String> = largest.iter().map(|&(bytes, who)| format!("{} MB {}", mb(bytes), name(who))).collect();
+    let largest: Vec<String> = largest.iter().map(|&(bytes, size, who)| format!("{} MB of {} MB {}", mb(bytes), mb(size), name(who))).collect();
     static TOLD: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
     crate::xlog_info!(
-        "memdiag: private other by owner, each allocation named by one or two resident pages of it (allocations/MB): {}; the Windows heaps report {} MB; the largest outside the heaps: {}; {} ms{}",
+        "memdiag: private other by owner, each allocation named by up to nine resident pages of it (allocations/MB): {}; the Windows heaps report {} MB, so {} MB of theirs is in blocks of their own that are counted under what their pages hold; the largest outside the heap segments (committed of reserved): {}; {} ms{}",
         shown.join("; "),
         mb(heaps),
+        mb(heaps.saturating_sub(in_segments)),
         if largest.is_empty() { "none".to_string() } else { largest.join(", ") },
         started.elapsed().as_millis(),
         if TOLD.swap(true, Relaxed) { "" } else { " (XCL_MEMDIAG_OWNERS=0: this line off)" }
@@ -1127,13 +1209,22 @@ mod tests {
     #[test]
     fn an_allocation_gathers_its_regions_and_its_first_readable_one() {
         let mut owned = Vec::new();
-        owned_note(&mut owned, 0x10000, 0x10000, 0x1000, 0x104);
-        owned_note(&mut owned, 0x10000, 0x11000, 0x3000, 0x04);
-        owned_note(&mut owned, 0x10000, 0x20000, 0x1000, 0x20);
-        owned_note(&mut owned, 0x40000, 0x40000, 0x2000, 0x01);
+        owned_note(&mut owned, (0x10000, 0x7000), 0x10000, 0x10000, 0x1000, 0x104);
+        owned_note(&mut owned, (0x10000, 0x7000), 0x10000, 0x11000, 0x3000, 0x04);
+        owned_note(&mut owned, (0x10000, 0x7000), 0x10000, 0x20000, 0x1000, 0x20);
+        owned_note(&mut owned, (0x10000, 0x7000), 0x40000, 0x40000, 0x2000, 0x01);
         assert_eq!(owned.len(), 2);
-        assert_eq!((owned[0].base, owned[0].committed, owned[0].first, owned[0].code), (0x10000, 0x5000, (0x11000, 0x3000), true));
-        assert_eq!((owned[1].base, owned[1].committed, owned[1].first, owned[1].code), (0x40000, 0x2000, (0, 0), false));
+        assert_eq!((owned[0].base, owned[0].committed, owned[0].size, owned[0].first, owned[0].code), (0x10000, 0x5000, 0xC000, (0x11000, 0x3000), true));
+        assert_eq!((owned[1].base, owned[1].committed, owned[1].size, owned[1].first, owned[1].code), (0x40000, 0x2000, 0x2000, (0, 0), false));
+        assert_eq!(owned_asks(&owned[0]), [0x11000, 0x12000, 0x20000, 0, 0, 0, 0, 0, 0]);
+        assert_eq!(owned_asks(&owned[1]), [0; 9]);
+        // (of many readable regions: the 1st, then the 2nd, 3rd, 5th, 9th, 17th, 33rd and 65th)
+        let mut many = Vec::new();
+        for k in 0..200usize {
+            owned_note(&mut many, (0, 0), 0x100_0000, 0x100_0000 + k * 0x2000, 0x1000, 0x04);
+        }
+        let region = |n: usize| 0x100_0000 + (n - 1) * 0x2000;
+        assert_eq!(owned_asks(&many[0]), [region(1), 0, region(2), region(3), region(5), region(9), region(17), region(33), region(65)]);
         assert_eq!([0u64, (1 << 20) - 1, 1 << 20, (16 << 20) - 1, 16 << 20, 64 << 20, 1 << 40].map(owned_size), [0, 0, 1, 1, 2, 3, 3]);
     }
 
@@ -1149,8 +1240,9 @@ mod tests {
         let bases = [0x10_0000usize, 0x20_0000, 0x30_0000];
         let heaps = [0x5000_0000usize];
         let images = [(0x7000_0000usize, 0x7010_0000usize), (0x7100_0000, 0x7100_1000)];
-        let name = |p: &[u8], at_base: bool, code: bool, committed: u64| owner(&[p], at_base, code, committed, &bases, &heaps, &images);
-        assert_eq!(owner(&[], true, true, 0x1000, &bases, &heaps, &images), Owner::Away);
+        let name = |p: &[u8], at_base: bool, code: bool, committed: u64| owner(&[p], at_base, false, code, committed, &bases, &heaps, &images);
+        assert_eq!(owner(&[], true, false, true, 0x1000, &bases, &heaps, &images), Owner::Away);
+        assert_eq!(owner(&[], false, true, true, 0x1000, &bases, &heaps, &images), Owner::HeapSegment);
         let segment = page(&[(2, 0xFFEE_FFEE), (9, 0x7000_0010), (10, 0x7000_0020)]);
         assert_eq!(name(&segment, true, false, 0x1000), Owner::HeapSegment);
         assert_eq!(name(&segment, false, false, 0x1000), Owner::Image(0));
@@ -1167,8 +1259,20 @@ mod tests {
         assert_eq!(name(&page(&[(3, 0x7100_0800), (7, 0x7100_0000), (8, 0x7000_0000), (9, 0x7100_1000)]), true, false, 0x1000), Owner::Image(1));
         // (the second page decides when the first has no pointers)
         let (plain, pointers) = (page(&[(1, 5)]), page(&[(1, 0x700f_fff8), (2, 0x7000_0000)]));
-        assert_eq!(owner(&[&plain, &pointers], true, false, 0x1000, &bases, &heaps, &images), Owner::Image(0));
-        assert_eq!(owner(&[&page(&[]), &page(&[])], true, false, 0x1000, &bases, &heaps, &images), Owner::Zero);
+        assert_eq!(owner(&[&plain, &pointers], true, false, false, 0x1000, &bases, &heaps, &images), Owner::Image(0));
+        assert_eq!(owner(&[&page(&[]), &page(&[])], true, false, false, 0x1000, &bases, &heaps, &images), Owner::Zero);
+    }
+
+    #[test]
+    fn segments_of_the_segment_heap_share_a_word_once_their_address_is_out() {
+        let key = 0x1234_5678_9abc_def0usize;
+        let mut starts: Vec<(usize, usize)> = (0..8).map(|k| (0x2000_0000 + (k << 24), (0x2000_0000 + (k << 24)) ^ key)).collect();
+        starts.extend((0..7).map(|k| (0x9000_0000 + (k << 24), (0x9000_0000 + (k << 24)) ^ 0x55)));
+        starts.push((0x1000_0000, 0x77));
+        starts.push((0x1100_0000, 0));
+        let found = heap_segments(&starts);
+        assert_eq!(found, (0..8).map(|k| 0x2000_0000 + (k << 24)).collect::<Vec<usize>>());
+        assert!(heap_segments(&[]).is_empty());
     }
 
     #[test]

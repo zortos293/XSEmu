@@ -169,7 +169,10 @@ pub(super) fn build(dxil: &[u8], samplers: &[crate::gpu::recomp::pso::StaticSamp
     let curve = compile_cost(dxil.len()).0;
     let physical = total_physical();
     let mut reserve = first_reserve(dxil.len(), PEAKS.lock().unwrap().as_ref().and_then(|m| m.get(&id).copied()));
-    for attempt in 1..=TRIES {
+    // (a try ended because the memory available fell is not counted: it waits for the memory
+    // again, as any compile that does not fit now)
+    let (mut attempt, mut dips) = (1, 0u32);
+    while attempt <= TRIES {
         if physical != 0 && reserve.saturating_add(URGENT_FLOOR) > physical {
             let why = format!(
                 "cannot build on this PC: {} ({} KB of DXIL) needs more than {} MiB in its helper, {} MiB of physical memory less the {} MiB floor",
@@ -209,11 +212,13 @@ pub(super) fn build(dxil: &[u8], samplers: &[crate::gpu::recomp::pso::StaticSamp
                 let next = next_reserve(reserve, peak, false);
                 crate::xlog_info!("D3D12.X: giant helper #{n}: {} outgrew its {} MiB limit (peak {} MiB): queued again at {} MiB", what(), reserve >> 20, peak >> 20, next >> 20);
                 reserve = next;
+                attempt += 1;
             }
             Outcome::Killed { peak, available } => {
                 let next = next_reserve(reserve, peak, true);
+                dips += 1;
                 crate::xlog_info!(
-                    "D3D12.X: giant helper #{n}: {} ended at {} MiB: the memory available fell to {} MiB (under {} MiB); queued again at {} MiB",
+                    "D3D12.X: giant helper #{n}: {} ended at {} MiB: the memory available fell to {} MiB (under {} MiB); queued again at {} MiB, still try {attempt} of {TRIES} (ended for memory {dips} times, not counted)",
                     what(), peak >> 20, available >> 20, KILL_BELOW >> 20, next >> 20
                 );
                 reserve = next;

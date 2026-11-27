@@ -299,7 +299,7 @@ fn loops_without_a_static_bound_within_the_guard_are_named() {
         let t = translate(code, &Options::default()).unwrap();
         assert!(t.complete(), "{:?}", t.unsupported);
         assert!(t.hlsl.contains(&format!("#define XCL_LOOP_GUARD {}u\n", super::loop_guard())) && t.hlsl.contains("static uint xcl_budget = XCL_LOOP_GUARD;"), "{}", t.hlsl);
-        assert!(t.hlsl.contains("for (;;)") && t.hlsl.contains("if (WaveActiveAnyTrue(xcl_budget == 0u)) { xcl_trip(0u); break; }"), "{}", t.hlsl);
+        assert!(t.hlsl.contains("for (;;)") && t.hlsl.contains("if (xcl_budget == 0u) { xcl_trip(0u); break; }"), "{}", t.hlsl);
         t.long_loops
     };
     // s0 = 0; do { s0 += 1 } while (s0 < 3)
@@ -337,6 +337,69 @@ fn gpu_a_spent_loop_budget_is_counted_once_per_lane() {
     io[super::IO_TRIP_AT] = 0x40;
     let out = runner::dispatch(&dxil, [2, 1, 1], &io, &vec![0u32; 64]).unwrap();
     assert_eq!(out[0x10..0x14], [128, 0, 0, 0], "{} per lane of 2 groups of 64", super::TRIP_KINDS[0]);
+}
+
+/// `f` with the base form's loop guard (`XCL_RECOMP_NO_LOOP_REGIONS`): for the tests of its one budget
+/// and its wave-wide exit.
+fn base_loop_guard<R>(f: impl FnOnce() -> R) -> R {
+    super::NO_LOOP_REGIONS.set(true);
+    let r = f();
+    super::NO_LOOP_REGIONS.set(false);
+    r
+}
+
+/// `f` with region budgets (`XCL_LOOP_GUARD_REGIONS`).
+fn with_loop_regions<R>(f: impl FnOnce() -> R) -> R {
+    super::LOOP_REGIONS.set(true);
+    let r = f();
+    super::LOOP_REGIONS.set(false);
+    r
+}
+
+/// With region budgets, a program's own spin that gives up at the loop budget, or just before it, must not leave the
+/// loops after it short of iterations: a retail FSR pass then published a flag built from a
+/// register its main loop never set, and the pass waiting on it spun for 260 ms a frame. Both
+/// HLSL forms (upstream ivall/xcl 287a931b; `loop_guard_tests` runs the same without a GPU).
+#[test]
+fn gpu_a_loop_after_a_spin_to_the_budget_still_runs() {
+    if !gpu_ready() {
+        return;
+    }
+    let guard = super::loop_guard();
+    for (spin, n, nested) in [(guard, 3, false), (guard - 16, 1000, false), (guard, 3, true)] {
+        let code = super::loop_guard_tests::spin_then_loop(spin, n, nested);
+        for structured in [true, false] {
+            let opt = Options { structured, ..runner::options(Mode::Kernel) };
+            let t = with_loop_regions(|| translate(&code, &opt)).unwrap();
+            let dxil = super::dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).unwrap();
+            let r = runner::run(&dxil, &KernelState::default(), &[]).unwrap();
+            let what = format!("spin {spin:#x}, loop {n}, nested {nested}, structured {structured}");
+            assert_eq!(r.sgpr[0], spin, "{what}: the spin ran to its own end");
+            assert_eq!((r.sgpr[1], r.sgpr[2]), (n, 7), "{what}: the loop after it ran all its iterations");
+        }
+    }
+}
+
+/// With region budgets, loops that never end still stop: `LOOP_BUDGETS_IN_ALL` budgets in all, then every loop leaves
+/// (upstream ivall/xcl 287a931b).
+#[test]
+fn gpu_endless_loops_in_many_regions_stop_at_the_total() {
+    if !gpu_ready() {
+        return;
+    }
+    // s0 = s1 = 0; six regions, each `s0 += 1` until s0 == 0 (2^32 tries); s1 counts the regions reached
+    let mut list: Vec<(&str, &str, &[(&str, u64)], Option<u32>)> = vec![("S_MOV_B32", "ENC_SOP1", &[("SDST", 0), ("SSRC0", 128)], None), ("S_MOV_B32", "ENC_SOP1", &[("SDST", 1), ("SSRC0", 128)], None)];
+    for _ in 0..6 {
+        list.push(("S_ADD_U32", "ENC_SOP2", &[("SDST", 1), ("SSRC0", 1), ("SSRC1", 129)], None));
+        list.push(("S_ADD_U32", "ENC_SOP2", &[("SDST", 0), ("SSRC0", 0), ("SSRC1", 129)], None));
+        list.push(("S_CMP_LG_U32", "ENC_SOPC", &[("SSRC0", 0), ("SSRC1", 128)], None));
+        list.push(("S_CBRANCH_SCC1", "ENC_SOPP", &[("SIMM16", 0xFFFD)], None));
+    }
+    let t = with_loop_regions(|| translate(&prog(&list), &runner::options(Mode::Kernel))).unwrap();
+    let dxil = super::dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).unwrap();
+    let r = runner::run(&dxil, &KernelState::default(), &[]).unwrap();
+    assert_eq!(r.sgpr[1], 6, "every region was reached");
+    assert_eq!(r.sgpr[0], super::LOOP_BUDGETS_IN_ALL * super::loop_guard(), "the program's total, and no more");
 }
 
 fn packed_compute_source(code: &[u8], threads: [u32; 3]) -> String {
@@ -688,6 +751,57 @@ fn outline_gate_state(threads: usize) -> (Vec<u32>, Vec<u32>, Vec<u32>) {
 /// A form of outlining: `emit::outline_statics`, `emit::outline_atomics`, `emit::outline_flat`.
 type OutlineForm = (bool, super::emit::OutlineAtomics, bool);
 
+/// `code` as the compute program of a driver container (`pso::fspx`): 64 threads a group, 4 user
+/// registers, three thread id components.
+fn fspx_container(code: &[u8]) -> Vec<u8> {
+    let mut head = vec![0u8; 0x1C];
+    head[0x0C..0x12].copy_from_slice(&[64, 0, 1, 0, 1, 0]);
+    head[0x18..].copy_from_slice(&(4u32 << 1 | 2 << 11).to_le_bytes());
+    let body = [vec![0u8; 0x24], code.to_vec()].concat();
+    let table = 0x10 + 2 * 16;
+    let mut part = [b"FSPX".as_slice(), &[0; 4], &2u32.to_le_bytes(), &[0; 4]].concat();
+    for (kind, at, len) in [(0u32, table, head.len()), (6, table + head.len(), body.len())] {
+        part.extend([kind, at as u32, len as u32, 0].iter().flat_map(|v| v.to_le_bytes()));
+    }
+    part.extend(head);
+    part.extend(body);
+    crate::gpu::xbox::tests::container(&[(b"ACCC", &part)])
+}
+
+/// The outline budget (`pso::outline_budget`) on `outline_gate_code` as a console program, built
+/// the way a run builds it: within the budget it is the packed program without calls; over it
+/// the legacy wave64 form without calls when that one fits; over it in both forms, and with no
+/// budget, the outlined program. Needs a DXC (`XCL_DXC_DIR`) for the outlined programs and a
+/// scratch `XCL_DXIL_CACHE` (the build writes the caches of a run); without them it does nothing.
+#[test]
+fn outline_budget_keeps_a_program_that_fits_without_calls() {
+    if std::env::var_os("XCL_DXC_DIR").is_none() || std::env::var_os("XCL_DXIL_CACHE").is_none() {
+        println!("XCL_DXC_DIR or XCL_DXIL_CACHE not set");
+        return;
+    }
+    let blob = fspx_container(&outline_gate_code());
+    let build = |budget: usize, legacy: bool| {
+        super::emit::OUTLINE.set(Some(true));
+        super::pso::OUTLINE_BUDGET.set(Some(budget));
+        let c = super::pso::compile_console_shader(&blob, super::pso::Stage::Compute, 0, 4, true, legacy);
+        super::emit::OUTLINE.set(None);
+        super::pso::OUTLINE_BUDGET.set(None);
+        c.unwrap_or_else(|e| panic!("budget {budget}, legacy {legacy}: {e}")).dxil
+    };
+    // a module of the direct backend is one function; DXC's outlined module is not one the interpreter reads
+    let calls = |dxil: &[u8]| xcl_dxil::interp::load(dxil).is_err();
+    let (packed, legacy) = (build(usize::MAX, false), build(usize::MAX, true));
+    assert!(!calls(&packed) && !calls(&legacy) && legacy.len() < packed.len(), "{} B packed, {} B legacy", packed.len(), legacy.len());
+    let (old, both_over) = (build(0, false), build(1, false));
+    assert!(calls(&old) && old.len() < packed.len(), "{} B outlined, {} B without calls", old.len(), packed.len());
+    assert!(both_over == old, "over the budget in both forms: {} B, not the outlined program's {} B", both_over.len(), old.len());
+    assert!(build(packed.len(), false) == packed, "a budget the packed program just fits");
+    assert!(build(packed.len() - 1, false) == legacy && build(legacy.len(), false) == legacy, "over the budget packed, within it in the legacy form");
+    assert!(build(legacy.len() - 1, false) == old, "a byte over the budget in the legacy form too");
+    assert!(calls(&build(1, true)) && build(legacy.len(), true) == legacy, "the legacy form alone");
+    println!("outline budget: {} B packed and {} B legacy without calls, {} B outlined", packed.len(), legacy.len(), old.len());
+}
+
 /// The forms of outlining the gate tests run, that of this run first.
 fn outline_forms() -> Vec<OutlineForm> {
     use super::emit::OutlineAtomics::{Add, All, None};
@@ -713,6 +827,20 @@ fn outline_form_name((statics, atomics, flat): OutlineForm) -> String {
 /// process; `XCL_OUTLINE_GATE_DUMP` names a folder for the program's code and the HLSL of every form.
 #[test]
 fn gpu_outlined_calls_atomics_and_loops_compute_the_same() {
+    // the accessors of this test are the earlier ones (`XCL_RECOMP_NO_COMPACT_ACCESS`); the next test has the compact ones
+    outline_gate(false, "gpu_outlined_calls_atomics_and_loops_compute_the_same");
+}
+
+/// The same gate with the compact accessors (`emit::compact_accessors`). Their `xcl_loadx4` is one
+/// loop of its own, so it calls no kept function in either nesting.
+#[test]
+fn gpu_outlined_calls_atomics_and_loops_compute_the_same_with_compact_accessors() {
+    outline_gate(true, "gpu_outlined_calls_atomics_and_loops_compute_the_same_with_compact_accessors");
+}
+
+/// The gate of the two tests above; `test` is the name the GPU part runs again by.
+fn outline_gate(compact: bool, test: &str) {
+    super::emit::NO_COMPACT_ACCESS.set(!compact);
     use super::emit::OutlineAtomics::{self, All};
     let code = outline_gate_code();
     // a child of this test (below) leaves the interpreter to its parent
@@ -744,6 +872,7 @@ fn gpu_outlined_calls_atomics_and_loops_compute_the_same() {
         let (io, mem, want) = outline_gate_state(threads);
         let plain = hlsl(None);
         assert!(!plain.contains("[noinline]"));
+        assert_eq!(plain.contains("uint2 xcl_at("), compact);
         let differ = |got: &[u32]| got.iter().zip(&want).enumerate().filter(|(_, (a, b))| a != b).map(|(w, (a, b))| format!("word {w}: {a:#x}, not {b:#x}")).take(8).collect::<Vec<_>>();
         if !child {
             assert_eq!(differ(&interpreted(&plain, &io, &mem)), Vec::<String>::new(), "interpreted, packed {packed}: the plain program");
@@ -758,7 +887,7 @@ fn gpu_outlined_calls_atomics_and_loops_compute_the_same() {
             assert_eq!(kept(&format!("xcl_mInterlockedAdd{r}")), form.1 != OutlineAtomics::None, "{}", name(*form));
             assert_eq!(kept("xcl_mInterlockedOr_n") && kept("xcl_mInterlockedMin_n") && kept("xcl_mInterlockedXor_n"), form.1 == All, "{}", name(*form));
             assert_eq!(text.contains(" out uint xr0"), !form.0, "{}", name(*form));
-            assert_eq!(text.contains("return uint4(xcl_mLoad_i(a.x), xcl_mLoad_i(a.y), xcl_mLoad_i(a.z), xcl_mLoad_i(a.w)); }"), form.2, "{}", name(*form));
+            assert_eq!(text.contains("return uint4(xcl_mLoad_i(a.x), xcl_mLoad_i(a.y), xcl_mLoad_i(a.z), xcl_mLoad_i(a.w)); }"), form.2 && !compact, "{}", name(*form));
             if !child {
                 assert_eq!(differ(&interpreted(&text, &io, &mem)), Vec::<String>::new(), "interpreted, packed {packed}: outlined, {}", name(*form));
             }
@@ -775,7 +904,7 @@ fn gpu_outlined_calls_atomics_and_loops_compute_the_same() {
         let mut lost = Vec::new();
         for form in &forms {
             let out = std::process::Command::new(std::env::current_exe().unwrap())
-                .args(["gpu::recomp::tests::gpu_outlined_calls_atomics_and_loops_compute_the_same", "--exact", "--nocapture", "--test-threads=1"])
+                .args([format!("gpu::recomp::tests::{test}").as_str(), "--exact", "--nocapture", "--test-threads=1"])
                 .envs([("XCL_OUTLINE_GATE_FORMS", name(*form)), ("XCL_OUTLINE_GATE_CHILD", "1".to_string())])
                 .env_remove("XCL_OUTLINE_GATE_DUMP")
                 .output()
@@ -814,6 +943,17 @@ fn gpu_outlined_calls_atomics_and_loops_compute_the_same() {
 /// (`emit::plain_load_limit`) and the program leaves the memory it leaves with every load coherent.
 #[test]
 fn gpu_plain_loads_read_what_coherent_loads_read() {
+    // through a group's pages, then with them folded (`emit::group_fold`)
+    // and with the buffer load, alone on its base, in a group of its own or not (`emit::lone_loads`)
+    for (fold, lone) in [(false, false), (true, false), (false, true), (true, true)] {
+        super::emit::NO_GROUP_FOLD.set(!fold);
+        super::emit::NO_LONE_LOADS.set(!lone);
+        gpu_plain_loads(fold, lone);
+    }
+    super::emit::NO_LONE_LOADS.set(false);
+}
+
+fn gpu_plain_loads(fold: bool, lone: bool) {
     let code = prog(&[
         ("S_LOAD_DWORDX4", "ENC_SMEM", &[("SDATA", 8), ("SBASE", 1), ("SOFFSET", 125)], None),
         ("S_BUFFER_LOAD_DWORDX4", "ENC_SMEM", &[("SDATA", 12), ("SBASE", 4), ("SOFFSET", 125)], None),
@@ -850,7 +990,9 @@ fn gpu_plain_loads_read_what_coherent_loads_read() {
             let (coherent, plain) = (hlsl(false), hlsl(true));
             assert!(coherent.contains("globallycoherent ") && !coherent.contains("_cached"), "{coherent}");
             let body = plain.split_once("void main(").unwrap().1;
-            assert!(body.contains(" = xcl_m_cachedLoad4") && body.contains("xcl_loadx4") && body.contains("_cached(") && body.contains(" = xcl_mLoad"), "{body}");
+            let four = if fold && !packed && !lone { "xcl_m_cachedLoad4X(" } else if lone && !packed { "xcl_loadx4_cached(" } else { "xcl_loadx4" };
+            assert!(body.contains(" = xcl_m_cachedLoad4") && body.contains(four) && body.contains("_cached") && body.contains(" = xcl_mLoad"), "{body}");
+            assert_eq!(body.contains("Fold("), fold && !packed);
             (packed, threads, coherent, plain)
         })
         .collect();
@@ -915,7 +1057,7 @@ fn gpu_packed_loop_profile_reports_natural_and_shared_budget_exits() {
         ("V_MOV_B32", "ENC_VOP1", &[("VDST", 0), ("SRC0", 128)], None),
     ]);
     let mode = Mode::Compute(super::CsInterface { threads: [64, 1, 1], user_sgprs: 4, tgid: [false; 3], tg_size: false, tid_components: 1 });
-    let hlsl = translate(&code, &Options { mode, wave64: true, split_wave64: true, legacy_compute_wave64: false, loop_profile: true, ..Default::default() }).unwrap().hlsl;
+    let hlsl = base_loop_guard(|| translate(&code, &Options { mode, wave64: true, split_wave64: true, legacy_compute_wave64: false, loop_profile: true, ..Default::default() })).unwrap().hlsl;
     assert!(hlsl.contains("xcl_lp_done(0u, 5u, xcl_lp_n, xcl_lp_exit, 7u);"));
     if !gpu_ready() {
         return;
@@ -946,7 +1088,7 @@ fn gpu_packed_compute_nested_loops_share_the_total_budget() {
         ("V_MOV_B32", "ENC_VOP1", &[("VDST", 3), ("SRC0", 10)], None),
         ("GLOBAL_STORE_DWORD", "ENC_FLAT_GLBL", &[("ADDR", 1), ("DATA", 3), ("SADDR", 0x7D)], None),
     ]);
-    let hlsl = packed_compute_source(&code, [96, 1, 1]).replace(&format!("#define XCL_LOOP_GUARD {}u", super::loop_guard()), "#define XCL_LOOP_GUARD 5u");
+    let hlsl = base_loop_guard(|| packed_compute_source(&code, [96, 1, 1])).replace(&format!("#define XCL_LOOP_GUARD {}u", super::loop_guard()), "#define XCL_LOOP_GUARD 5u");
     assert_eq!(hlsl.matches("static uint xcl_budget =").count(), 1);
     assert_eq!(hlsl.matches("xcl_budget -= min(xcl_budget, 1u);").count(), 2);
     let out = run_packed_compute(&hlsl, 96);
@@ -971,7 +1113,7 @@ fn gpu_loop_budget_exits_with_the_wave_when_a_nonfirst_lane_runs_out() {
     ]);
     for (wave64, legacy_compute_wave64, lanes) in [(false, false, 32), (true, false, 64), (true, true, 64)] {
         let cs = super::CsInterface { threads: [lanes, 1, 1], user_sgprs: 4, tgid: [false; 3], tg_size: false, tid_components: 1 };
-        let t = translate(&code, &Options { mode: Mode::Compute(cs), wave64, split_wave64: true, legacy_compute_wave64, ..Default::default() }).unwrap();
+        let t = base_loop_guard(|| translate(&code, &Options { mode: Mode::Compute(cs), wave64, split_wave64: true, legacy_compute_wave64, ..Default::default() })).unwrap();
         assert!(t.complete(), "{:?}", t.unsupported_why);
         let entry = t.hlsl.rfind("void main(").unwrap();
         assert_eq!(t.hlsl[entry..].matches("[loop] for (;;) {").count(), 1);
@@ -3440,7 +3582,15 @@ fn gpu_raw_view_spans_a_memory_window() {
             io.Store(0u, w.Load(0u)); io.Store(4u, w.Load(0xFFFFFFFCu)); io.Store(8u, w.Load(0x80000000u));\n\
         }\n";
     let dxil = super::dxc::compile(src, "main", "cs_6_6", &[]).unwrap();
-    let r = runner::run_with_window_view(&dxil, 1 << 32).unwrap();
+    let r = match runner::run_with_window_view(&dxil, 1 << 32) {
+        Ok(r) => r,
+        // The window itself is the subject: an adapter that cannot reserve 4 GiB (WARP on the CI
+        // runner) has nothing for this test to prove.
+        Err(e) if e.contains("CreateReservedResource") => {
+            return runner::skip_test(&format!("no 4 GiB memory window ({e})"));
+        }
+        Err(e) => panic!("{e}"),
+    };
     assert_eq!(&r[..3], &[0x1111_1111, 0x2222_2222, 0]);
 }
 
@@ -5456,7 +5606,9 @@ fn gpu_memory_windows_above_4_gib() {
     let one = translate(&p, &Options::default()).unwrap();
     assert!(!one.hlsl.contains("xcl_w =") && !one.hlsl.contains("min(xcl_w") && one.hlsl.contains("ResourceDescriptorHeap[xcl_mem_views]"), "one window: no window selection");
     let t = translate(&p, &on_gpu(Options { mem_windows: 2, ..Default::default() })).unwrap();
-    assert!(t.hlsl.contains("ResourceDescriptorHeap[xcl_mem_views + xcl_w]") && t.hlsl.contains("ResourceDescriptorHeap[NonUniformResourceIndex(xcl_mem_views + xcl_wv)]") && t.hlsl.contains("_w < 2u, "), "{}", t.hlsl);
+    let earlier = t.hlsl.contains("ResourceDescriptorHeap[xcl_mem_views + xcl_w]") && t.hlsl.contains("ResourceDescriptorHeap[NonUniformResourceIndex(xcl_mem_views + xcl_wv)]");
+    let compact = t.hlsl.contains("select(f, xcl_mem_views + xcl_w, p.x)") && t.hlsl.contains("select(f, xcl_mem_views + xcl_wv, p.x)");
+    assert!((earlier || compact) && t.hlsl.contains("_w < 2u, "), "{}", t.hlsl);
     assert!(!t.hlsl.contains("register(u2)") && !t.hlsl.contains("switch (xcl_w)"));
     let dxil = super::dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).map_err(|e| format!("{e}\n{}", t.hlsl)).unwrap();
     let hi = |a: u64| (a >> 32) as u32;
@@ -8544,6 +8696,110 @@ fn split_wave64_meet_in_a_half_divergent_branch_keeps_the_spin() {
     }
 }
 
+// xsemu: from xcl-dev/xcl nvidia-dev 9b455a1a,67a08dbe crates/xcl/src/gpu/recomp/tests.rs
+/// The split form keeps the console wave's order of LDS accesses across its halves
+/// (`xcl_x_lw`): an LDS read meets the other half first when LDS may have been written since the
+/// halves last met, a write when it may have been read (on the console every lane reads before
+/// any lane of a later instruction writes), an atomic in either case; every meet and `s_barrier`
+/// clears the bits. A program that writes no LDS gets no such meet, nor does the native form.
+#[test]
+fn split_wave64_lds_reads_meet_after_writes() {
+    type Inst = (&'static str, &'static str, &'static [(&'static str, u64)], Option<u32>);
+    let write: Inst = ("DS_WRITE_B32", "ENC_DS", &[("ADDR", 1), ("DATA0", 0)], None);
+    let read: Inst = ("DS_READ_B32", "ENC_DS", &[("VDST", 2), ("ADDR", 1)], None);
+    let add: Inst = ("DS_ADD_U32", "ENC_DS", &[("ADDR", 1), ("DATA0", 0)], None);
+    let barrier: Inst = ("S_BARRIER", "ENC_SOPP", &[], None);
+    let lane: Inst = ("V_READFIRSTLANE_B32", "ENC_VOP1", &[("VDST", 0), ("SRC0", V)], None);
+    // a read waits for writes (bit 1), a write for reads (bit 2), an atomic for both
+    const AFTER_WRITE: &str = "if ((xcl_x_lw & 1u) != 0u) xcl_x_meet();";
+    const AFTER_READ: &str = "if ((xcl_x_lw & 2u) != 0u) xcl_x_meet();";
+    const AFTER_ANY: &str = "if ((xcl_x_lw & 3u) != 0u) xcl_x_meet();";
+    const WROTE: &str = "xcl_x_lw |= 1u;";
+    const READ: &str = "xcl_x_lw |= 2u;";
+    const BOTH: &str = "xcl_x_lw |= 3u;";
+    const CLEAR: &str = "xcl_x_lw = 0u;";
+    let split = Options { mode: Mode::Kernel, wave64: true, split_wave64: true, ..Default::default() };
+    let hlsl = |list: &[Inst], o: &Options| {
+        let t = translate(&prog(list), o).unwrap();
+        assert!(t.complete(), "{:?}", t.unsupported_why);
+        if super::dxc::location().is_ok() {
+            super::dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).unwrap_or_else(|e| panic!("{e}\n{}", t.hlsl));
+        }
+        t.hlsl
+    };
+    let main = |h: &str| h[h.find("void main(").unwrap()..].to_string();
+    // every meet clears the bits, also one without a partner half
+    let h = hlsl(&[write, read], &split);
+    let meet = &h[h.find("bool xcl_x_meet()").unwrap()..];
+    assert!(meet.find(CLEAR).unwrap() < meet.find("if (xcl_xn == 0u) return false;").unwrap(), "{meet}");
+    // the hazard: a write, then a read with nothing between: the read meets first
+    let m = main(&h);
+    let (wrote, wait, at) = (m.find(WROTE).unwrap(), m.find(AFTER_WRITE).unwrap(), m.rfind("= xcl_lds[").unwrap());
+    assert!(wrote < wait && wait < at, "the meet between the write and the read:\n{m}");
+    // the other way round: a read, then a write – the write meets first, so the other half has
+    // read before this one writes
+    let m = main(&hlsl(&[read, write], &split));
+    let (read_at, wait, write_at) = (m.find("= xcl_lds[").unwrap(), m.find(AFTER_READ).unwrap(), m.find("] = v0;").unwrap());
+    assert!(m.find(READ).unwrap() < wait && read_at < wait && wait < write_at, "the meet between the read and the write:\n{m}");
+    // an atomic waits for both and sets both
+    let m = main(&hlsl(&[read, write, add, read], &split));
+    assert_eq!([AFTER_WRITE, AFTER_READ, AFTER_ANY, WROTE, READ, BOTH].map(|x| m.matches(x).count()), [2, 1, 1, 1, 2, 1], "{m}");
+    // s_barrier: both halves made their accesses before it
+    let m = main(&hlsl(&[write, barrier, read], &split));
+    let (sync, clear, wait) = (m.find("GroupMemoryBarrierWithGroupSync();").unwrap(), m.find(CLEAR).unwrap(), m.find(AFTER_WRITE).unwrap());
+    assert!(sync < clear && clear < wait, "{m}");
+    // no LDS write: no bits at all, LDS or not; the native form has none either
+    for (what, list, o) in [
+        ("reads only", &[read, read][..], split.clone()),
+        ("no LDS", &[lane][..], split.clone()),
+        ("native wave64", &[write, read, add][..], Options { split_wave64: false, ..split.clone() }),
+    ] {
+        let m = main(&hlsl(list, &o));
+        assert!(!m.contains("xcl_x_lw"), "{what}:\n{m}");
+    }
+    // a compute group of several console waves (the counters' meet) and one of a single half
+    // (xsemu: the halves form of compute is the legacy wave64 form; the packed form runs both
+    // halves in one hardware wave, in order, and needs no meet)
+    for threads in [128u32, 32] {
+        let cs = super::CsInterface { threads: [threads, 1, 1], user_sgprs: 2, tgid: [false; 3], tg_size: false, tid_components: 1 };
+        let h = hlsl(&[write, read], &Options { mode: Mode::Compute(cs.clone()), legacy_compute_wave64: true, ..split.clone() });
+        assert!(h.contains(AFTER_WRITE) && h.contains(WROTE), "{threads} threads");
+        let packed = hlsl(&[write, read], &Options { mode: Mode::Compute(cs), legacy_compute_wave64: false, ..split.clone() });
+        assert!(!packed.contains("xcl_x_lw"), "{threads} threads, packed:\n{packed}");
+    }
+    // `XCL_X_LDS_ORDER=0` turns it off (the earlier form)
+    use super::emit::lds_order_for;
+    assert!(lds_order_for(None) && lds_order_for(Some("1")) && lds_order_for(Some("")));
+    assert!(!lds_order_for(Some("0")) && !lds_order_for(Some(" 0 ")));
+}
+
+/// `XCL_X_LDS_ORDER=0` gives the split form's text from before the LDS order exactly: no
+/// `xcl_x_lw` anywhere, and the ordered text is that one plus its `xcl_x_lw` lines alone.
+#[test]
+fn split_wave64_lds_order_off_is_the_earlier_text() {
+    type Inst = (&'static str, &'static str, &'static [(&'static str, u64)], Option<u32>);
+    let write: Inst = ("DS_WRITE_B32", "ENC_DS", &[("ADDR", 1), ("DATA0", 0)], None);
+    let read: Inst = ("DS_READ_B32", "ENC_DS", &[("VDST", 2), ("ADDR", 1)], None);
+    let add: Inst = ("DS_ADD_U32", "ENC_DS", &[("ADDR", 1), ("DATA0", 0)], None);
+    let barrier: Inst = ("S_BARRIER", "ENC_SOPP", &[], None);
+    let code = prog(&[write, read, add, barrier, read, write]);
+    let kernel = Options { mode: Mode::Kernel, wave64: true, split_wave64: true, ..Default::default() };
+    let cs = |threads: u32| Options {
+        mode: Mode::Compute(super::CsInterface { threads: [threads, 1, 1], user_sgprs: 2, tgid: [false; 3], tg_size: false, tid_components: 1 }),
+        legacy_compute_wave64: true,
+        ..kernel.clone()
+    };
+    for (what, o) in [("kernel", kernel.clone()), ("compute 64", cs(64)), ("compute 128", cs(128))] {
+        let on = translate(&code, &o).unwrap().hlsl;
+        super::emit::NO_LDS_ORDER.set(true);
+        let off = translate(&code, &o).unwrap().hlsl;
+        super::emit::NO_LDS_ORDER.set(false);
+        assert!(on.contains("xcl_x_lw") && !off.contains("xcl_x_lw"), "{what}:\n{off}");
+        let stripped: Vec<&str> = on.lines().filter(|l| !l.contains("xcl_x_lw")).collect();
+        assert_eq!(stripped, off.lines().collect::<Vec<_>>(), "{what}");
+    }
+}
+
 /// Mesh mode for a GPU with 32-lane waves only: the console's two wave64s per group as four
 /// hardware wave32s exchanging masks and lane reads (counter-paired: two console waves),
 /// programs with cross-half operations included; native wave64 and wave32 programs unchanged.
@@ -8625,6 +8881,124 @@ fn gpu_split_wave64_cross_half_operations() {
         assert_eq!(v[5], (l as u32).min(40), "lane {l}: v_mbcnt over vcc");
         assert_eq!(v[2], if l >= 48 { 1048 } else { 0x77 }, "lane {l}: write under exec of the upper half");
         assert_eq!(v[6], 1000 + 63 - l as u32, "lane {l}: ds_bpermute from lane {}", 63 - l);
+    }
+}
+
+// xsemu: from xcl-dev/xcl nvidia-dev 9b455a1a,67a08dbe crates/xcl/src/gpu/recomp/tests.rs
+/// LDS written by the upper half and read by lane 0 with nothing between that makes the halves
+/// meet: the console's wave runs both for all 64 lanes in order, so lane 0 sees the writes. The
+/// upper half writes only after a chain of dependent global loads its lanes alone make, so in
+/// the split form (32-lane GPUs) the lower half reaches the read first unless the read waits
+/// for it (`xcl_x_lw`). A plain store and an atomic or; then the other order: every lane reads
+/// (the upper half late) and lane 0 overwrites what they read, which the lower half must not do
+/// before the upper half has read. Groups of one console wave (the group barrier's meet) and
+/// of several (the counters'). xsemu: compute in the halves form is the legacy wave64 form
+/// (the packed form runs both halves in one hardware wave), and HLSL is the only translator.
+#[test]
+fn gpu_split_wave64_lds_write_then_read_across_halves() {
+    if !gpu_ready() {
+        return;
+    }
+    use super::{dxc, CsInterface};
+    const LOADS: usize = 16;
+    const MARKER: u32 = 0x600D;
+    // s0 = output base, s1 = the load chain's first address, s2 = MARKER - 1, s3 =
+    // log2(threads), s4 = MARKER, s5 = group id; v0 = thread index in the group
+    let mut list: Vec<(&str, &str, Vec<(&str, u64)>, Option<u32>)> = vec![
+        ("V_MOV_B32", "ENC_VOP1", vec![("VDST", 5), ("SRC0", 128)], None),
+        ("V_MOV_B32", "ENC_VOP1", vec![("VDST", 6), ("SRC0", 128)], None),
+        ("V_AND_B32", "ENC_VOP2", vec![("VDST", 2), ("SRC0", 128 + 31), ("VSRC1", 0)], None), // lane & 31
+        ("V_LSHRREV_B32", "ENC_VOP2", vec![("VDST", 1), ("SRC0", 134), ("VSRC1", 0)], None), // console wave
+        ("V_LSHLREV_B32", "ENC_VOP2", vec![("VDST", 1), ("SRC0", 130), ("VSRC1", 1)], None), // its LDS dword
+        // lane 0 clears the wave's two dwords (at v1 and v1 + 256)
+        ("S_MOV_B32", "ENC_SOP1", vec![("SDST", 126), ("SSRC0", 129)], None),
+        ("S_MOV_B32", "ENC_SOP1", vec![("SDST", 127), ("SSRC0", 128)], None),
+        ("V_MOV_B32", "ENC_VOP1", vec![("VDST", 3), ("SRC0", 128)], None),
+        ("DS_WRITE2_B32", "ENC_DS", vec![("ADDR", 1), ("DATA0", 3), ("DATA1", 3), ("OFFSET0", 0), ("OFFSET1", 64)], None),
+        // a mask read whole: the halves meet (after the clear, before the writes below)
+        ("S_MOV_B64", "ENC_SOP1", vec![("SDST", 126), ("SSRC0", 193)], None),
+        ("V_CMP_GT_U32", "ENC_VOPC", vec![("SRC0", 255), ("VSRC1", 0)], Some(40)),
+        ("S_BCNT1_I32_B64", "ENC_SOP1", vec![("SDST", 20), ("SSRC0", 106)], None),
+        // lanes 32..63: the load chain, then lds[v1] = MARKER, lds[v1 + 256] |= 1 << (lane - 32)
+        ("S_MOV_B32", "ENC_SOP1", vec![("SDST", 126), ("SSRC0", 128)], None),
+        ("S_MOV_B32", "ENC_SOP1", vec![("SDST", 127), ("SSRC0", 193)], None),
+        ("V_MOV_B32", "ENC_VOP1", vec![("VDST", 10), ("SRC0", 1)], None),
+        ("V_MOV_B32", "ENC_VOP1", vec![("VDST", 11), ("SRC0", 128)], None),
+    ];
+    for _ in 0..LOADS {
+        list.push(("GLOBAL_LOAD_DWORD", "ENC_FLAT_GLBL", vec![("VDST", 10), ("ADDR", 10), ("SADDR", 0x7D)], None));
+    }
+    list.extend([
+        ("DS_WRITE_B32", "ENC_DS", vec![("ADDR", 1), ("DATA0", 10)], None),
+        ("V_SUBREV_NC_U32", "ENC_VOP2", vec![("VDST", 12), ("SRC0", 2), ("VSRC1", 10)], None), // v10 - s2 = 1
+        ("V_LSHLREV_B32", "ENC_VOP2", vec![("VDST", 12), ("SRC0", V + 2), ("VSRC1", 12)], None),
+        ("DS_OR_B32", "ENC_DS", vec![("ADDR", 1), ("DATA0", 12), ("OFFSET0", 0), ("OFFSET1", 1)], None),
+        // lane 0 reads both, no exchange since the writes
+        ("S_MOV_B32", "ENC_SOP1", vec![("SDST", 126), ("SSRC0", 129)], None),
+        ("S_MOV_B32", "ENC_SOP1", vec![("SDST", 127), ("SSRC0", 128)], None),
+        ("DS_READ2_B32", "ENC_DS", vec![("VDST", 5), ("ADDR", 1), ("OFFSET0", 0), ("OFFSET1", 64)], None),
+        // read, then write: every lane reads lds[v1] (MARKER), the upper half only after a
+        // second load chain (its address depends on it); then lane 0 clears it with nothing
+        // between – the console's lanes all read before the clear
+        ("S_MOV_B64", "ENC_SOP1", vec![("SDST", 126), ("SSRC0", 193)], None),
+        ("V_MOV_B32", "ENC_VOP1", vec![("VDST", 14), ("SRC0", 4)], None), // MARKER
+        ("S_MOV_B32", "ENC_SOP1", vec![("SDST", 126), ("SSRC0", 128)], None),
+        ("S_MOV_B32", "ENC_SOP1", vec![("SDST", 127), ("SSRC0", 193)], None),
+        ("V_MOV_B32", "ENC_VOP1", vec![("VDST", 14), ("SRC0", 1)], None),
+        ("V_MOV_B32", "ENC_VOP1", vec![("VDST", 15), ("SRC0", 128)], None),
+    ]);
+    for _ in 0..LOADS {
+        list.push(("GLOBAL_LOAD_DWORD", "ENC_FLAT_GLBL", vec![("VDST", 14), ("ADDR", 14), ("SADDR", 0x7D)], None));
+    }
+    list.extend([
+        ("S_MOV_B64", "ENC_SOP1", vec![("SDST", 126), ("SSRC0", 193)], None),
+        ("V_SUBREV_NC_U32", "ENC_VOP2", vec![("VDST", 15), ("SRC0", 4), ("VSRC1", 14)], None), // 0
+        ("V_ADD_NC_U32", "ENC_VOP2", vec![("VDST", 15), ("SRC0", V + 1), ("VSRC1", 15)], None), // v1
+        ("DS_READ_B32", "ENC_DS", vec![("VDST", 7), ("ADDR", 15)], None),
+        ("S_MOV_B32", "ENC_SOP1", vec![("SDST", 126), ("SSRC0", 129)], None),
+        ("S_MOV_B32", "ENC_SOP1", vec![("SDST", 127), ("SSRC0", 128)], None),
+        ("DS_WRITE_B32", "ENC_DS", vec![("ADDR", 1), ("DATA0", 3)], None),
+        // out[group · threads + thread] = (v5, v6, v7, 0)
+        ("S_MOV_B64", "ENC_SOP1", vec![("SDST", 126), ("SSRC0", 193)], None),
+        ("V_MOV_B32", "ENC_VOP1", vec![("VDST", 8), ("SRC0", 128)], None),
+        ("S_LSHL_B32", "ENC_SOP2", vec![("SDST", 16), ("SSRC0", 5), ("SSRC1", 3)], None), // s3 = log2(threads)
+        ("V_ADD_NC_U32", "ENC_VOP2", vec![("VDST", 20), ("SRC0", 16), ("VSRC1", 0)], None),
+        ("V_LSHLREV_B32", "ENC_VOP2", vec![("VDST", 20), ("SRC0", 132), ("VSRC1", 20)], None),
+        ("V_ADD_NC_U32", "ENC_VOP2", vec![("VDST", 20), ("SRC0", 0), ("VSRC1", 20)], None),
+        ("V_MOV_B32", "ENC_VOP1", vec![("VDST", 21), ("SRC0", 128)], None),
+        ("GLOBAL_STORE_DWORDX4", "ENC_FLAT_GLBL", vec![("ADDR", 20), ("DATA", 5), ("SADDR", 0x7D)], None),
+    ]);
+    let refs: Vec<(&str, &str, &[(&str, u64)], Option<u32>)> = list.iter().map(|(n, e, f, l)| (*n, *e, &f[..], *l)).collect();
+    let p = prog(&refs);
+    let chain = 0x40u32;
+    let base = 0x1000usize;
+    let groups = 64usize;
+    for threads in [64u32, 128, 256] {
+        let cs = CsInterface { threads: [threads, 1, 1], user_sgprs: 5, tgid: [true, false, false], tg_size: false, tid_components: 1 };
+        let opt = on_gpu(Options { mode: Mode::Compute(cs), wave64: true, legacy_compute_wave64: true, ..Default::default() });
+        let t = translate(&p, &opt).unwrap();
+        assert!(t.complete(), "{:?}", t.unsupported_why);
+        if runner::split_wave64() {
+            // every LDS instruction tests the bits (2 writes, the or, 2 reads, the clear)
+            assert_eq!(t.hlsl.matches(") != 0u) xcl_x_meet();").count(), 6, "{threads} threads");
+        }
+        let dxil = dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).unwrap_or_else(|e| panic!("{e}"));
+        let mut io = vec![0u32; 128];
+        io[..5].copy_from_slice(&[base as u32, chain, MARKER - 1, threads.trailing_zeros(), MARKER]);
+        let mut mem = vec![0u32; (base + groups * threads as usize * 16) / 4];
+        // mem[chain + 4k] = chain + 4 (k + 1), the last one MARKER
+        for k in 0..LOADS {
+            mem[chain as usize / 4 + k] = if k + 1 == LOADS { MARKER } else { chain + 4 * (k as u32 + 1) };
+        }
+        let out = runner::dispatch(&dxil, [groups as u32, 1, 1], &io, &mem).unwrap();
+        for g in 0..groups {
+            for tid in 0..threads as usize {
+                let at = (base + (g * threads as usize + tid) * 16) / 4;
+                let want = if tid % 64 == 0 { (MARKER, u32::MAX) } else { (0, 0) };
+                assert_eq!((out[at], out[at + 1]), want, "{threads} threads, group {g} thread {tid}: the upper half's store and or");
+                assert_eq!(out[at + 2], MARKER, "{threads} threads, group {g} thread {tid}: read before lane 0's clear");
+            }
+        }
     }
 }
 
@@ -11351,6 +11725,7 @@ fn gpu_ps_mask_loop_on_a_primitive_edge_ends() {
 /// in the user registers and in 256 KiB of window 0 read as a pointer into that window, as a
 /// count and as a buffer's base, so a title program gets past its first tests and its loads
 /// stay in the window; "zero" leaves both zeroed, and most programs leave at their first count.
+/// `XCL_REPRO_SAVE=<folder>` keeps each program's DXIL there as `<input's name>.dxil`.
 /// Without `XCL_REPRO` the test does nothing.
 #[test]
 fn gpu_repro_programs() {
@@ -11480,6 +11855,9 @@ fn repro_one(path: &std::path::Path) -> String {
         Err(e) => return format!("NOT BUILT in {:.1} s: {}", t0.elapsed().as_secs_f64(), e.lines().next().unwrap_or_default()),
     };
     let built = format!("{} B of DXIL in {:.1} s", dxil.len(), t0.elapsed().as_secs_f64());
+    if let Some(dir) = std::env::var_os("XCL_REPRO_SAVE") {
+        let _ = std::fs::write(std::path::Path::new(&dir).join(path.file_name().unwrap_or_default()).with_extension("dxil"), &dxil);
+    }
     if !gpu_ready() {
         return format!("{built}; no GPU, not dispatched");
     }

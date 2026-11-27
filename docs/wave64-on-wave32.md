@@ -205,6 +205,10 @@ emitter does, not only the ISA's operand tables:
   its top, and in the `pc` dispatcher form before each of its blocks, to the code after it or
   (dispatcher) the end of the program: what is live there is live before each instruction of
   the loop.
+  The guard tests the lane's own count (`xcl_budget`), with no wave operation: both halves
+  take the same branches, so their lanes count the same guards and all leave at the same
+  iteration, and region budgets (`XCL_LOOP_GUARD_REGIONS`, `loop_budget`) are refilled at the
+  same loop in both.
 
 A mask with no destination (VOP3 compare into NULL) or one that is 0 in every lane (the
 `false` mask of `v_div_scale`) is not exchanged either. Both halves make the same static

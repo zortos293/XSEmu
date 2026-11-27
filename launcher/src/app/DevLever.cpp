@@ -11,6 +11,7 @@
 #include "core/RunnerManager.h"
 #include "pages/RunnerUi.h"
 #include "core/TitleConfig.h"
+#include "pages/ArtworkCard.h"
 #include "pages/FirstLaunchPage.h"
 #include "pages/GameDetailsPage.h"
 #include "pages/ImportSettingsDialog.h"
@@ -326,6 +327,23 @@ QImage paintArt(const QString& kind, QSize size)
     return img;
 }
 
+// A stand-in logo: the title in heavy white capitals on a transparent background.
+QImage paintLogo(const QString& title, QSize size)
+{
+    QImage img(size, QImage::Format_ARGB32_Premultiplied);
+    img.fill(Qt::transparent);
+    QPainter p(&img);
+    p.setRenderHint(QPainter::Antialiasing);
+    QFont f = p.font();
+    f.setPixelSize(size.height() / 3);
+    f.setWeight(QFont::Black);
+    f.setLetterSpacing(QFont::PercentageSpacing, 104);
+    p.setFont(f);
+    p.setPen(QColor(0xFF, 0xF4, 0xE0));
+    p.drawText(QRect(QPoint(0, 0), size), Qt::AlignCenter | Qt::TextWordWrap, title.toUpper());
+    return img;
+}
+
 void seedArt(Services& s, const Game& g, const QString& kind, bool hero)
 {
     if (!g.isValid())
@@ -335,11 +353,17 @@ void seedArt(Services& s, const Game& g, const QString& kind, bool hero)
     CoverCache::Entry e;
     e.name = g.title();
     e.fetchedAt = QDateTime::currentDateTime();
-    e.grid = CoverCache::fileName(g.titleId(), CoverCache::Kind::Grid, QStringLiteral("png"));
-    paintArt(kind, QSize(600, 900)).save(QDir(dir).filePath(e.grid));
+    e.gameId = kind == QLatin1String("coast") ? 1001 : 1002;
+    QString& grid = e.file(CoverCache::Kind::Grid);
+    grid = CoverCache::fileName(g.titleId(), CoverCache::Kind::Grid, QStringLiteral("png"));
+    paintArt(kind, QSize(600, 900)).save(QDir(dir).filePath(grid));
     if (hero) {
-        e.hero = CoverCache::fileName(g.titleId(), CoverCache::Kind::Hero, QStringLiteral("png"));
-        paintArt(kind, QSize(1920, 620)).save(QDir(dir).filePath(e.hero));
+        QString& heroFile = e.file(CoverCache::Kind::Hero);
+        heroFile = CoverCache::fileName(g.titleId(), CoverCache::Kind::Hero, QStringLiteral("png"));
+        paintArt(kind, QSize(1920, 620)).save(QDir(dir).filePath(heroFile));
+        QString& logo = e.file(CoverCache::Kind::Logo);
+        logo = CoverCache::fileName(g.titleId(), CoverCache::Kind::Logo, QStringLiteral("png"));
+        paintLogo(g.title(), QSize(800, 240)).save(QDir(dir).filePath(logo));
     }
     s.covers.cache().put(g.titleId(), e);
     emit s.covers.artChanged(g.titleId()); // drops the decoded art Services kept from before
@@ -354,6 +378,10 @@ void seedLibrary(Services& s)
     const Game quiet = findGame(s, QStringLiteral("The Long Quiet Between Lighthouses"));
     seedArt(s, coast, QStringLiteral("coast"), true);
     seedArt(s, quiet, QStringLiteral("quiet"), false);
+    CoverCache::Entry notFound;
+    notFound.notFound = true;
+    notFound.fetchedAt = QDateTime::currentDateTimeUtc();
+    s.covers.cache().put(findGame(s, QStringLiteral("Signal Garden")).titleId(), notFound);
     s.settings.addPlayTime(coast.titleId(), 41 * 3600 + 20 * 60, now.addSecs(-3 * 3600));
     s.settings.addPlayTime(quiet.titleId(), 6 * 3600, now.addDays(-2));
     WarmupRun cancelled;
@@ -413,7 +441,7 @@ QStringList DevLever::states()
         QStringLiteral("in-game-boot-error"), QStringLiteral("in-game-back-to-library"),
         QStringLiteral("runners"), QStringLiteral("runners-install-confirm"), QStringLiteral("runners-building"),
         QStringLiteral("runners-install-error"), QStringLiteral("runners-change-location"), QStringLiteral("details-runs-with-kelvaroq"),
-        QStringLiteral("details-runs-with-picker"), QStringLiteral("details-run-profile"),
+        QStringLiteral("details-runs-with-picker"), QStringLiteral("details-run-profile"), QStringLiteral("details-artwork"), QStringLiteral("details-artwork-match"),
         QStringLiteral("warmup-runner"), QStringLiteral("library-runner-own-window"), QStringLiteral("library-runner-floating-bar"),
         QStringLiteral("share-settings"), QStringLiteral("import-preview"), QStringLiteral("import-error"),
     };
@@ -480,6 +508,8 @@ bool DevLever::prepare(QString* error)
     qputenv("XCL_DATA_ROOT", root(QStringLiteral("xcl")).toUtf8());
     qputenv("XCL_DXIL_CACHE", root(QStringLiteral("dxil")).toUtf8());
     qputenv("XSEMU_RUNNERS_DIR", root(QStringLiteral("runners")).toUtf8());
+    if (qEnvironmentVariableIsEmpty("XSEMU_SGDB_PROXY"))
+        qputenv("XSEMU_SGDB_PROXY", "http://127.0.0.1:9/api/v2"); // fixtures never reach SteamGridDB unless told to
     if (qEnvironmentVariableIsEmpty("XSEMU_GPU"))
         qputenv("XSEMU_GPU", "10de:NVIDIA GPU (sample)");
     QFile feed(root(QStringLiteral("runner-feed.json")));
@@ -499,6 +529,7 @@ void DevLever::apply(const Options& o, Services& s, MainWindow& w)
     // the design states show XSEmu's warm-up; the -warmup-off states show it turned off, as the build ships
     s.settings.setXsemuWarmup(!o.state.endsWith(QLatin1String("warmup-off")));
     const bool firstLaunch = o.state.startsWith(QLatin1String("first-launch"));
+    s.settings.setArtLookups(false); // until the fixtures' art is seeded, so no lookup races it
     const bool libraryState = isLibraryState(o.state) && o.state != QLatin1String("library-empty");
     const QString games = root(QStringLiteral("games"));
     if (libraryState) {
@@ -517,6 +548,7 @@ void DevLever::apply(const Options& o, Services& s, MainWindow& w)
         seedArt(s, findGame(s, QStringLiteral("Coastline Drive")), QStringLiteral("coast"), true);
         seedArt(s, findGame(s, QStringLiteral("The Long Quiet Between Lighthouses")), QStringLiteral("quiet"), false);
     }
+    s.settings.setArtLookups(true);
     s.settings.setFirstLaunchDone(!firstLaunch);
     if (!firstLaunch && !isLibraryState(o.state))
         seedWarmups(s);
@@ -545,7 +577,16 @@ void DevLever::apply(const Options& o, Services& s, MainWindow& w)
         w.showGameDetails(coast);
     } else if (st == QLatin1String("details-runs-with-picker"))
         w.showGameDetails(coast);
-    else if (st == QLatin1String("details-run-profile")) {
+    else if (st.startsWith(QLatin1String("details-artwork"))) {
+        CoverCache::Entry e = s.covers.cache().entry(coast.titleId());
+        e.pinned = true;
+        e.authors = {QStringLiteral("Mira Okafor"), QStringLiteral("Mira Okafor"), QStringLiteral("tidewright"), {}};
+        s.covers.cache().put(coast.titleId(), e);
+        const QString icon = root(QStringLiteral("coast-icon.png"));
+        paintArt(QStringLiteral("coast"), QSize(256, 256)).save(icon);
+        s.covers.setCustomImage(coast.titleId(), CoverCache::Kind::Icon, icon);
+        w.showGameDetails(coast);
+    } else if (st == QLatin1String("details-run-profile")) {
         s.settings.setGameOverride(coast.titleId(), QStringLiteral("runProfile"),
                                    QStringList{QStringLiteral("XCL_SHADER_BACKEND=dxil"), QStringLiteral("XCL_LOOP_GUARD=4096"),
                                                QStringLiteral("XCL_DISPLAY_MODE=2560x1440"), QStringLiteral("XCL_NETWORK=1")});
@@ -725,6 +766,12 @@ void DevLever::apply(const Options& o, Services& s, MainWindow& w)
             QScrollBar* bar = w.gameDetailsPage()->findChild<QScrollArea*>()->verticalScrollBar();
             bar->setValue(bar->maximum());
         });
+    if (st == QLatin1String("details-artwork"))
+        QTimer::singleShot(0, &w, [&w] {
+            w.gameDetailsPage()->findChild<QScrollArea*>()->ensureWidgetVisible(w.gameDetailsPage()->findChild<ArtworkCard*>(), 0, 24);
+        });
+    if (st == QLatin1String("details-artwork-match"))
+        QTimer::singleShot(0, &w, [&w] { w.gameDetailsPage()->findChild<ArtworkCard*>()->chooseMatch(); });
     if (st == QLatin1String("runners-install-confirm"))
         QTimer::singleShot(0, &w, [&w, &s] { RunnerUi::confirmInstall(&w, s, QStringLiteral("victory-7900xtx")); });
     if (st == QLatin1String("runners-change-location")) {

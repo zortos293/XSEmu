@@ -26,7 +26,7 @@
 // The launcher's version (XSEMU_VERSION), the emulator's path, its answer to --version and whether the
 // launcher may start it (or why not: too old, busy), and the credits and
 // licences: XCL by the xcl-dev contributors (GPL-3.0-or-later), the launcher (GPL-3.0-or-later), Qt (LGPL-3.0, linked
-// dynamically), cover art from SteamGridDB with the user's own key.
+// dynamically), and game art from SteamGridDB with credit to its community and a link to it.
 QWidget* SettingsSections::about(Services& s)
 {
     const SettingsKit::Section sec = SettingsKit::makeSection({}, {});
@@ -121,11 +121,18 @@ QWidget* SettingsSections::about(Services& s)
     credits->setWordWrap(true);
     sec.add(credits, 8);
     auto* licences = new Label(QStringLiteral("Like XCL, XSEmu and this launcher are licensed under the GNU General Public License v3 or later. The launcher uses Qt under the "
-                                              "GNU Lesser General Public License v3, linked dynamically. Cover art is fetched from SteamGridDB with your own key and "
-                                              "cached on this PC; XSEmu ships no game art."),
+                                              "GNU Lesser General Public License v3, linked dynamically."),
                                Label::Style::Small, Theme::Role::Text2);
     licences->setWordWrap(true);
     sec.add(licences, 8);
+    auto* art = new Label(QStringLiteral("Game art (covers, banners, logos and icons) comes from <b>SteamGridDB</b> and is made by its community; "
+                                         "each image's artist is named on the game's details page. XSEmu ships no game art and is not affiliated with "
+                                         "SteamGridDB. Art is fetched through XSEmu's art service, or with your own SteamGridDB key when you set one, and "
+                                         "cached on this PC."),
+                          Label::Style::Small, Theme::Role::Text2);
+    art->setTextFormat(Qt::RichText);
+    art->setWordWrap(true);
+    sec.add(art, 8);
     auto* links = new QWidget;
     auto* lh = new QHBoxLayout(links);
     lh->setContentsMargins(0, 16, 0, 0);
@@ -134,6 +141,7 @@ QWidget* SettingsSections::about(Services& s)
         {QStringLiteral("GPL-3.0 licence"), QStringLiteral("https://www.gnu.org/licenses/gpl-3.0.html")},
         {QStringLiteral("Qt licence (LGPL-3.0)"), QStringLiteral("https://www.gnu.org/licenses/lgpl-3.0.html")},
         {QStringLiteral("XCL source"), QStringLiteral("https://github.com/ivall/xcl")},
+        {QStringLiteral("SteamGridDB"), QStringLiteral("https://www.steamgriddb.com")},
     };
     for (const auto& u : urls) {
         auto* b = new Button(u.first, Button::Variant::Secondary, Button::Size::Small, QStringLiteral("external"));

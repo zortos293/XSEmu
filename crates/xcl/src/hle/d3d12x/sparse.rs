@@ -201,19 +201,25 @@ fn decommit_tiles(
 }
 
 /// what gives a lazy tile its video memory (`Lazy::given`): the CPU's first write of something
-/// other than zeros, a buffer placed over it, a GPU command of the title's that writes there
+/// other than zeros, a buffer placed over it, a GPU command of the title's that writes there,
+/// a view by address that shaders can store through
 const BY_WRITE: usize = 0;
 const BY_PLACEMENT: usize = 1;
 const BY_COMMAND: usize = 2;
+const BY_VIEW: usize = 3;
 
 /// Committed tiles without video memory: those of the title's GPU heaps that the coherent window
 /// did not take (`alloc_diverted`). Such a heap is committed whole and the title writes part of
 /// it (a retail game: 1.75 GB of zero pages in 2.9 GB of heaps), so its tiles get video memory
 /// when it is first needed and not at the commit: when the CPU has written something other than
 /// zeros there (the write watch shows it before the next submit), when a buffer is placed over
-/// them, or when a GPU command the title records writes there. Until then a tile is not mapped
-/// in its window: the GPU reads zeros there, which is what the CPU's view holds, there is
-/// nothing to read back – and what a shader stores there by address is lost.
+/// them, when a GPU command the title records writes there, or when the title makes a view by
+/// address there that shaders can store through (`before_shader_write`; a tile such a view was
+/// ever made of gets it at every commit, `STORES`). Until then a tile is not mapped in its
+/// window: the GPU reads zeros there, which is what the CPU's view holds, and there is nothing
+/// to read back. So a shader's store finds video memory wherever XCL saw the buffer placed or
+/// the view made; only a store through a descriptor the title wrote as memory, for an address
+/// with neither, would still be lost.
 #[derive(Default)]
 struct Lazy {
     /// tile address → its committed 4 KiB pages (bit `i`: page `i`; never 0)
@@ -221,10 +227,10 @@ struct Lazy {
     /// tiles given video memory since the last title submit: all their pages are looked at
     /// then, not only those the write watch reports
     fresh: Vec<usize>,
-    /// tiles given video memory so far, by what asked (`BY_WRITE`, `BY_PLACEMENT`, `BY_COMMAND`)
-    given: [u64; 3],
+    /// tiles given video memory so far, by what asked (`BY_WRITE` … `BY_VIEW`)
+    given: [u64; 4],
     /// when `line` last gave the counts, and what they were
-    logged: Option<(std::time::Instant, usize, [u64; 3])>,
+    logged: Option<(std::time::Instant, usize, [u64; 4])>,
 }
 
 impl Lazy {
@@ -309,17 +315,18 @@ impl Lazy {
     /// heap was lazy, and only when they changed.
     fn line(&mut self, now: std::time::Instant, mapped: usize) -> Option<String> {
         let counts = (self.tiles.len(), self.given);
-        if counts == (0, [0; 3]) || self.logged.is_some_and(|(at, tiles, given)| (tiles, given) == counts || now.duration_since(at).as_secs() < 30) {
+        if counts == (0, [0; 4]) || self.logged.is_some_and(|(at, tiles, given)| (tiles, given) == counts || now.duration_since(at).as_secs() < 30) {
             return None;
         }
         self.logged = Some((now, counts.0, counts.1));
         Some(format!(
-            "sparse lazy tiles: {} MB committed without video memory ({} tiles); video memory given to {} tiles at a first CPU write, {} at a buffer placement, {} at a GPU command write; {} MB of tiles mapped in all (XCL_SPARSE_LAZY_TILES=0: off)",
+            "sparse lazy tiles: {} MB committed without video memory ({} tiles); video memory given to {} tiles at a first CPU write, {} at a buffer placement, {} at a GPU command write, {} for a view by address that shaders can store through (XCL_SPARSE_LAZY_VIEWS=0: none); {} MB of tiles mapped in all (XCL_SPARSE_LAZY_TILES=0: off)",
             (counts.0 * TILE) >> 20,
             counts.0,
             self.given[BY_WRITE],
             self.given[BY_PLACEMENT],
             self.given[BY_COMMAND],
+            self.given[BY_VIEW],
             (mapped * TILE) >> 20
         ))
     }
@@ -388,6 +395,33 @@ static LAZY_BORN: AtomicU64 = AtomicU64::new(0);
 /// read as zeros there, so none is lazy
 static NO_LAZY: AtomicBool = AtomicBool::new(false);
 static SETTLED: Mutex<Settled> = Mutex::new(Settled { born: 0, ranges: Vec::new() });
+/// the tiles of the views by address that shaders can store through (`before_shader_write`),
+/// as disjoint ranges merged with their neighbours (start → end, as `EARLY`). A tile there is
+/// not lazy again, whenever its pages are committed (`State::commit_range`): the view is an
+/// address in a descriptor, which outlives a decommit and can be made before the commit.
+static STORES: Mutex<BTreeMap<usize, usize>> = Mutex::new(BTreeMap::new());
+
+/// Whether `[a, b)` lies in one of `ranges` (disjoint and merged: `early_add`).
+fn ranges_cover(ranges: &BTreeMap<usize, usize>, a: usize, b: usize) -> bool {
+    ranges.range(..=a).next_back().is_some_and(|(_, &e)| e >= b)
+}
+
+/// The parts of `[a, b)` in `ranges`, by address.
+fn ranges_within(ranges: &BTreeMap<usize, usize>, a: usize, b: usize) -> Vec<(usize, usize)> {
+    if a >= b {
+        return Vec::new();
+    }
+    let mut out: Vec<(usize, usize)> = ranges.range(..=a).next_back().filter(|&(_, &e)| e > a).map(|(_, &e)| (a, e.min(b))).into_iter().collect();
+    out.extend(ranges.range(a + 1..b).map(|(&s, &e)| (s, e.min(b))));
+    out
+}
+
+/// Whether a view by address that shaders can store through gives lazy tiles their video
+/// memory (`XCL_SPARSE_LAZY_VIEWS=0`: it does not, and such a store is lost).
+fn store_views() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("XCL_SPARSE_LAZY_VIEWS").map_or(true, |v| v != "0"))
+}
 
 /// The parts of the pages of `[a, a + n)` that lie in lazy heaps: (start, end), by address.
 fn lazy_parts(a: usize, n: usize) -> Vec<(usize, usize)> {
@@ -759,6 +793,13 @@ pub unsafe fn init(dev: &ID3D12Device) -> Vec<(usize, usize, u64)> {
 
 pub fn accepts_allocations() -> bool {
     !UNAVAILABLE.load(Ordering::Acquire)
+}
+
+/// Whether the sparse windows are open and can take an allocation: false when this adapter could not
+/// create them, and false before anything has opened them. Tests and callers that need the sparse
+/// path ask this instead of assuming `crate::gpu::uma::get()` implies it.
+pub fn windows_ready() -> bool {
+    accepts_allocations() && STATE.lock().map(|s| s.is_some()).unwrap_or(false)
 }
 
 pub(super) fn reserve_tile_table(bytes: usize) -> Result<(), crate::util::HRESULT> {
@@ -1584,6 +1625,34 @@ pub unsafe fn alloc_diverted(size: usize, align: usize) -> Option<(usize, usize)
 /// `before_execute` makes the title's queue wait for the mapping. Called with no lock of
 /// `list_x`'s held.
 pub unsafe fn before_gpu_write(va: usize, len: usize) {
+    lazy_give(BY_COMMAND, va, len)
+}
+
+/// The title makes a view of `[va, va + len)` by address that shaders can store through (an
+/// unordered-access view of a buffer no resource stands for): lazy tiles there get their video
+/// memory now, and those committed there later at the commit (`STORES`), since nothing else
+/// tells of a store a shader makes. The range ends with the allocation `va` is in. One look
+/// at `STORES` for a view of tiles that had one before.
+pub unsafe fn before_shader_write(va: usize, len: usize) {
+    if len == 0 || NO_LAZY.load(Ordering::Acquire) || !store_views() {
+        return;
+    }
+    let Some(u) = crate::gpu::uma::made().filter(|u| u.is_sparse(va)) else { return };
+    let Some((start, bytes)) = u.sparse_reservation(va) else { return };
+    let len = len.min(start + bytes - va);
+    let (first, end) = (va & !(TILE - 1), (va + len).saturating_add(TILE - 1) & !(TILE - 1));
+    {
+        let mut stores = STORES.lock().unwrap();
+        if ranges_cover(&stores, first, end) {
+            return;
+        }
+        early_add(&mut stores, first, end);
+    }
+    lazy_give(BY_VIEW, va, len)
+}
+
+/// Lazy tiles of `[va, va + len)` in a sparse window get their video memory (`by`: for the count).
+unsafe fn lazy_give(by: usize, va: usize, len: usize) {
     if len == 0 || LAZY_TILES.load(Ordering::Acquire) == 0 || !crate::gpu::uma::made().is_some_and(|u| u.is_sparse(va)) {
         return;
     }
@@ -1595,7 +1664,7 @@ pub unsafe fn before_gpu_write(va: usize, len: usize) {
     let mut g = STATE.lock().unwrap();
     let Some(s) = g.as_mut() else { return };
     for (t, bytes) in tile_runs(&s.lazy.within(first, end)) {
-        s.give(BY_COMMAND, t, bytes, |_| 0xFFFF);
+        s.give(by, t, bytes, |_| 0xFFFF);
     }
     if s.lazy.within(first, end).is_empty() {
         SETTLED.lock().unwrap().add(LAZY_BORN.load(Ordering::Acquire), first, end);
@@ -1731,6 +1800,13 @@ impl State {
         for (lo, hi) in lazy_parts(a, n) {
             self.ensure_mapped(at, lo.saturating_sub(at), |_| 0xFFFF);
             born |= self.lazy.commit(lo, hi, |t| self.mapped.contains_key(&t));
+            // (tiles a view by address lets shaders store to: at once, `STORES`)
+            let stored = ranges_within(&STORES.lock().unwrap(), lo & !(TILE - 1), hi);
+            for (from, to) in stored {
+                for (t, bytes) in tile_runs(&self.lazy.within(from, to)) {
+                    self.give(BY_VIEW, t, bytes, |_| 0xFFFF);
+                }
+            }
             at = hi;
         }
         self.ensure_mapped(at, a.saturating_add(n).saturating_sub(at), |_| 0xFFFF);
@@ -2794,7 +2870,7 @@ mod tests {
         lazy.commit(base, base + 32 * TILE, |_| false);
         assert_eq!(
             lazy.line(now, 100).as_deref(),
-            Some("sparse lazy tiles: 2 MB committed without video memory (32 tiles); video memory given to 0 tiles at a first CPU write, 0 at a buffer placement, 0 at a GPU command write; 6 MB of tiles mapped in all (XCL_SPARSE_LAZY_TILES=0: off)")
+            Some("sparse lazy tiles: 2 MB committed without video memory (32 tiles); video memory given to 0 tiles at a first CPU write, 0 at a buffer placement, 0 at a GPU command write, 0 for a view by address that shaders can store through (XCL_SPARSE_LAZY_VIEWS=0: none); 6 MB of tiles mapped in all (XCL_SPARSE_LAZY_TILES=0: off)")
         );
         assert_eq!(lazy.line(now + s(40), 100), None, "nothing changed");
         lazy.take(base);
@@ -2804,9 +2880,23 @@ mod tests {
         assert!(line.contains("1 MB committed without video memory (31 tiles); video memory given to 1 tiles at a first CPU write"), "{line}");
         lazy.given[BY_PLACEMENT] += 2;
         lazy.given[BY_COMMAND] += 3;
+        lazy.given[BY_VIEW] += 4;
         assert_eq!(lazy.line(now + s(60), 101), None);
         let line = lazy.line(now + s(61), 101).expect("a line is owed");
-        assert!(line.contains("2 at a buffer placement, 3 at a GPU command write"), "{line}");
+        assert!(line.contains("2 at a buffer placement, 3 at a GPU command write, 4 for a view by address that shaders can store through"), "{line}");
+
+        // the ranges of such views: found whole (nothing to do for a view) and in part (the
+        // tiles of a commit that get video memory at once)
+        let mut stores = BTreeMap::new();
+        early_add(&mut stores, 0x10_0000, 0x12_0000);
+        early_add(&mut stores, 0x12_0000, 0x13_0000);
+        early_add(&mut stores, 0x20_0000, 0x21_0000);
+        assert!(ranges_cover(&stores, 0x10_0000, 0x13_0000) && ranges_cover(&stores, 0x11_0000, 0x12_8000));
+        assert!(!ranges_cover(&stores, 0x12_0000, 0x14_0000) && !ranges_cover(&stores, 0x0F_0000, 0x11_0000) && !ranges_cover(&stores, 0x30_0000, 0x31_0000));
+        assert_eq!(ranges_within(&stores, 0x11_0000, 0x20_8000), vec![(0x11_0000, 0x13_0000), (0x20_0000, 0x20_8000)]);
+        assert_eq!(ranges_within(&stores, 0x13_0000, 0x20_0000), vec![]);
+        assert_eq!(ranges_within(&stores, 0, 0x10_8000), vec![(0x10_0000, 0x10_8000)]);
+        assert!(ranges_within(&stores, 0x11_0000, 0x11_0000).is_empty() && ranges_within(&stores, 0x12_0000, 0x11_0000).is_empty());
     }
 
     /// The pages in `early`, checking that its ranges are page-aligned, not empty, disjoint and

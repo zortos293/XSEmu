@@ -138,7 +138,8 @@ variables come from `LaunchConfig::runEnvironment`.
 | Overlay | Stall and performance overlay | `overlayDefault`, sent over the control pipe at launch |
 | Overlay | Position, size, metrics | Disabled: not in the protocol |
 | Game folders | Folders, rescan | `gameFolders` |
-| Game folders | SteamGridDB API key, art lookups | `steamGridDbKey`, `artLookups` |
+| Game folders | Download game art (on by default), clear downloaded art, personal SteamGridDB key | `artLookups`, `CoverArtService::clearCache`, `steamGridDbKey` |
+| Game details | Artwork: SteamGridDB match (Change...), Choose image... / Reset per kind, Refresh artwork | the cover cache's `pinned` and `custom` entries (`CoverArtService::setMatch`, `setCustomImage`) |
 | Game folders | Runners folder (free space, warning under 20 GB; `XSEMU_RUNNERS_DIR` wins) | `runnersFolder` (`RunnerManager::setRunnersFolder`) |
 | Runners page | Change location on a runner's card (Move or Rebuild there) | `runnerLocations` (`RunnerManager::relocate`) |
 | Input | Keyboard and mouse as gamepad | `keyboard_mouse` |
@@ -186,7 +187,9 @@ with a `.fixture` suffix. `DevFixtures::materialize` copies them to their real n
 - Settings for console model, network, giant-compile cap, overlay, game folders and theme
   (light, dark or system, switched live).
 - First launch in three steps.
-- Cover art from SteamGridDB once a key is set in `settings.ini` (`covers/steamGridDbKey`).
+- Cover, banner, logo and icon art from SteamGridDB for every game, through XSEmu's proxy
+  (`tools/sgdb-proxy`, no key needed) or with a personal key; cached under `<launcher data>\covers`,
+  fetched again only on Refresh artwork, with a per-game match and per-kind local images.
 
 Not done yet: the game window is not docked into the in-game view (the launcher starts XSEmu
 without `--host-hwnd`, so the game opens its own window), and there is no in-game overlay control,

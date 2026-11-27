@@ -450,22 +450,15 @@ fn main() {
     // keep the TLS callback from being discarded by the linker
     unsafe { std::ptr::read_volatile(&XCL_TLS_CALLBACK) };
 
-    // Outlined memory functions hand their results back through statics unless told otherwise
-    // (XCL_RECOMP_OUTLINE_RESULTS=out): with out parameters main keeps a stack slot for every
-    // result of every call, and the NVIDIA driver removes the device when the title's big
-    // batch-cull programs run (play-102; static held in play-102f1). The default is set here and
-    // not in the translator: the translator's source and the switch's value both name the
-    // generation of the translated cache, so this keeps the generation those runs filled.
-    if std::env::var_os("XCL_RECOMP_OUTLINE_RESULTS").is_none() {
-        std::env::set_var("XCL_RECOMP_OUTLINE_RESULTS", "static");
-    }
-
     if let Some(boot) = std::env::var_os("XCL_HOST") {
         std::env::remove_var("XCL_HOST");
         std::process::exit(xcl::host::host_main(&PathBuf::from(boot)));
     }
 
     let args: Vec<String> = std::env::args().skip(1).collect();
+    if args.first().is_some_and(|a| a == "run") {
+        xcl::hle::d3d12x::real::start_game_trim("the launcher", true);
+    }
     let code = match args.first().map(String::as_str) {
         Some("run") if args.len() >= 2 => match xcl::hosting::parse_run_args(&args[1..]) {
             Ok(run) => {

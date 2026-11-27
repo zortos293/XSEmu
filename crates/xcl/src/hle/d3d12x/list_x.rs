@@ -2592,6 +2592,7 @@ pub(super) unsafe fn execute_with_waits(lists: &[*mut c_void], submit: impl FnMu
 pub(super) unsafe extern "system" fn copy_memory_x(this: *mut c_void, dst: u64, src: u64, size: u64, _flags: u32) {
     static N: AtomicU64 = AtomicU64::new(0);
     const W: &str = "CopyMemoryToMemoryX";
+    super::dsv_trace::memory(W, Some(dst as usize), Some(src as usize), size);
     if super::bind::indirect_world_trace() {
         super::bind::indirect_world_event(this as usize, format_args!("{W} source {src:#x} destination {dst:#x}+{size:#x}"));
     }
@@ -2983,6 +2984,7 @@ unsafe fn split(list: *mut c_void, wrapper: *mut c_void, put_off: Option<(Deferr
         }
     }
 
+    super::depth_uav::before_close(list);
     super::gpu_timing::before_close(list);
     let ext = *(list as *const usize);
     let close_hr = pc::<unsafe extern "system" fn(*mut c_void) -> i32>(list, PC_CLOSE)(list);
@@ -3460,6 +3462,7 @@ unsafe fn record_put_off(seg: *mut c_void) -> bool {
         hr
     };
     let close = || {
+        super::depth_uav::before_close(seg);
         super::gpu_timing::before_close(seg);
         let ext = *(seg as *const usize);
         let hr = pc::<unsafe extern "system" fn(*mut c_void) -> i32>(seg, PC_CLOSE)(seg);
@@ -3992,6 +3995,7 @@ pub unsafe extern "system" fn kickoff_x(this: *mut c_void) {
         }
     }
 
+    super::depth_uav::before_close(this);
     super::gpu_timing::before_close(this);
     let ext = *(this as *const usize);
     let close_hr = pc::<unsafe extern "system" fn(*mut c_void) -> i32>(this, PC_CLOSE)(this);
@@ -4693,6 +4697,22 @@ static VISIBLE: Mutex<Option<HashMap<Query, u64>>> = Mutex::new(None);
 /// what such an OCCLUSION query reports (BINARY_OCCLUSION: 1)
 const VISIBLE_SAMPLES: u64 = 0x1_0000;
 
+/// what every OCCLUSION query reports with `occlusion_visible` (CGBJ's value)
+const ALWAYS_VISIBLE_SAMPLES: u64 = 1 << 20;
+
+/// Every occlusion query resolves as visible (2^20 samples; BINARY_OCCLUSION: 1), as in
+/// CGBJ/cool_fox f4b48ad crates/victory-gpu/src/list.rs:1484-1515: the PC's real count depends
+/// on a depth buffer that is not yet the console's, and a query that reads 0 hides whatever the
+/// title gates on it (sun, lamps, flares). `XCL_OCCLUSION_VISIBLE=0`: the PC's real results.
+fn occlusion_visible() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = std::env::var("XCL_OCCLUSION_VISIBLE").map_or(true, |v| v.trim() != "0");
+        crate::xlog_info!("D3D12.X: occlusion queries {} (XCL_OCCLUSION_VISIBLE)", if on { "all resolve as visible" } else { "report the PC's real results" });
+        on
+    })
+}
+
 fn is_occlusion(ty: D3D12_QUERY_TYPE) -> bool {
     ty == D3D12_QUERY_TYPE_OCCLUSION || ty == D3D12_QUERY_TYPE_BINARY_OCCLUSION
 }
@@ -4887,6 +4907,8 @@ pub(super) unsafe extern "system" fn resource_barrier_x(this: *mut c_void, n: u3
     if !depth_copies.is_empty() {
         super::depth_uav::after_barriers(this, depth_copies);
     }
+    // R9G9B9E5 views read through copies of the R32_UINT textures whose writes these end (`e5_copy`)
+    super::e5_copy::after_barriers(this, &out, barriers, n);
     if unknown {
         super::depth_state::invalidate(this as usize);
     }
@@ -4947,6 +4969,10 @@ fn note_gpu_write(what: &str, va: usize, n: u64) {
 pub(super) unsafe extern "system" fn copy_buffer_region_x(this: *mut c_void, dst: usize, dst_off: u64, src: usize, src_off: u64, n: u64) {
     super::residency::note_list_resources(this as usize, [dst, src]);
     note_buffer_write(this as usize, dst, dst_off, n, true);
+    if super::dsv_trace::on() {
+        let at = |r: usize, off: u64| real::title_address(r).map(|a| a + off as usize);
+        super::dsv_trace::memory("CopyBufferRegion", at(dst, dst_off), at(src, src_off), n);
+    }
     if super::present::trace_frame() {
         if let Some(a) = real::title_address(dst) {
             note_gpu_write("CopyBufferRegion", a + dst_off as usize, n);
@@ -4993,8 +5019,13 @@ pub(super) unsafe extern "system" fn copy_texture_region_x(this: *mut c_void, ds
 }
 
 pub(super) unsafe extern "system" fn copy_texture_region_flags_x(this: *mut c_void, dst: *const D3D12_TEXTURE_COPY_LOCATION, x: u32, y: u32, z: u32, src: *const D3D12_TEXTURE_COPY_LOCATION, bx: *const D3D12_BOX, flags: u32) {
+    if super::dsv_trace::on() {
+        let r = |l: *const D3D12_TEXTURE_COPY_LOCATION| l.as_ref().map_or(0, |l| transmute_copy::<_, usize>(&l.pResource));
+        super::dsv_trace::transfer("CopyTextureRegion", r(dst), r(src));
+    }
     if texture_ops::intercept(this, texture_ops::RecordingPoint::Adopted, || texture_ops::Operation::copy(dst, [x,y,z], src, bx, flags))
         .unwrap_or_else(|e| hard_stop(e)) { return; }
+    super::depth_uav::on_copy_region(this, dst, src);
     super::depth_uav::note_op(this);
     if let Some(d) = dst.as_ref() {
         let r: usize = transmute_copy(&d.pResource);
@@ -5087,6 +5118,7 @@ const PC_CLEAR_DEPTH_STENCIL_VIEW: usize = 47;
 
 /// command list #51 ClearDepthStencilView(dsv, flags, depth, stencil, rects, rect list) (PC #47)
 pub(super) unsafe extern "system" fn clear_depth_stencil_x(this: *mut c_void, dsv: usize, flags: u32, depth: f32, stencil: u8, n: u32, rects: *const windows::Win32::Foundation::RECT) {
+    super::depth_uav::on_clear(this, dsv, flags);
     super::depth_uav::note_op(this);
     super::residency::note_list_untracked(this as usize);
     if super::present::trace_frame() {
@@ -5194,8 +5226,10 @@ unsafe fn trace_resolve(what: &str, dst: usize, src: usize, format: i32, extra: 
 
 /// command list #19 ResolveSubresource(dst, dst sub, src, src sub, format) (PC #19)
 pub(super) unsafe extern "system" fn resolve_subresource_x(this: *mut c_void, dst: usize, dst_sub: u32, src: usize, src_sub: u32, format: i32) {
+    super::dsv_trace::transfer("ResolveSubresource", dst, src);
     if texture_ops::intercept(this, texture_ops::RecordingPoint::Adopted, || texture_ops::Operation::resolve(dst, dst_sub, src, src_sub, format, None))
         .unwrap_or_else(|e| hard_stop(e)) { return; }
+    super::depth_uav::on_copy(this, dst, dst_sub, src, src_sub);
     super::depth_uav::note_op(this);
     super::residency::note_list_resources(this as usize, [dst, src]);
     super::present::note_use(dst, super::present::USE_COPY);
@@ -5211,9 +5245,11 @@ pub(super) unsafe extern "system" fn resolve_subresource_x(this: *mut c_void, ds
 /// mode) (PC #64)
 #[allow(clippy::too_many_arguments)]
 pub(super) unsafe extern "system" fn resolve_subresource_region_x(this: *mut c_void, dst: usize, dst_sub: u32, x: u32, y: u32, src: usize, src_sub: u32, rect: *const windows::Win32::Foundation::RECT, format: i32, mode: i32) {
+    super::dsv_trace::transfer("ResolveSubresourceRegion", dst, src);
     if texture_ops::intercept(this, texture_ops::RecordingPoint::Adopted, || texture_ops::Operation::resolve(dst, dst_sub, src, src_sub, format,
         Some((x,y,rect.as_ref().copied(),D3D12_RESOLVE_MODE(mode)))))
         .unwrap_or_else(|e| hard_stop(e)) { return; }
+    super::depth_uav::on_copy(this, dst, dst_sub, src, src_sub);
     super::depth_uav::note_op(this);
     super::residency::note_list_resources(this as usize, [dst, src]);
     super::present::note_use(dst, super::present::USE_COPY);
@@ -5230,6 +5266,8 @@ pub(super) unsafe extern "system" fn resolve_subresource_region_x(this: *mut c_v
 /// CopyResource(dst, src) (PC #17; DMA list #13): buffers placed below their console address
 /// are copied as their own bytes (the PC resources also hold what lies before them)
 pub(super) unsafe extern "system" fn copy_resource_x(this: *mut c_void, dst: usize, src: usize) {
+    super::depth_uav::on_copy(this, dst, u32::MAX, src, u32::MAX);
+    super::dsv_trace::transfer("CopyResource", dst, src);
     super::depth_uav::note_op(this);
     super::present::note_use(dst, super::present::USE_COPY);
     trace_plane_transfer(this, dst, src, "resource copy");
@@ -5314,9 +5352,14 @@ pub(super) unsafe extern "system" fn resolve_query_data_x(this: *mut c_void, hea
         _ => std::mem::size_of::<D3D12_QUERY_DATA_PIPELINE_STATISTICS1>() as u64,
     };
     note_buffer_write(this as usize, dest, offset, stride * count as u64, false);
-    let visible: Vec<(u32, u64)> = match VISIBLE.lock().unwrap().as_ref() {
-        Some(m) if is_occlusion(ty) && !m.is_empty() => (first..first.saturating_add(count)).filter_map(|i| m.get(&(heap, i)).map(|&v| (i, v))).collect(),
-        _ => Vec::new(),
+    let visible: Vec<(u32, u64)> = if is_occlusion(ty) && occlusion_visible() {
+        let v = if ty == D3D12_QUERY_TYPE_BINARY_OCCLUSION { 1 } else { ALWAYS_VISIBLE_SAMPLES };
+        (first..first.saturating_add(count)).map(|i| (i, v)).collect()
+    } else {
+        match VISIBLE.lock().unwrap().as_ref() {
+            Some(m) if is_occlusion(ty) && !m.is_empty() => (first..first.saturating_add(count)).filter_map(|i| m.get(&(heap, i)).map(|&v| (i, v))).collect(),
+            _ => Vec::new(),
+        }
     };
     if native_buffer::destinations::resolve(this, heap, ty, first, count, dest, offset, stride * count as u64, &visible) {
         return;
@@ -5480,6 +5523,10 @@ mod tests {
         use windows::Win32::Graphics::Dxgi::*;
         if crate::gpu::uma::get().is_none() {
             crate::gpu::recomp::runner::skip_test("no unified memory");
+            return;
+        }
+        if !crate::hle::d3d12x::sparse::windows_ready() {
+            crate::gpu::recomp::runner::skip_test("no 4 GiB sparse memory window: this adapter cannot reserve one");
             return;
         }
         unsafe {
@@ -6197,6 +6244,12 @@ mod tests {
 
     #[test]
     fn resolve_query_data_applies_buffer_delta_to_pc_resolve_and_occlusion_writeback() {
+        if !crate::hle::d3d12x::sparse::windows_ready() {
+            // The resolve reaches its PC data through a console heap, which needs window-0 storage a
+            // software adapter cannot make; without it the whole buffer goes instead.
+            return crate::gpu::recomp::runner::skip_test(
+                "no 4 GiB sparse memory window: this adapter cannot reserve one, and the resolve needs a console heap");
+        }
         use std::cell::RefCell;
 
         thread_local! {

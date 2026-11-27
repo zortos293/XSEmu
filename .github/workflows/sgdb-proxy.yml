@@ -1,0 +1,38 @@
+name: SteamGridDB proxy
+
+on:
+  pull_request:
+    paths:
+      - tools/sgdb-proxy/**
+      - .github/workflows/sgdb-proxy.yml
+  push:
+    branches: [main]
+    paths:
+      - tools/sgdb-proxy/**
+      - .github/workflows/sgdb-proxy.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  sgdb-proxy:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    defaults:
+      run:
+        working-directory: tools/sgdb-proxy
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: tools/sgdb-proxy/package-lock.json
+      - run: npm ci
+      - run: npm run typecheck
+      - run: npm test
+      - name: Bundle (no deploy)
+        run: npx wrangler deploy --dry-run --outdir dist

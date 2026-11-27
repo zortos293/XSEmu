@@ -20,8 +20,8 @@ use crate::gpu::rdna2::{self, Decoded, Variant};
 /// Lane predicates as reduced ordered BDDs: node 0 is false, 1 true, every other node tests a
 /// variable (an atom: a mask value the analysis does not follow, named by where it was
 /// made). Equal predicates are the same node.
-struct Bdd {
-    nodes: Vec<(u32, u32, u32)>,
+pub(super) struct Bdd {
+    pub(super) nodes: Vec<(u32, u32, u32)>,
     /// lowest and highest variable under each node (a quick test for `usesrange`)
     span: Vec<(u32, u32)>,
     unique: HashMap<(u32, u32, u32), u32>,
@@ -31,11 +31,11 @@ struct Bdd {
 const NODE_LIMIT: usize = 1 << 18;
 
 impl Bdd {
-    fn new() -> Bdd {
+    pub(super) fn new() -> Bdd {
         Bdd { nodes: vec![(u32::MAX, 0, 0), (u32::MAX, 1, 1)], span: vec![(u32::MAX, 0), (u32::MAX, 0)], unique: HashMap::new(), memo: HashMap::new() }
     }
 
-    fn mk(&mut self, v: u32, lo: u32, hi: u32) -> u32 {
+    pub(super) fn mk(&mut self, v: u32, lo: u32, hi: u32) -> u32 {
         if lo == hi {
             return lo;
         }
@@ -50,12 +50,12 @@ impl Bdd {
         n
     }
 
-    fn var(&mut self, v: u32) -> u32 {
+    pub(super) fn var(&mut self, v: u32) -> u32 {
         self.mk(v, 0, 1)
     }
 
     /// op 0: and, 1: or, 2: xor; None when the predicates grow past `NODE_LIMIT`
-    fn apply(&mut self, op: u8, a: u32, b: u32) -> Option<u32> {
+    pub(super) fn apply(&mut self, op: u8, a: u32, b: u32) -> Option<u32> {
         let (a, b) = (a.min(b), a.max(b));
         match (op, a, b) {
             (0, 0, _) => return Some(0),
@@ -84,13 +84,13 @@ impl Bdd {
         Some(n)
     }
 
-    fn not(&mut self, a: u32) -> Option<u32> {
+    pub(super) fn not(&mut self, a: u32) -> Option<u32> {
         self.apply(2, a, 1)
     }
 
     /// Whether a variable in [lo, hi) is under node `a` (each node once: the graph shares
     /// nodes; below a variable at or past `hi` there are only later ones).
-    fn uses_range(&self, a: u32, lo: u32, hi: u32) -> bool {
+    pub(super) fn uses_range(&self, a: u32, lo: u32, hi: u32) -> bool {
         let (min, max) = self.span[a as usize];
         if a < 2 || max < lo || min >= hi {
             return false;
@@ -115,7 +115,7 @@ impl Bdd {
 /// Which lanes a mask word stands for: a word of the wave's EXEC is relative to the lanes the
 /// wave has in that half (`trueBdd`: every one of them on), a constant to none.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum Half {
+pub(super) enum Half {
     Lo,
     Hi,
     Any,
@@ -123,13 +123,13 @@ enum Half {
 
 /// What an SGPR holds where the analysis is: a predicate of each lane's bit, or nothing known.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum Word {
+pub(super) enum Word {
     Known(u32, Half),
     Unknown,
 }
 
 /// Atoms made by instruction `i`: its results' words and its unknown operands.
-const ATOMS_PER_INST: u32 = 32;
+pub(super) const ATOMS_PER_INST: u32 = 32;
 
 /// The instructions before which EXEC provably holds every lane the wave started with (its
 /// entry EXEC, every live thread's bit, when `entry_full`), by pc: there a lane's EXEC bit is
@@ -227,7 +227,7 @@ pub(super) fn full_exec(insts: &[Decoded], wave64: bool, entry_full: bool, guard
 }
 
 /// `full_exec`'s step: the SGPR words after instruction `i` (`d`), from those before.
-fn mask_step(bdd: &mut Bdd, d: &Decoded, i: u32, wave64: bool, cyclic: bool, s: &mut [Word]) {
+pub(super) fn mask_step(bdd: &mut Bdd, d: &Decoded, i: u32, wave64: bool, cyclic: bool, s: &mut [Word]) {
     let name = d.inst.name;
     let u = sgpr_use(d);
     let base = i * ATOMS_PER_INST;
@@ -367,7 +367,7 @@ fn mask_step(bdd: &mut Bdd, d: &Decoded, i: u32, wave64: bool, cyclic: bool, s: 
 }
 
 /// Which instructions lie on a cycle of the graph (Tarjan's strongly connected components).
-fn on_cycles(succ: &[Vec<usize>]) -> Vec<bool> {
+pub(super) fn on_cycles(succ: &[Vec<usize>]) -> Vec<bool> {
     let n = succ.len();
     let (mut index, mut low, mut on_stack) = (vec![usize::MAX; n], vec![0; n], vec![false; n]);
     let (mut stack, mut cyclic, mut next) = (Vec::new(), vec![false; n], 0);

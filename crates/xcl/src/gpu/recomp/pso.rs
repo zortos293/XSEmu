@@ -145,11 +145,13 @@ pub fn console_to_dxil_in(blob: &[u8], stage: Stage, sampler_base: u32, split_wa
 
 /// The translated cache's identity for `blob`: a program that may traverse acceleration structures
 /// is another translation with every ray a miss (`rt_all_miss`), and a compute program another one
-/// without the dispatch thread limits in its prologue (`XCL_DISPATCH_THREAD_DIMENSIONS=0`); every
+/// without the dispatch thread limits in its prologue (`XCL_DISPATCH_THREAD_DIMENSIONS=0`) or the
+/// group spread (`XCL_DISPATCH_SPREAD=0`); every
 /// other program keeps the build's identity, so neither switch makes the other stages cold.
 fn translated_identity(blob: &[u8], stage: Stage, legacy: bool, profile: bool) -> u64 {
     let ident = translated::identity_for_layout(legacy, profile);
     let ident = tagged_identity(ident, stage == Stage::Compute && !super::dispatch_thread_dimensions(), "no-thread-limits");
+    let ident = tagged_identity(ident, stage == Stage::Compute && !super::dispatch_spread(), "no-group-spread");
     rt_miss_identity(ident, super::rt_all_miss() && super::may_trace_rays(blob))
 }
 
@@ -216,6 +218,14 @@ mod translated {
         if base == 0 {
             return 0;
         }
+        // the loop guard's other forms (`XCL_RECOMP_NO_LOOP_REGIONS`, `XCL_LOOP_GUARD_REGIONS`) are other HLSL
+        let base = if super::super::wave_wide_loop_guard() {
+            identity_for(&format!("{base:016x}"), "no-loop-regions")
+        } else if super::super::loop_regions() {
+            identity_for(&format!("{base:016x}"), "loop-guard-regions")
+        } else {
+            base
+        };
         let base = if super::super::compute_per_access_coherence() {
             identity_for(&format!("{base:016x}"), "compute-per-access-coherence")
         } else {
@@ -226,15 +236,19 @@ mod translated {
         } else {
             base
         };
+        // xsemu: from xcl-dev/xcl nvidia-dev 67a08dbe crates/xcl/src/gpu/recomp/pso.rs
+        // `XCL_X_LDS_ORDER=0`: the split wave64 form without its LDS order
+        let base = if super::super::emit::lds_order_wanted() { base } else { identity_for(&format!("{base:016x}"), "xcl-x-lds-order-0") };
         let nan = if super::nan_guards() { "nan-guards" } else { "" };
         let nan = &["XCL_RECOMP_NO_PLAIN_LOADS", "XCL_RECOMP_PLAIN_MEMORY"].iter().filter(|v| std::env::var_os(v).is_some()).fold(nan.to_string(), |s, v| format!("{s}\0{v}"));
         let guard = super::super::loop_guard();
         let trip_counters = crate::config::guard_trips_enabled();
         let static_cap = super::super::loop_profile::static_cap();
-        // the A/B switches of the structured form, the lane-guard proofs, the quad reads, the page groups, their accessors and the primitive index width change the HLSL
-        let nan = ["XCL_RECOMP_NO_CFG", "XCL_RECOMP_NO_EXEC_PROOF", "XCL_RECOMP_NO_QUAD_READS", "XCL_RECOMP_NO_PAGE_GROUPS", "XCL_RECOMP_NO_ACCESSOR_SHRINK", "XCL_RECOMP_NO_OUTLINE", "XCL_RECOMP_NO_PRIM9"].iter().filter(|v| std::env::var_os(v).is_some()).fold(nan.to_string(), |s, v| format!("{s}\0{v}"));
+        // the A/B switches of the structured form, the lane-guard proofs, the quad reads, the page groups, their accessors, the compact accessors, the load loop, the primitive index width and the lane-independent form change the HLSL
+        let nan = ["XCL_RECOMP_NO_CFG", "XCL_RECOMP_NO_EXEC_PROOF", "XCL_RECOMP_NO_QUAD_READS", "XCL_RECOMP_NO_PAGE_GROUPS", "XCL_RECOMP_NO_ACCESSOR_SHRINK", "XCL_RECOMP_NO_COMPACT_ACCESS", "XCL_RECOMP_NO_LOAD_LOOP", "XCL_RECOMP_NO_GROUP_FOLD", "XCL_RECOMP_NO_KEPT_PAGES", "XCL_RECOMP_NO_KEPT_PAGES_OUTLINED", "XCL_RECOMP_NO_LONE_LOADS", "XCL_RECOMP_NO_OUTLINE", "XCL_RECOMP_NO_PRIM9", "XCL_RECOMP_NO_LANE_INDEPENDENT"].iter().filter(|v| std::env::var_os(v).is_some()).fold(nan.to_string(), |s, v| format!("{s}\0{v}"));
         let nan = std::env::var("XCL_RECOMP_OUTLINE_MIN_INSTS").map_or(nan.clone(), |n| format!("{nan}\0outline-min-insts={n}"));
         let nan = ["XCL_RECOMP_OUTLINE_RESULTS", "XCL_RECOMP_OUTLINE_ATOMICS", "XCL_RECOMP_OUTLINE_NESTED"].iter().fold(nan, |s, v| std::env::var(v).map_or(s.clone(), |x| format!("{s}\0{v}={x}")));
+        let nan = format!("{nan}\0outline-above={}", super::outline_budget());
         if legacy {
             return identity_for(&format!("{base:016x}"), &format!("{nan}\0loop-guard={guard}\0trip-counters={trip_counters}\0loop-profile={profile}\0static-loop-cap={static_cap}\0legacy-compute-wave64"));
         }
@@ -369,6 +383,42 @@ fn packed_dxil_limits() -> (usize, usize) {
     })
 }
 
+#[cfg(test)]
+thread_local! {
+    /// tests: `outline_budget` on this thread
+    pub(super) static OUTLINE_BUDGET: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+}
+
+/// The outline budget: bytes of DXIL a compute program may be without calls. A program
+/// `emit::outline_from` names is built without calls first, by the direct backend, and outlined
+/// only when that DXIL is over the budget (calls are what a driver has been seen to trip over;
+/// the size is what it cannot build). `XCL_RECOMP_OUTLINE_ABOVE_KB` in KiB, 1000 unless set; 0:
+/// no measuring, every program `emit::outline_from` names is outlined (the rule before this one).
+/// Nothing is measured either when DXC makes every program (`XCL_SHADER_BACKEND=hlsl`): the form
+/// without calls of a big program takes it minutes.
+pub(super) fn outline_budget() -> usize {
+    #[cfg(test)]
+    if let Some(b) = OUTLINE_BUDGET.get() {
+        return b;
+    }
+    std::env::var("XCL_RECOMP_OUTLINE_ABOVE_KB").ok().and_then(|v| v.trim().parse::<usize>().ok()).unwrap_or(1000).saturating_mul(1024)
+}
+
+/// A compute program in the wave64 form of `options` under the outline budget: without calls
+/// when that DXIL is within `budget` bytes or `emit::outline_from` does not name the program,
+/// else outlined (true). `budget` 0: as `emit::outline_from` says, nothing measured (false).
+fn within_outline_budget(blob: &[u8], program: &super::DecodedProgram<'_>, options: &Options, profile: &str, budget: usize) -> Result<(Compiled, bool), String> {
+    let measured = budget != 0;
+    let t = check_console_translation(blob, super::emit_program(program, &Options { no_outline: measured, ..options.clone() })?)?;
+    let dxil = dxc::compile_cached(&t.hlsl, "main", profile)?.0;
+    if !(measured && t.outline_candidate && dxil.len() > budget) {
+        return Ok((Compiled { dxil, samplers: t.static_samplers }, false));
+    }
+    let t = check_console_translation(blob, super::emit_program(program, options)?)?;
+    let dxil = dxc::compile_cached(&t.hlsl, "main", profile)?.0;
+    Ok((Compiled { dxil, samplers: t.static_samplers }, true))
+}
+
 fn packed_dxil_fallback(packed: usize, legacy: usize, ratio: usize, giant: usize) -> Option<&'static str> {
     if giant != 0 && packed >= giant && legacy < giant {
         Some("legacy-wave64: crossed driver giant threshold")
@@ -379,15 +429,17 @@ fn packed_dxil_fallback(packed: usize, legacy: usize, ratio: usize, giant: usize
     }
 }
 
-fn compile_console_shader(blob: &[u8], stage: Stage, sampler_base: u32, windows: u32, split_wave64: bool, legacy: bool) -> Result<Compiled, String> {
+pub(super) fn compile_console_shader(blob: &[u8], stage: Stage, sampler_base: u32, windows: u32, split_wave64: bool, legacy: bool) -> Result<Compiled, String> {
     with_console_code(blob, stage, sampler_base, windows, split_wave64, |code, mut options, profile| {
         options.legacy_compute_wave64 = legacy;
         let (ratio, giant) = packed_dxil_limits();
         if stage == Stage::Compute && options.wave64 && options.split_wave64 && !options.legacy_compute_wave64 && (ratio != 0 || giant != 0) && dxc::defer() {
             return Err("packed DXIL selection is not cached yet".into());
         }
+        // a compute program is made without calls first: that DXIL's size decides (`outline_budget`)
+        let budget = if stage == Stage::Compute && options.mem_windows > 1 && dxc::direct_backend() { outline_budget() } else { 0 };
         let program = super::decode_program(code, &options)?;
-        let mut t = check_console_translation(blob, super::emit_program(&program, &options)?)?;
+        let mut t = check_console_translation(blob, super::emit_program(&program, &Options { no_outline: budget != 0, ..options.clone() })?)?;
         if let Some([r, g, b]) = (stage == Stage::Pixel).then(|| debug_color(blob)).flatten() {
             t.hlsl = t.hlsl.replacen("    return xo;\n}", &format!("    xo.t0 = float4({r:.3}, {g:.3}, {b:.3}, 1.0);\n    return xo;\n}}"), 1);
         }
@@ -420,12 +472,26 @@ fn compile_console_shader(blob: &[u8], stage: Stage, sampler_base: u32, windows:
         let dxil = dxc::compile_cached(&t.hlsl, "main", profile)?.0;
         let mut selected = Compiled { dxil, samplers: t.static_samplers };
         let mut selected_legacy = options.legacy_compute_wave64;
-        if t.packed_compute && (ratio != 0 || (giant != 0 && selected.dxil.len() >= giant)) {
+        let (mut compare_forms, mut outlined) = (t.packed_compute, false);
+        if budget != 0 && t.outline_candidate && selected.dxil.len() > budget {
+            // over the budget without calls: the legacy wave64 form without calls when that one
+            // fits, else the outlined program
+            let shader = crate::gpu::shader::fnv64(blob);
+            let legacy = if compare_forms { Some(within_outline_budget(blob, &program, &Options { legacy_compute_wave64: true, ..options.clone() }, profile, budget)?) } else { None };
+            if let Some((legacy, false)) = legacy {
+                crate::xlog_info!("[SHADER] compute {shader:016x}: legacy-wave64: no calls within the outline budget ({} B packed, {} B legacy DXIL without calls; budget {budget} B)", selected.dxil.len(), legacy.dxil.len());
+                (selected, selected_legacy, compare_forms) = (legacy, true, false);
+            } else {
+                let o = check_console_translation(blob, super::emit_program(&program, &options)?)?;
+                let dxil = dxc::compile_cached(&o.hlsl, "main", profile)?.0;
+                crate::xlog_info!("[SHADER] compute {shader:016x}: outlined, {} B of DXIL ({} B without calls, over the outline budget of {budget} B)", dxil.len(), selected.dxil.len());
+                (selected, outlined) = (Compiled { dxil, samplers: o.static_samplers }, true);
+            }
+        }
+        if compare_forms && (ratio != 0 || (giant != 0 && selected.dxil.len() >= giant)) {
             let emit_legacy = || {
                 let options = Options { legacy_compute_wave64: true, ..options.clone() };
-                let legacy = check_console_translation(blob, super::emit_program(&program, &options)?)?;
-                let dxil = dxc::compile_cached(&legacy.hlsl, "main", profile)?.0;
-                Ok::<_, String>(Compiled { dxil, samplers: legacy.static_samplers })
+                within_outline_budget(blob, &program, &options, profile, budget).map(|(legacy, _)| legacy)
             };
             let legacy = if cache_allowed(stage, |name| std::env::var_os(name).is_some()) {
                 translated::cached_in(&dxc::cache_dir(), translated_identity(blob, stage, true, false), blob, stage, sampler_base, windows, split_wave64, emit_legacy)
@@ -450,7 +516,7 @@ fn compile_console_shader(blob: &[u8], stage: Stage, sampler_base: u32, windows:
             }
         }
         if stage == Stage::Compute && super::loop_profile::enabled_for(blob) {
-            let options = Options { loop_profile: true, legacy_compute_wave64: selected_legacy, ..options };
+            let options = Options { loop_profile: true, legacy_compute_wave64: selected_legacy, no_outline: budget != 0 && !outlined, ..options };
             let instrumented = check_console_translation(blob, super::emit_program(&program, &options)?)?;
             let dxil = dxc::compile_cached(&instrumented.hlsl, "main", profile)?.0;
             selected = Compiled { dxil, samplers: instrumented.static_samplers };
@@ -647,17 +713,21 @@ pub fn compute_interface(blob: &[u8]) -> Option<super::CsInterface> {
     }
 }
 
-/// Once per translation: the loops `XCL_LOOP_GUARD` may cut short in a working program.
+/// Once per translation: the loops its loop budget (`XCL_LOOP_GUARD`, `super::loop_budget`) may cut
+/// short in a working program.
 fn note_long_loops(blob: &[u8], t: &super::Translation) {
-    if t.long_loops.is_empty() {
+    let Some(budget) = t.loop_budget.filter(|_| !t.long_loops.is_empty()) else {
         return;
-    }
+    };
+    let budget = match budget {
+        super::LoopBudget::Regions { region, total } => format!("{region} iterations per lane in a loop region, {total} in all"),
+        one => format!("{} iterations per lane", one.of_a_loop()),
+    };
     let more = if t.long_loops.len() > 4 { format!("; and {} more", t.long_loops.len() - 4) } else { String::new() };
     crate::xlog_info!(
-        "[SHADER] {:016x}: {} loop(s) may run longer than the loop guard ({} iterations per lane, XCL_LOOP_GUARD): {}{more}",
+        "[SHADER] {:016x}: {} loop(s) may run longer than the loop guard ({budget}, XCL_LOOP_GUARD): {}{more}",
         crate::gpu::shader::fnv64(blob),
         t.long_loops.len(),
-        super::loop_guard(),
         t.long_loops[..t.long_loops.len().min(4)].join("; ")
     );
 }
@@ -1016,6 +1086,23 @@ mod shader_cache_tests {
         assert_eq!(a, translated::identity_for("source-a", "dxc-a"));
         assert_ne!(a, translated::identity_for("source-b", "dxc-a"));
         assert_ne!(a, translated::identity_for("source-a", "dxc-b"));
+    }
+
+    /// The loop guard's forms (`XCL_RECOMP_NO_LOOP_REGIONS`, `XCL_LOOP_GUARD_REGIONS`) are other HLSL:
+    /// each has its own translations on disk.
+    #[test]
+    fn translated_identity_tracks_the_loop_guards_form() {
+        let lane = translated::identity_for_layout(false, false);
+        super::super::NO_LOOP_REGIONS.set(true);
+        let wave = translated::identity_for_layout(false, false);
+        super::super::LOOP_REGIONS.set(true);
+        let wave_too = translated::identity_for_layout(false, false);
+        super::super::NO_LOOP_REGIONS.set(false);
+        let regions = translated::identity_for_layout(false, false);
+        super::super::LOOP_REGIONS.set(false);
+        assert_ne!(lane, 0, "the disk cache is on in tests");
+        assert!(lane != wave && lane != regions && wave != regions, "{lane:x} {wave:x} {regions:x}");
+        assert_eq!(wave, wave_too, "the base form is one form, whatever the regions switch says");
     }
 
     #[test]

@@ -54,7 +54,7 @@ fn scalar_code(v: u64, n: u64) -> Regs {
 }
 
 /// Instructions whose mask operand is read lane by lane (the emitter's `lane_of`).
-fn reads_mask_per_lane(name: &str) -> bool {
+pub(super) fn reads_mask_per_lane(name: &str) -> bool {
     matches!(name, "V_CNDMASK_B32" | "V_ADD_CO_CI_U32" | "V_SUB_CO_CI_U32" | "V_SUBREV_CO_CI_U32")
 }
 
