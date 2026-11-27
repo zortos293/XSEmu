@@ -28,11 +28,20 @@ Use a folder of your own, never an installed launcher, and give it a data folder
 test's settings and logs cannot touch yours:
 
 ```powershell
+# The release that carries the lever, and a newer one for it to find.
+$from = 'v0.1.1-pre.2'
+$to   = 'v0.1.1-pre.3'
+
 $root = "$env:TEMP\xsemu-selfupdate-test"
 $app  = "$root\app"; $env:XSEMU_LAUNCHER_DATA = "$root\data"
+Remove-Item -Recurse -Force $root -ErrorAction SilentlyContinue
 
 # 1. the from-release, unpacked into the scratch folder
-Invoke-WebRequest "https://github.com/zortos293/XSEmu/releases/download/$from/XSEmuLauncher-windows.zip" -OutFile "$root\from.zip"
+$base = "https://github.com/zortos293/XSEmu/releases/download"
+Invoke-WebRequest "$base/$from/xsemu-manifest.json" -OutFile "$root\from-manifest.json"
+Invoke-WebRequest "$base/$from/XSEmuLauncher-windows.zip" -OutFile "$root\from.zip"
+if ((Get-FileHash "$root\from.zip" -Algorithm SHA256).Hash -ne
+    (Get-Content "$root\from-manifest.json" -Raw | ConvertFrom-Json).launcher.sha256) { throw 'the from-release archive is not its manifest hash' }
 Expand-Archive "$root\from.zip" -DestinationPath "$root\from"
 New-Item -ItemType Directory -Force $app | Out-Null
 Copy-Item "$root\from\XSEmuLauncher\bin\*" $app -Recurse
@@ -41,6 +50,9 @@ Copy-Item "$root\from\XSEmuLauncher\bin\*" $app -Recurse
 $env:XSEMU_UPDATE_TEST = 'install'
 Start-Process "$app\XSEmuLauncher.exe" -WorkingDirectory $app
 ```
+
+The check compares versions, so `$to` only has to exist and be newer than `$from`; nothing points the
+launcher at it.
 
 The launcher checks six seconds in, installs the Core, then the launcher, quits, and the updater script
 replaces its own files and starts it again. Watch it happen in `%TEMP%\xsemu-launcher-update.log` (the
@@ -52,7 +64,7 @@ What has to be true afterwards:
   Core has started once;
 - the launcher's files are the new release's, and the updater log says `keeping core\...` for every
   staged Core file — a launcher update never replaces the Core;
-- `core\version.json` names the new version, and `XSEmu.exe --version` agrees;
+- `core\version.json` names `$to`'s version, and `XSEmu.exe --version` agrees;
 - with `XSEMU_UPDATE_TEST=restore` on a later start, `core.old` goes back and `core\XSEmu.exe` is the
   old program again, while the launcher stays new.
 
