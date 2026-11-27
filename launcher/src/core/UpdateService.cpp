@@ -6,6 +6,7 @@
 #include "ProcessGate.h"
 
 #include <QCoreApplication>
+#include <QDateTime>
 #include <QDir>
 #include <QDirIterator>
 #include <QEventLoop>
@@ -21,6 +22,7 @@
 #include <QProcess>
 #include <QSaveFile>
 #include <QThread>
+#include <QTimer>
 
 #include <algorithm>
 #include <memory>
@@ -800,6 +802,55 @@ try {
         return {};
     }
     return script;
+}
+
+void UpdateService::noteTestLever(const QString& line)
+{
+    // Beside the settings file, so a test with a data folder of its own keeps the record with it.
+    QFile log(QFileInfo(m_settings.fileName()).absolutePath() + QStringLiteral("/update-test.log"));
+    if (log.open(QIODevice::WriteOnly | QIODevice::Append | QIODevice::Text))
+        log.write(QDateTime::currentDateTime().toString(Qt::ISODate).toUtf8() + ' ' + line.toUtf8() + '\n');
+    qWarning("XSEMU_UPDATE_TEST: %s", qUtf8Printable(line));
+}
+
+void UpdateService::armTestLever(const QString& lever)
+{
+    if (lever.isEmpty())
+        return;
+    if (lever != QLatin1String("install") && lever != QLatin1String("restore")) {
+        noteTestLever(QStringLiteral("'%1' is neither install nor restore; nothing is armed").arg(lever));
+        return;
+    }
+    m_testLever = lever;
+    noteTestLever(QStringLiteral("armed '%1'").arg(lever));
+    if (lever == QLatin1String("restore")) {
+        QString error;
+        const bool restored = restorePreviousCore(&error);
+        noteTestLever(restored ? QStringLiteral("restore: the previous Core is back")
+                               : QStringLiteral("restore failed: %1").arg(error));
+        QTimer::singleShot(0, QCoreApplication::instance(), &QCoreApplication::quit);
+        return;
+    }
+    connect(this, &UpdateService::changed, this, &UpdateService::stepTestInstall);
+}
+
+void UpdateService::stepTestInstall()
+{
+    if (m_testLever != QLatin1String("install") || m_status.busy() || !m_status.updateAvailable())
+        return;
+    // The Core first. A launcher update ends with the launcher quitting so its updater script can
+    // replace the files, and the Core's half has to be done before that.
+    if (m_status.coreUpdate && m_status.coreBundled && !m_testInstalledCore) {
+        m_testInstalledCore = true;
+        noteTestLever(QStringLiteral("install: the Core, %1 to %2").arg(m_status.installedCore, m_status.release.core.version));
+        install(Part::Core);
+        return;
+    }
+    if (m_status.launcherUpdate && !m_testInstalledLauncher) {
+        m_testInstalledLauncher = true;
+        noteTestLever(QStringLiteral("install: the launcher, %1 to %2").arg(launcherVersion(), m_status.release.launcher.version));
+        install(Part::Launcher);
+    }
 }
 
 void UpdateService::noteEmulatorStarted()

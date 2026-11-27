@@ -548,7 +548,93 @@ private slots:
         QVERIFY(updates.canInstall(UpdateService::Part::Core));
     }
 
+    void testLeverInstallsTheCoreThenTheLauncher()
+    {
+        Fixture f;
+        Fake fake(f);
+        AppSettings settings(f.appSettingsIni);
+        settings.setPrereleaseUpdates(true);
+        settings.setEmulatorPathOverride(f.coreProgram());
+        ProcessGate gate;
+        UpdateService updates(settings, gate);
+        updates.setDirectories(f.appDir, f.coreDir);
+        fake.attach(updates);
+
+        updates.armTestLever(QStringLiteral("install"));
+        updates.check(true);
+
+        // The lever's Core half goes in, then its launcher half asks to replace the launcher, which
+        // this host refuses by design: the launcher replaces itself on Windows only. The refusal is
+        // the proof that the lever got to the second step, after the Core, with nobody clicking.
+        QVERIFY(waitFor([&] { return updates.status().state == UpdateService::State::Failed; }));
+        QVERIFY2(updates.status().error.contains(QStringLiteral("replaces itself on Windows only")),
+                 qPrintable(updates.status().error));
+        QCOMPARE(shaOf(bytesOf(f.coreProgram())), fake.newProgramSha);
+        QVERIFY2(QFileInfo::exists(f.previousProgram()), "the Core the update replaced stays in core.old");
+
+        const QString text = leverLog(f);
+        QVERIFY2(text.contains(QStringLiteral("armed 'install'")), qPrintable(text));
+        QVERIFY2(text.contains(QStringLiteral("install: the Core, 0.1.0-pre.1 to 0.1.1-pre.1")), qPrintable(text));
+        QVERIFY2(text.contains(QStringLiteral("install: the launcher, ")), qPrintable(text));
+    }
+
+    void testLeverRestoresThePreviousCore()
+    {
+        Fixture f;
+        Fake fake(f);
+        AppSettings settings(f.appSettingsIni);
+        settings.setPrereleaseUpdates(true);
+        settings.setEmulatorPathOverride(f.coreProgram());
+        ProcessGate gate;
+        UpdateService updates(settings, gate);
+        updates.setDirectories(f.appDir, f.coreDir);
+        fake.attach(updates);
+
+        const QByteArray oldProgram = bytesOf(f.coreProgram());
+        updates.check(true);
+        QVERIFY(waitFor([&] { return !updates.status().busy(); }));
+        updates.install(UpdateService::Part::Core);
+        QVERIFY(waitFor([&] { return !updates.status().busy() && updates.status().corePreviousKept; }));
+        QCOMPARE(shaOf(bytesOf(f.coreProgram())), fake.newProgramSha);
+
+        updates.armTestLever(QStringLiteral("restore"));
+        QCOMPARE(shaOf(bytesOf(f.coreProgram())), shaOf(oldProgram));
+        QCOMPARE(updates.installedCoreVersion(), QStringLiteral("0.1.0-pre.1"));
+        const QString text = leverLog(f);
+        QVERIFY2(text.contains(QStringLiteral("armed 'restore'")), qPrintable(text));
+        QVERIFY2(text.contains(QStringLiteral("restore: the previous Core is back")), qPrintable(text));
+    }
+
+    void testLeverIgnoresAnyOtherValue()
+    {
+        Fixture f;
+        Fake fake(f);
+        AppSettings settings(f.appSettingsIni);
+        settings.setPrereleaseUpdates(true);
+        settings.setEmulatorPathOverride(f.coreProgram());
+        ProcessGate gate;
+        UpdateService updates(settings, gate);
+        updates.setDirectories(f.appDir, f.coreDir);
+        fake.attach(updates);
+
+        const QByteArray oldProgram = bytesOf(f.coreProgram());
+        updates.armTestLever(QStringLiteral("bogus"));
+        updates.check(true);
+        QVERIFY(waitFor([&] { return !updates.status().busy(); }));
+        QCOMPARE(updates.status().state, UpdateService::State::Available);
+        QCOMPARE(shaOf(bytesOf(f.coreProgram())), shaOf(oldProgram));
+        const QString text = leverLog(f);
+        QVERIFY2(text.contains(QStringLiteral("'bogus' is neither install nor restore")), qPrintable(text));
+        QVERIFY2(!text.contains(QStringLiteral("install:")), qPrintable(text));
+    }
+
 private:
+    static QString leverLog(const Fixture& f)
+    {
+        QFile log(QFileInfo(f.appSettingsIni).absolutePath() + QStringLiteral("/update-test.log"));
+        return log.open(QIODevice::ReadOnly) ? QString::fromUtf8(log.readAll()) : QString();
+    }
+
     // One fake release: v0.1.1-pre.1 with a launcher zip and a Core zip, served from local files.
     class Fake {
     public:
