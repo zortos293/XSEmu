@@ -99,7 +99,9 @@ fn launcher_uses_configured_exe_in_an_ambiguous_folder() {
     };
     let _ = child.kill();
     let _ = child.wait();
-    std::fs::remove_dir_all(&root).unwrap();
+    // The run may still hold a file of its own folder for a moment after it is killed (a child of
+    // its own, a mapped image), and cleaning up a temporary folder is not what this test asserts.
+    let _ = std::fs::remove_dir_all(&root);
 
     let boot = boot.unwrap_or_else(|error| panic!("boot record missing: {error}"));
     let boot: serde_json::Value = serde_json::from_str(&boot).unwrap();
