@@ -602,11 +602,16 @@ private slots:
         QVERIFY2(updates.status().error.contains(QStringLiteral("SHA-256")), qPrintable(updates.status().error));
 
         // Nothing may follow a failed step: the launcher's install empties update/, which is where a
-        // Core failure keeps its recovery copy.
+        // Core failure keeps its recovery copy. A later check must not pick the sequence back up.
+        QTest::qWait(500);
+        updates.check(true);
+        QVERIFY(waitFor([&] { return !updates.status().busy(); }));
         QTest::qWait(500);
         const QString text = leverLog(f);
         QVERIFY2(text.contains(QStringLiteral("install: the Core")), qPrintable(text));
+        QVERIFY2(text.contains(QStringLiteral("stopped after a failed step")), qPrintable(text));
         QVERIFY2(!text.contains(QStringLiteral("install: the launcher")), qPrintable(text));
+        QVERIFY(!QFileInfo::exists(QDir(f.appDir).filePath(QStringLiteral("core.old"))));
     }
 
     void testLeverRestoresThePreviousCore()

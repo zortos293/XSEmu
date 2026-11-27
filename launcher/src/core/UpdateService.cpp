@@ -836,10 +836,17 @@ void UpdateService::armTestLever(const QString& lever)
 
 void UpdateService::stepTestInstall()
 {
-    // Only the settled "something is available" state moves the sequence on. A failed step leaves the
-    // sequence where it stopped: a Core failure can be keeping its recovery copy in update/, and the
-    // launcher's half deletes that folder.
-    if (m_testLever != QLatin1String("install") || m_status.state != State::Available)
+    if (m_testLever != QLatin1String("install"))
+        return;
+    // One failure ends the run for good, whatever a later check finds: a Core failure can be keeping
+    // its recovery copy in update/, and the launcher's half deletes that folder.
+    if (m_status.state == State::Failed) {
+        m_testLever.clear();
+        noteTestLever(QStringLiteral("stopped after a failed step"));
+        return;
+    }
+    // Only the settled "something is available" state moves the sequence on.
+    if (m_status.state != State::Available)
         return;
     // The Core first. A launcher update ends with the launcher quitting so its updater script can
     // replace the files, and the Core's half has to be done before that.
