@@ -11,14 +11,14 @@
 QWidget* SettingsSections::overlay(Services& s)
 {
     const SettingsKit::Section sec = SettingsKit::makeSection(
-        QStringLiteral("Overlay"), QStringLiteral("XSEmu draws the overlay inside the game image, so it shows up in captures and costs no extra window."));
+        QStringLiteral("Overlay"), QStringLiteral("XSEmu Core draws the overlay inside the game image, so it shows up in captures and costs no extra window."));
     sec.caps(QStringLiteral("Display"));
     auto* on = new Toggle;
     on->setChecked(s.settings.overlayDefault());
     QObject::connect(on, &Toggle::toggled, &s.settings, &AppSettings::setOverlayDefault);
     sec.row(QStringLiteral("Stall and performance overlay"), QStringLiteral("Shown when a game starts. Toggle it in game with F3 or from the game bar."), on);
     auto* position = new SegmentedControl({QStringLiteral("Top left"), QStringLiteral("Top right"), QStringLiteral("Bottom left"), QStringLiteral("Bottom right")});
-    sec.row(QStringLiteral("Position"), {}, position)->setUnavailable(QStringLiteral("XSEmu draws it in the top-left corner. Moving it is not in this XSEmu build yet."));
+    sec.row(QStringLiteral("Position"), {}, position)->setUnavailable(QStringLiteral("XSEmu Core draws it in the top-left corner. Moving it is not in this XSEmu Core build yet."));
     auto* size = new SegmentedControl({QStringLiteral("Small"), QStringLiteral("Medium"), QStringLiteral("Large")});
     size->setCurrentIndex(1);
     sec.row(QStringLiteral("Size"), {}, size)->setUnavailable();
@@ -37,7 +37,7 @@ QWidget* SettingsSections::overlay(Services& s)
     for (const Metric& m : metrics) {
         auto* t = new Toggle;
         t->setChecked(m.drawn);
-        sec.row(m.label, m.help, t)->setUnavailable(m.drawn ? QStringLiteral("Always drawn. Choosing what the overlay shows is not in this XSEmu build yet.")
+        sec.row(m.label, m.help, t)->setUnavailable(m.drawn ? QStringLiteral("Always drawn. Choosing what the overlay shows is not in this XSEmu Core build yet.")
                                                             : QStringLiteral("The game bar shows this; the in-frame overlay doesn't yet."));
     }
     QObject::connect(&s.settings, &AppSettings::changed, sec.page, [&s, on](const QString& key) {

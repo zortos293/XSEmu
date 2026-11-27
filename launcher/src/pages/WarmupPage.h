@@ -45,5 +45,6 @@ private:
     Button* m_cancel;
     QGridLayout* m_runs;
     bool m_dismissed = false;
+    bool m_fullPass = false; // the warm-up button starts a full pass (a result block), not the picked game's
     QString m_startError;
 };

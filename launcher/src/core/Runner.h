@@ -166,11 +166,11 @@ Recommendation recommend(quint32 gpuVendorId, const QString& gpuName, quint64 ra
             if (r.recommendFor == want && ramBytes >= r.recommendMinRamBytes && installable(r.id))
                 return {r.id, QStringLiteral("Recommended for %1: %2.").arg(gpu, r.recommendWhy)};
         }
-        return {QLatin1String(XSEmu), QStringLiteral("No runner for %1 GPUs can be installed on this PC yet, so XSEmu runs games on %2.").arg(vendorName(gpuVendorId), gpu)};
+        return {QLatin1String(XSEmu), QStringLiteral("No runner for %1 GPUs can be installed on this PC yet, so XSEmu Core runs games on %2.").arg(vendorName(gpuVendorId), gpu)};
     }
     if (gpuVendorId == 0)
-        return {QLatin1String(XSEmu), QStringLiteral("The GPU could not be identified, so XSEmu is the safe choice.")};
-    return {QLatin1String(XSEmu), QStringLiteral("XSEmu supports %1; the other runners are tuned for AMD or NVIDIA GPUs.").arg(gpu)};
+        return {QLatin1String(XSEmu), QStringLiteral("The GPU could not be identified, so XSEmu Core is the safe choice.")};
+    return {QLatin1String(XSEmu), QStringLiteral("XSEmu Core supports %1; the other runners are tuned for AMD or NVIDIA GPUs.").arg(gpu)};
 }
 
 }

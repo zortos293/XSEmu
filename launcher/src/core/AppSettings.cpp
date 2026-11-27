@@ -42,6 +42,7 @@ QVariantMap WarmupRun::toMap() const
         {QStringLiteral("done"), done},
         {QStringLiteral("total"), total},
         {QStringLiteral("failed"), failed},
+        {QStringLiteral("left"), left},
         {QStringLiteral("tookS"), tookS},
         {QStringLiteral("result"), resultName(result)},
         {QStringLiteral("exitCode"), exitCode},
@@ -62,6 +63,8 @@ WarmupRun WarmupRun::fromMap(const QVariantMap& m)
     r.done = m.value(QStringLiteral("done")).toLongLong();
     r.total = m.value(QStringLiteral("total")).toLongLong();
     r.failed = m.value(QStringLiteral("failed")).toLongLong();
+    // a record from before the emulator said what a pass left keeps -1: unknown, not nothing
+    r.left = m.contains(QStringLiteral("left")) ? m.value(QStringLiteral("left")).toLongLong() : -1;
     r.tookS = m.value(QStringLiteral("tookS")).toDouble();
     r.result = resultFrom(m.value(QStringLiteral("result")).toString());
     r.exitCode = m.value(QStringLiteral("exitCode")).toInt();
@@ -71,6 +74,34 @@ WarmupRun WarmupRun::fromMap(const QVariantMap& m)
     r.profile = m.value(QStringLiteral("profile")).toString();
     r.finishedAt = QDateTime::fromString(m.value(QStringLiteral("finishedAt")).toString(), Qt::ISODate);
     return r;
+}
+
+QVariantMap WarmupCheckpoint::toMap() const
+{
+    return {
+        {QStringLiteral("titleId"), titleId},
+        {QStringLiteral("titleName"), titleName},
+        {QStringLiteral("runnerId"), runnerId},
+        {QStringLiteral("profile"), profile},
+        {QStringLiteral("full"), full},
+        {QStringLiteral("built"), built},
+        {QStringLiteral("phase"), phase},
+        {QStringLiteral("startedAt"), startedAt.toUTC().toString(Qt::ISODate)},
+    };
+}
+
+WarmupCheckpoint WarmupCheckpoint::fromMap(const QVariantMap& m)
+{
+    WarmupCheckpoint p;
+    p.titleId = m.value(QStringLiteral("titleId")).toString();
+    p.titleName = m.value(QStringLiteral("titleName")).toString();
+    p.runnerId = m.value(QStringLiteral("runnerId")).toString();
+    p.profile = m.value(QStringLiteral("profile")).toString();
+    p.full = m.value(QStringLiteral("full")).toBool();
+    p.built = m.value(QStringLiteral("built")).toLongLong();
+    p.phase = m.value(QStringLiteral("phase")).toString();
+    p.startedAt = QDateTime::fromString(m.value(QStringLiteral("startedAt")).toString(), Qt::ISODate);
+    return p;
 }
 
 AppSettings::AppSettings(QObject* parent)
@@ -365,6 +396,22 @@ void AppSettings::addRecentWarmup(const WarmupRun& run)
 void AppSettings::clearRecentWarmups()
 {
     write(Key::RecentWarmups, QStringLiteral("[]"));
+}
+
+std::optional<WarmupCheckpoint> AppSettings::warmupInFlight() const
+{
+    const QVariantMap m = readMap(Key::WarmupInFlight);
+    const WarmupCheckpoint pass = WarmupCheckpoint::fromMap(m);
+    return pass.isValid() ? std::optional<WarmupCheckpoint>(pass) : std::nullopt;
+}
+
+void AppSettings::setWarmupInFlight(const std::optional<WarmupCheckpoint>& pass)
+{
+    if (!pass) {
+        write(Key::WarmupInFlight, QString());
+        return;
+    }
+    write(Key::WarmupInFlight, QString::fromUtf8(QJsonDocument(QJsonObject::fromVariantMap(pass->toMap())).toJson(QJsonDocument::Compact)));
 }
 
 qint64 AppSettings::playSeconds(const QString& titleId) const

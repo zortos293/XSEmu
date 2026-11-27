@@ -102,21 +102,21 @@ QString RunnerSpec::writeConfig(const QList<QPair<QString, QString>>& values) co
         s.replace(QLatin1Char('\\'), QLatin1String("\\\\")).replace(QLatin1Char('"'), QLatin1String("\\\""));
         return QLatin1Char('"') + s + QLatin1Char('"');
     };
-    QString text = QStringLiteral("# Written by XSEmu before every run and pre-cache of %1; changes here are replaced.\n[paths]\n").arg(name);
+    QString text = QStringLiteral("# Written by XSEmu Launcher before every run and pre-cache of %1; changes here are replaced.\n[paths]\n").arg(name);
     for (const ConfigPath& p : configPaths) {
         const QString value = expand(p.value, values);
         if (value.isEmpty())
             continue;
         const QString path = QDir::toNativeSeparators(QDir::cleanPath(value));
         if (p.create && !QDir().mkpath(path))
-            return QStringLiteral("XSEmu could not create %1.").arg(path);
+            return QStringLiteral("XSEmu Launcher could not create %1.").arg(path);
         text += p.key + QStringLiteral(" = ") + quoted(path) + QLatin1Char('\n');
     }
     const QString file = QDir::cleanPath(expand(configFile, values));
     QDir().mkpath(QFileInfo(file).absolutePath());
     QSaveFile f(file);
     if (!f.open(QIODevice::WriteOnly) || f.write(text.toUtf8()) < 0 || !f.commit())
-        return QStringLiteral("XSEmu could not write %1: %2").arg(QDir::toNativeSeparators(file), f.errorString());
+        return QStringLiteral("XSEmu Launcher could not write %1: %2").arg(QDir::toNativeSeparators(file), f.errorString());
     return {};
 }
 
@@ -156,7 +156,7 @@ QList<RunnerSpec> build()
 
     RunnerSpec x;
     x.id = QLatin1String(XSEmu);
-    x.name = QStringLiteral("XSEmu");
+    x.name = QStringLiteral("XSEmu Core");
     x.summary = QStringLiteral("Built in. Embeds the game in this window.");
     x.repo = QStringLiteral("zortos293/xsemu");
     x.licence = QStringLiteral("GPL-3.0-or-later");
@@ -257,7 +257,7 @@ QList<RunnerSpec> build()
     k.recommendWhy = QStringLiteral("Kelvaroq is vendor-neutral and was tuned on an RTX 5080");
     k.summary = QStringLiteral("Vendor-neutral; its authors measured it on a GeForce RTX 5080.");
     k.licence = QStringLiteral("GPL-3.0");
-    k.note = QStringLiteral("Kelvaroq reports the game's licence as active and always runs offline; XSEmu's offline store error does not apply to it.");
+    k.note = QStringLiteral("Kelvaroq reports the game's licence as active and always runs offline; XSEmu Core's offline store error does not apply to it.");
     k.windowsOnly = true;
     k.install = RunnerSpec::Install::ReleaseAsset;
     k.releaseTag = QStringLiteral("v0.2.0");
@@ -297,7 +297,7 @@ QList<RunnerSpec> build()
     f.licence = QStringLiteral("GPL-3.0");
     f.note = QStringLiteral("cool_fox reports the game's licence as active. It signs the DXIL it makes without validating it, and skips some of the "
                             "title's ray-tracing shaders by name. It always runs the game as a Series S, whatever the game's console setting. "
-                            "Its GitHub repository was deleted; XSEmu builds the audited commit. Needs 32 GB of RAM.");
+                            "Its GitHub repository was deleted; XSEmu Launcher builds the audited commit. Needs 32 GB of RAM.");
     f.windowsOnly = true;
     f.install = RunnerSpec::Install::BuildFromSource;
     f.commit = QStringLiteral("f4b48ad766ddbec1a1867022cd42f7645b0dd55e");

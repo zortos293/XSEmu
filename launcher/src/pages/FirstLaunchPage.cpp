@@ -185,7 +185,7 @@ FirstLaunchPage::FirstLaunchPage(Services& services, QWidget* parent)
     , m_s(services)
     , m_steps(new StepIndicator)
     , m_stack(new QStackedWidget)
-    , m_version(new Label(QStringLiteral("XSEmu %1").arg(QStringLiteral(XSEMU_VERSION)), Label::Style::Small, Theme::Role::Text3))
+    , m_version(new Label(QStringLiteral("XSEmu Launcher %1").arg(QStringLiteral(XSEMU_VERSION)), Label::Style::Small, Theme::Role::Text3))
     , m_back(new Button(QStringLiteral("Back"), Button::Variant::Ghost, Button::Size::Large, QStringLiteral("back")))
     , m_skip(new Button(QStringLiteral("Skip for now"), Button::Variant::Ghost, Button::Size::Large))
     , m_next(new Button(QStringLiteral("Continue"), Button::Variant::Primary, Button::Size::Large))
@@ -203,7 +203,7 @@ FirstLaunchPage::FirstLaunchPage(Services& services, QWidget* parent)
     auto* brand = new QHBoxLayout;
     brand->setSpacing(10);
     brand->addWidget(new BrandMark(28));
-    brand->addWidget(new Label(QStringLiteral("XSEmu"), Label::Style::SectionTitle));
+    brand->addWidget(new Label(QStringLiteral("XSEmu Launcher"), Label::Style::SectionTitle));
     brand->addStretch(1);
     cv->addLayout(brand);
     cv->addSpacing(34);
@@ -280,10 +280,10 @@ void FirstLaunchPage::finish()
 QWidget* FirstLaunchPage::buildConsole()
 {
     QVBoxLayout* c = nullptr;
-    QWidget* page = stepPage(0, QStringLiteral("Which console should XSEmu be?"),
+    QWidget* page = stepPage(0, QStringLiteral("Which console should XSEmu Core be?"),
                              QStringLiteral("Games pick their memory budget and resolution from the console model. You can change this later in Settings \u2192 Console."), &c);
     m_seriesS = new ChoiceCard(QStringLiteral("Series S"), QStringLiteral("8 GB title memory · lower resolution targets"),
-                               QStringLiteral("Runs on most gaming PCs. XSEmu only keeps 1 GB of RAM free while a game runs."), QStringLiteral("Recommended"));
+                               QStringLiteral("Runs on most gaming PCs. XSEmu Core only keeps 1 GB of RAM free while a game runs."), QStringLiteral("Recommended"));
     auto* seriesX = new ChoiceCard(QStringLiteral("Series X"), QStringLiteral("13.5 GB title memory · higher targets"),
                                    QStringLiteral("Needs much more RAM and VRAM. Pick it only on a 64 GB PC."));
     auto* group = new QButtonGroup(page);
@@ -308,7 +308,7 @@ QWidget* FirstLaunchPage::buildConsole()
         const qint64 ramGb = qint64((hw.totalRamBytes + (512ULL << 20)) >> 30);
         QString text = QStringLiteral("This PC has %1 GB of RAM").arg(ramGb);
         if (hw.gpuName.isEmpty())
-            text += QStringLiteral(", and XSEmu couldn't read its GPU.");
+            text += QStringLiteral(", and XSEmu Core couldn't read its GPU.");
         else if (hw.dedicatedVramBytes > 0)
             text += QStringLiteral(" and %1 with %2.").arg(hw.gpuName, Format::gigabytes(qint64(hw.dedicatedVramBytes), 0));
         else
@@ -325,7 +325,7 @@ QWidget* FirstLaunchPage::buildNetwork()
 {
     QVBoxLayout* c = nullptr;
     QWidget* page = stepPage(1, QStringLiteral("Keep games offline?"),
-                             QStringLiteral("Offline is how XSEmu is tested. Games behave as they would on a console with no internet."), &c);
+                             QStringLiteral("Offline is how XSEmu Core is tested. Games behave as they would on a console with no internet."), &c);
     m_offlineCard = new Card(Card::Kind::Surface, 12);
     auto* oh = new QHBoxLayout(m_offlineCard);
     oh->setContentsMargins(18, 16, 18, 16);
@@ -361,7 +361,7 @@ QWidget* FirstLaunchPage::buildNetwork()
     m_signIn = new Label({}, Label::Style::SmallMedium, Theme::Role::Text2);
     sv->addLayout(factRow(QStringLiteral("Xbox services sign-in"), m_signIn));
     c->addWidget(sees);
-    c->addWidget(new InfoNote(QStringLiteral("XSEmu never reports a licence it doesn't have. A game that needs a live licence check shows its own offline message.")));
+    c->addWidget(new InfoNote(QStringLiteral("XSEmu Core never reports a licence it doesn't have. A game that needs a live licence check shows its own offline message.")));
     connect(m_offline, &Toggle::toggled, this, &FirstLaunchPage::refreshNetwork);
     refreshNetwork();
     return page;
@@ -378,7 +378,7 @@ QWidget* FirstLaunchPage::buildFolders()
 {
     QVBoxLayout* c = nullptr;
     QWidget* page = stepPage(2, QStringLiteral("Where are your games?"),
-                             QStringLiteral("Pick a folder of extracted titles. XSEmu looks for games with a MicrosoftGame.config up to three folders deep."), &c);
+                             QStringLiteral("Pick a folder of extracted titles. XSEmu Launcher looks for games with a MicrosoftGame.config up to three folders deep."), &c);
 
     // empty: the drop zone
     m_dropZone = new DropZone;

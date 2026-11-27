@@ -2,7 +2,7 @@
 //   fake-xsemu run [--host-hwnd <hex>] [--control-pipe <name>] <game folder> [-- args]
 //   fake-xsemu warm-up [--full] [--progress-json]
 // FAKE_XSEMU_SCENARIO = ok | crash | device_removed | files_missing | slow_boot | warmup_fail |
-//                       warmup_ram_floor | warmup_refuse
+//                       warmup_partial | warmup_ram_floor | warmup_refuse
 // FAKE_XSEMU_VERSION_DELAY_MS = how long --version takes to answer (default 0)
 // FAKE_XSEMU_ENV_DUMP = a folder: run and warm-up write their XCL_* environment, sorted, to <folder>/<run|warm-up>.env
 #include "FakeRun.h"

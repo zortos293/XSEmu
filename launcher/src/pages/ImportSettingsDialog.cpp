@@ -195,7 +195,7 @@ void showPreview(QWidget* window, Services& s, const SettingsProfile::Parsed& pa
                                 install->setToolTip(error);
                         });
                         action = install;
-                        caption = st.state == RunnerManager::State::Failed && !st.error.isEmpty() ? st.error : QStringLiteral("Not installed yet. Games fall back to XSEmu until it is.");
+                        caption = st.state == RunnerManager::State::Failed && !st.error.isEmpty() ? st.error : QStringLiteral("Not installed yet. Games fall back to XSEmu Core until it is.");
                     }
                 }
                 const QString& shared = in->profile.runnerVersion;

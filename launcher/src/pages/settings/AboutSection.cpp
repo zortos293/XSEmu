@@ -38,7 +38,7 @@ QWidget* SettingsSections::about(Services& s)
     auto* names = new QVBoxLayout;
     names->setSpacing(2);
     names->addStretch(1);
-    names->addWidget(new Label(QStringLiteral("XSEmu"), Label::Style::SectionTitle));
+    names->addWidget(new Label(QStringLiteral("XSEmu Launcher"), Label::Style::SectionTitle));
     auto* build = new Label(QStringLiteral("launcher %1 · Qt %2").arg(QStringLiteral(XSEMU_VERSION), QString::fromLatin1(qVersion())), Label::Style::Mono, Theme::Role::Text2);
     build->setFont(Theme::mono(12));
     names->addWidget(build);
@@ -90,7 +90,7 @@ QWidget* SettingsSections::about(Services& s)
             lines << QStringLiteral("Version not asked yet: the emulator is busy.");
         else
             lines << (answer.version.isEmpty() ? QStringLiteral("No version reported.") : answer.version)
-                  << (answer.capable ? QStringLiteral("Ready for the launcher.") : QStringLiteral("This XSEmu build is too old for the launcher: Play and Warm-up stay off."));
+                  << (answer.capable ? QStringLiteral("Ready for the launcher.") : QStringLiteral("This XSEmu Core build is too old for the launcher: Play and Warm-up stay off."));
         if (other.busy())
             lines << other.reason();
         if (AppSettings::emulatorPathFromEnvironment())
@@ -114,7 +114,7 @@ QWidget* SettingsSections::about(Services& s)
     SettingsShare::addSettingsRows(sec, s);
 
     sec.caps(QStringLiteral("Credits"));
-    auto* credits = new Label(QStringLiteral("XSEmu is built on <b>XCL</b>, the Xbox Series compatibility layer by the xcl-dev contributors (GPL-3.0-or-later). "
+    auto* credits = new Label(QStringLiteral("XSEmu Core is built on <b>XCL</b>, the Xbox Series compatibility layer by the xcl-dev contributors (GPL-3.0-or-later). "
                                              "The console model, system libraries and shader recompiler come from XCL."),
                               Label::Style::Body);
     credits->setTextFormat(Qt::RichText);

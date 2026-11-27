@@ -140,6 +140,8 @@ void FakeWarmup::tick()
 
     if (m_done >= ph.total) {
         if (m_phase + 1 >= m_phases.size()) {
+            if (m_scenario == QLatin1String("warmup_partial"))
+                m_failed += 5; // a pass that went through everything with builds it could not make
             finish(false);
             return;
         }
@@ -163,13 +165,21 @@ void FakeWarmup::finish(bool cancelled)
     m_timer.stop();
     saveBuilt();
     const bool complete = !cancelled;
+    // what this pass did not build, as the emulator counts it: the phases it never reached and the
+    // builds it failed, which the next pass goes on with
+    qint64 of = 0;
+    for (const Phase& ph : m_phases)
+        of += ph.total;
+    const qint64 left = qMax<qint64>(0, of - (m_built - m_failed));
+    const bool partial = m_scenario == QLatin1String("warmup_partial");
     emitLine({{QStringLiteral("ev"), QStringLiteral("warmup_done")},
               {QStringLiteral("built"), m_built - m_failed},
               {QStringLiteral("failed"), m_failed},
+              {QStringLiteral("left"), left},
               {QStringLiteral("too_big"), 0},
               {QStringLiteral("took_s"), qRound(m_clock.elapsed() / 100.0) / 10.0},
               {QStringLiteral("complete"), complete},
               {QStringLiteral("cancelled"), cancelled},
-              {QStringLiteral("code"), cancelled ? 4 : 0}});
-    leave(cancelled ? 4 : 0);
+              {QStringLiteral("code"), cancelled ? 4 : partial ? 1 : 0}});
+    leave(cancelled ? 4 : partial ? 1 : 0);
 }

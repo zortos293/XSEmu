@@ -89,21 +89,21 @@ QString WarmupController::checkStart(const Game& forGame) const
 {
     const RunnerSpec& spec = runnerFor(forGame);
     if (spec.isBuiltIn() && !m_settings.xsemuWarmup())
-        return QStringLiteral("The XSEmu warm-up is turned off in this build.");
+        return QStringLiteral("The XSEmu Core warm-up is turned off in this build.");
     if (!m_gate.isFree())
         return m_gate.blockedReason(ProcessGate::Action::StartWarmup);
     if (const ProcessGate::External other = m_gate.external(); other.busy())
         return other.reason();
     if (!spec.isBuiltIn()) {
         if (!m_runners || !m_runners->isRunnable(spec.id))
-            return QStringLiteral("%1 is not installed. Install it on the Runners page, or set this game to run with XSEmu.").arg(spec.name);
+            return QStringLiteral("%1 is not installed. Install it on the Runners page, or set this game to run with XSEmu Core.").arg(spec.name);
         if (spec.precache.isEmpty())
             return QStringLiteral("%1 has no shader pre-cache; it builds what it needs while the game runs.").arg(spec.name);
         return {};
     }
     const QString emulator = m_settings.emulatorPath();
     if (!QFileInfo(emulator).isExecutable())
-        return QStringLiteral("XSEmu was not found at %1.").arg(QDir::toNativeSeparators(emulator));
+        return QStringLiteral("XSEmu Core was not found at %1.").arg(QDir::toNativeSeparators(emulator));
     return EmulatorBuild::probe(emulator).problem();
 }
 
@@ -118,6 +118,9 @@ bool WarmupController::start(bool full, const Game& forGame, QString* error)
     m_game = forGame;
     m_progress = {};
     m_progress.full = full;
+    m_phaseSettled = 0;
+    m_startedAt = QDateTime::currentDateTime();
+    m_checkpointClock.start();
     m_done.reset();
     m_error.clear();
     m_stderr.clear();
@@ -129,6 +132,7 @@ bool WarmupController::start(bool full, const Game& forGame, QString* error)
     const RunnerSpec& spec = runnerFor(forGame);
     m_spec = spec.isBuiltIn() ? nullptr : &spec;
     m_profile = m_spec ? QString() : LaunchConfig::profileIdentity(m_settings, forGame.titleId());
+    writeCheckpoint();
     if (m_spec) {
         m_progress.runnerId = m_spec->id;
         m_progress.stepCount = int(m_spec->precache.size());
@@ -148,7 +152,7 @@ bool WarmupController::start(bool full, const Game& forGame, QString* error)
     connect(p, &QProcess::finished, this, [this](int code, QProcess::ExitStatus s) { onFinished(code, static_cast<int>(s)); });
     connect(p, &QProcess::errorOccurred, this, [this, p](QProcess::ProcessError e) {
         if (e == QProcess::FailedToStart) {
-            m_error = QStringLiteral("XSEmu could not be started: %1").arg(p->errorString());
+            m_error = QStringLiteral("XSEmu Core could not be started: %1").arg(p->errorString());
             onFinished(-1, static_cast<int>(QProcess::CrashExit));
         }
     });
@@ -209,8 +213,16 @@ void WarmupController::handle(const Protocol::Event& ev)
         m_progress.targets = s->total;
         m_progress.full = s->full;
         m_progress.threads = s->threads;
+        m_phaseSettled = 0;
+        m_progress.passDone = 0;
         emit progressChanged();
     } else if (const auto* p = std::get_if<Protocol::WarmupProgress>(&ev)) {
+        // the phases run one after another, so the previous one is over when another starts: what it
+        // finished with stays counted in passDone, which survives a crash the done line does not
+        const bool nextPhase = !m_progress.phase.isEmpty() && p->phase != m_progress.phase;
+        if (nextPhase)
+            m_phaseSettled += m_progress.done;
+        m_progress.passDone = m_phaseSettled + p->done;
         m_progress.phase = p->phase;
         m_progress.done = p->done;
         m_progress.total = p->total;
@@ -223,6 +235,8 @@ void WarmupController::handle(const Protocol::Event& ev)
         m_progress.pausedForRam = p->pausedForRam;
         m_progress.elapsedS = m_clock.isValid() ? m_clock.elapsed() / 1000.0 : 0;
         setState(p->pausedForRam ? State::PausedForRam : State::Running);
+        if (nextPhase || m_checkpointClock.elapsed() >= 10000)
+            writeCheckpoint();
         emit progressChanged();
     } else if (const auto* d = std::get_if<Protocol::WarmupDone>(&ev)) {
         m_done = *d;
@@ -241,19 +255,22 @@ WarmupRun WarmupController::classify(int exitCode, bool crashed, const std::opti
     r.finishedAt = QDateTime::currentDateTime();
     r.tookS = last.elapsedS;
     r.failed = last.failed;
+    r.done = last.passDone; // a pass with no done line built no more than its last progress line said
     if (done) {
         r.done = done->built + done->failed;
         r.failed = done->failed;
+        r.left = done->left;
         r.tookS = done->tookS;
+        // The done line is the emulator's own account of the pass, so it decides what happened: exit
+        // code 1 only says some builds failed, and those are exactly what a later pass goes on with
         if (done->cancelled)
             r.result = WarmupRun::Result::Cancelled;
-        else if (done->complete)
-            r.result = WarmupRun::Result::Finished;
-        else {
+        else if (!done->complete) {
             r.result = WarmupRun::Result::StoppedPartWay;
             r.stoppedForRam = last.pausedForRam;
-        }
-        if (!crashed && (exitCode == 0 || exitCode == 4))
+        } else
+            r.result = WarmupRun::Result::Finished;
+        if (!crashed)
             return r;
     }
     if (cancelRequested && !done) {
@@ -264,7 +281,7 @@ WarmupRun WarmupController::classify(int exitCode, bool crashed, const std::opti
     r.result = WarmupRun::Result::Failed;
     r.message = error;
     if (r.message.isEmpty())
-        r.message = crashed ? QStringLiteral("XSEmu stopped unexpectedly.") : QStringLiteral("XSEmu ended with exit code %1.").arg(exitCode);
+        r.message = crashed ? QStringLiteral("XSEmu Core stopped unexpectedly.") : QStringLiteral("XSEmu Core ended with exit code %1.").arg(exitCode);
     return r;
 }
 
@@ -288,6 +305,7 @@ void WarmupController::finish(WarmupRun run)
     run.profile = m_profile;
     m_lastRun = run;
     m_settings.addRecentWarmup(run);
+    m_settings.setWarmupInFlight(std::nullopt);
     if (m_process) {
         m_process->disconnect(this);
         m_process->deleteLater();
@@ -444,6 +462,56 @@ WarmupRun WarmupController::runnerRun(int exitCode) const
     run.tookS = m_progress.elapsedS;
     run.finishedAt = QDateTime::currentDateTime();
     return run;
+}
+
+void WarmupController::writeCheckpoint()
+{
+    WarmupCheckpoint pass;
+    pass.titleId = m_game.isValid() ? m_game.titleId() : QString();
+    pass.titleName = m_game.isValid() ? m_game.title() : QString();
+    pass.runnerId = m_spec ? m_spec->id : QString();
+    pass.profile = m_profile;
+    pass.full = m_progress.full;
+    pass.built = m_progress.passDone;
+    pass.phase = m_progress.phase;
+    pass.startedAt = m_startedAt;
+    m_settings.setWarmupInFlight(pass);
+    m_checkpointClock.restart();
+}
+
+std::optional<WarmupController::Resume> WarmupController::resumable(const QList<WarmupRun>& runs,
+                                                                    const std::optional<WarmupCheckpoint>& inFlight,
+                                                                    const QString& titleId, const QString& runnerId,
+                                                                    const QString& profile)
+{
+    // a pass the launcher did not see the end of: it closed or died, so no run recorded it
+    if (inFlight && inFlight->isValid() && inFlight->titleId == titleId && inFlight->runnerId == runnerId
+        && (profile.isEmpty() || inFlight->profile.isEmpty() || inFlight->profile == profile))
+        return Resume{inFlight->full, inFlight->built, -1, inFlight->phase};
+    for (const WarmupRun& r : runs) {
+        if (r.titleId != titleId || r.runnerId != runnerId)
+            continue;
+        if (!profile.isEmpty() && !r.profile.isEmpty() && r.profile != profile)
+            return std::nullopt; // the run profile changed, so its keys are not this profile's keys
+        switch (r.result) {
+        case WarmupRun::Result::Cancelled:
+        case WarmupRun::Result::StoppedPartWay:
+            return Resume{r.full, r.done, r.left, QString()};
+        case WarmupRun::Result::Failed:
+            // a refusal before the pass started (another process, no device) left nothing to continue
+            if (r.done <= 0)
+                return std::nullopt;
+            return Resume{r.full, r.done, r.left, QString()};
+        case WarmupRun::Result::Finished:
+            // a pass that went through everything can still leave builds it could not make
+            if (r.left > 0)
+                return Resume{r.full, r.done, r.left, QString()};
+            return std::nullopt;
+        case WarmupRun::Result::NothingToBuild:
+            return std::nullopt;
+        }
+    }
+    return std::nullopt;
 }
 
 void WarmupController::setState(State s)
