@@ -135,16 +135,18 @@ jobs:
         run: |
           $tag = $env:TAG
           $assets = @('out\XSEmuLauncher-windows.zip', 'out\XSEmuCore-windows.zip', 'out\XSEmu.exe', 'out\xsemu-manifest.json')
-          $prerelease = if ($env:PRERELEASE -eq 'true') { @('--prerelease') } else { @() }
+          # A real array, filled in place: `$flags = if (...) { @('--prerelease') } else { @() }` collapses
+          # to the bare string on one branch, and splatting a string passes it one character at a time.
+          $flags = @('--repo', $env:GITHUB_REPOSITORY)
+          if ($env:PRERELEASE -eq 'true') { $flags += '--prerelease' }
           gh release view $tag --repo $env:GITHUB_REPOSITORY *> $null
           if ($LASTEXITCODE -eq 0) {
             Write-Host "the release $tag exists: replacing its assets and notes"
             gh release upload $tag @assets --clobber --repo $env:GITHUB_REPOSITORY
             if ($LASTEXITCODE -ne 0) { throw 'uploading the assets failed' }
-            gh release edit $tag --notes-file out\notes.md @prerelease --repo $env:GITHUB_REPOSITORY
+            gh release edit $tag --notes-file out\notes.md @flags
           } else {
-            gh release create $tag @assets --title "XSEmu $env:VERSION" --notes-file out\notes.md @prerelease `
-              --verify-tag --repo $env:GITHUB_REPOSITORY
+            gh release create $tag @assets --title "XSEmu $env:VERSION" --notes-file out\notes.md --verify-tag @flags
           }
           if ($LASTEXITCODE -ne 0) { throw 'publishing the release failed' }
           gh release view $tag --repo $env:GITHUB_REPOSITORY --json assets,isPrerelease --jq '{ prerelease: .isPrerelease, assets: [.assets[].name] }'
