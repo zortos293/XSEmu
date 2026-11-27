@@ -238,6 +238,15 @@ struct State {
 
 static STATE: LazyLock<Mutex<State>> = LazyLock::new(|| Mutex::new(State::default()));
 
+/// The capture state. A panic while it is held poisons the mutex, and taking a poisoned lock with
+/// `unwrap()` makes every later reader panic too – including `epoch()`, which a fence signal calls
+/// from a `Drop`, so one failed assertion aborts the process instead of failing one test or skipping
+/// one recording. Read it as it was left instead: the state is plain bookkeeping, and whatever the
+/// recording says is no worse than dropping the frame.
+fn lock() -> std::sync::MutexGuard<'static, State> {
+    STATE.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 thread_local! {
     static IN_OP: RefCell<Vec<usize>> = const { RefCell::new(Vec::new()) };
     static NATIVE_QUEUE: Cell<Option<(usize, usize)>> = const { Cell::new(None) };
@@ -538,7 +547,7 @@ unsafe fn get_queue(raw: *mut c_void) -> Option<Queue> {
     }
     let key = raw as usize;
     let id = {
-        let mut state = STATE.lock().unwrap();
+        let mut state = lock();
         let id = state.next_queue.checked_add(1)?;
         if state.queues.len() + state.registering.len() >= MAX_QUEUES
             || !state.registering.insert(key)
@@ -588,18 +597,18 @@ unsafe fn get_queue(raw: *mut c_void) -> Option<Queue> {
             },
             device,
         };
-        let previous = STATE.lock().unwrap().queues.insert(key, q.clone());
+        let previous = lock().queues.insert(key, q.clone());
         drop(previous);
         Some(q)
     })();
-    STATE.lock().unwrap().registering.remove(&key);
+    lock().registering.remove(&key);
     made
 }
 
 pub(super) unsafe fn queue_created(raw: *mut c_void) {
     if enabled() {
         if queue_token(raw).is_none() {
-            let previous = STATE.lock().unwrap().queues.remove(&(raw as usize));
+            let previous = lock().queues.remove(&(raw as usize));
             drop(previous);
         }
         let _ = get_queue(raw);
@@ -608,7 +617,7 @@ pub(super) unsafe fn queue_created(raw: *mut c_void) {
 
 unsafe fn poll(queue: Option<usize>) {
     let snapshots = {
-        let state = STATE.lock().unwrap();
+        let state = lock();
         state
             .flights
             .iter()
@@ -623,7 +632,7 @@ unsafe fn poll(queue: Option<usize>) {
         if completed < marker.value {
             continue;
         }
-        let flight = STATE.lock().unwrap().flights.remove(&id);
+        let flight = lock().flights.remove(&id);
         let Some(flight) = flight else { continue };
         let valid = completed == marker.value;
         if valid {
@@ -638,7 +647,7 @@ unsafe fn poll(queue: Option<usize>) {
             finish(covered, None, valid);
         }
         {
-            let mut state = STATE.lock().unwrap();
+            let mut state = lock();
             if !valid {
                 state.quarantined_markers.push(flight.marker);
                 state.marker_count -= 1;
@@ -656,10 +665,10 @@ unsafe fn finish(submission: Submission, readable: Option<usize>, valid: bool) {
     batch.dropped = submission.folded_drops;
     for (index, generation) in submission.recordings {
         let gate = (valid && readable.is_some())
-            .then(|| STATE.lock().unwrap().slots[index].read_gate.clone());
+            .then(|| lock().slots[index].read_gate.clone());
         let _read = gate.as_ref().map(|gate| gate.lock().unwrap());
         let (snapshot, depth, count, timestamps) = {
-            let state = STATE.lock().unwrap();
+            let state = lock();
             let slot = &state.slots[index];
             let Some(recording) = slot.recording.as_ref().filter(|r| r.id == generation) else {
                 debug_assert!(false, "GPU timing readback without its recording");
@@ -761,7 +770,7 @@ unsafe fn allocate_slot(device: ID3D12Device, ty: D3D12_QUERY_HEAP_TYPE) -> Opti
 
 unsafe fn allocate_spill(base: &SlotGpu) -> Option<Arc<SlotGpu>> {
     {
-        let mut state = STATE.lock().unwrap();
+        let mut state = lock();
         if state
             .faulted_devices
             .contains(&(base.device.as_raw() as usize))
@@ -783,7 +792,7 @@ unsafe fn allocate_spill(base: &SlotGpu) -> Option<Arc<SlotGpu>> {
     let made = SlotGpu::new(base.device.clone(), base.ty).map(Arc::new);
     if made.is_none() {
         UNAVAILABLE.fetch_add(1, Ordering::Relaxed);
-        STATE.lock().unwrap().spill_count -= 1;
+        lock().spill_count -= 1;
     }
     made
 }
@@ -793,7 +802,7 @@ pub(super) unsafe fn opened(raw: *mut c_void, pipeline: usize) {
     if !enabled() || raw.is_null() {
         return;
     }
-    STATE.lock().unwrap().forget(raw as usize);
+    lock().forget(raw as usize);
     if super::title_textures::is_own_work() {
         return;
     }
@@ -823,7 +832,7 @@ pub(super) unsafe fn opened(raw: *mut c_void, pipeline: usize) {
         Grow,
     }
     let claim = {
-        let mut state = STATE.lock().unwrap();
+        let mut state = lock();
         if state.faulted_devices.contains(&(device.as_raw() as usize)) {
             return;
         }
@@ -844,7 +853,7 @@ pub(super) unsafe fn opened(raw: *mut c_void, pipeline: usize) {
         Claim::Ready(i) => i,
         Claim::Grow => {
             let gpu = allocate_slot(device, ty);
-            let mut state = STATE.lock().unwrap();
+            let mut state = lock();
             state.opening_slots -= 1;
             let Some(gpu) = gpu else { return };
             let i = state.slots.len();
@@ -857,7 +866,7 @@ pub(super) unsafe fn opened(raw: *mut c_void, pipeline: usize) {
         }
     };
     let id = {
-        let mut state = STATE.lock().unwrap();
+        let mut state = lock();
         let device = state.slots[index].gpu.device.as_raw() as usize;
         if state.faulted_devices.contains(&device) {
             state.free.push(index);
@@ -880,11 +889,11 @@ pub(super) unsafe fn opened(raw: *mut c_void, pipeline: usize) {
         )
         .is_err()
     {
-        STATE.lock().unwrap().free.push(index);
+        lock().free.push(index);
         return;
     }
     let start = {
-        let mut state = STATE.lock().unwrap();
+        let mut state = lock();
         state.lists.insert(raw as usize, index);
         let slot = &mut state.slots[index];
         slot.recording = Some(Recording {
@@ -907,7 +916,7 @@ pub(super) unsafe fn render_pass(list: *mut c_void, flags: Option<D3D12_RENDER_P
         return;
     }
     let start = {
-        let mut state = STATE.lock().unwrap();
+        let mut state = lock();
         let Some(&index) = state.lists.get(&(list as usize)) else {
             return;
         };
@@ -939,7 +948,7 @@ pub(super) unsafe fn before_close(raw: *mut c_void) {
         return;
     }
     let (pages, pairs) = {
-        let mut state = STATE.lock().unwrap();
+        let mut state = lock();
         let Some(&index) = state.lists.get(&(raw as usize)) else {
             return;
         };
@@ -979,13 +988,13 @@ pub(super) unsafe fn before_close(raw: *mut c_void) {
 pub(super) fn forget(list: usize) {
     lineage::forget(list, None);
     if enabled() {
-        STATE.lock().unwrap().forget(list);
+        lock().forget(list);
     }
 }
 
 pub(super) unsafe fn attach_depth(raw: *mut c_void, capture: Arc<super::depth_capture::Capture>) -> Result<usize, String> {
     let (id, start) = {
-        let mut state = STATE.lock().unwrap();
+        let mut state = lock();
         let index = *state.lists.get(&(raw as usize)).ok_or("no timed list generation")?;
         let slot = &mut state.slots[index];
         let r = slot.recording.as_mut().ok_or("no active recording")?;
@@ -1002,7 +1011,7 @@ pub(super) unsafe fn attach_depth(raw: *mut c_void, capture: Arc<super::depth_ca
 }
 
 pub(super) fn query_scope_open(list: usize, generation: u64) -> bool {
-    let state = STATE.lock().unwrap();
+    let state = lock();
     state.lists.get(&list).and_then(|i| state.slots.get(*i)).is_some_and(|s|
         !state.faulted_devices.contains(&(s.gpu.device.as_raw() as usize)) && s.recording.as_ref().is_some_and(|r|
             r.id as u64 == generation && r.owned && !r.sealed && !r.quarantined && r.in_flight == 0 && r.pass.is_none() && !r.suspended))
@@ -1012,7 +1021,7 @@ pub(super) fn pipeline(list: *mut c_void, pso: usize) {
     if !enabled() {
         return;
     }
-    let mut state = STATE.lock().unwrap();
+    let mut state = lock();
     if let Some(&index) = state.lists.get(&(list as usize)) {
         state.slots[index].recording.as_mut().unwrap().pipeline = pso;
     }
@@ -1042,7 +1051,7 @@ pub(super) unsafe fn list_token(raw: *mut c_void) -> Option<(usize, usize)> {
 pub(super) fn list_released(token: Option<(usize, usize)>) {
     let Some((list, id)) = token else { return };
     lineage::forget(list, Some(id as u64));
-    let mut state = STATE.lock().unwrap();
+    let mut state = lock();
     if state.lists.get(&list).is_some_and(|&index| {
         state.slots[index]
             .recording
@@ -1063,7 +1072,7 @@ pub(super) unsafe fn queue_token(raw: *mut c_void) -> Option<usize> {
 pub(super) fn queue_released(id: Option<usize>) {
     let Some(id) = id else { return };
     let closed = {
-        let mut state = STATE.lock().unwrap();
+        let mut state = lock();
         let key = state
             .queues
             .iter()
@@ -1127,7 +1136,7 @@ unsafe fn capture<R>(
                 (u64::from(x) * u64::from(y)).saturating_mul(u64::from(z)) >= threshold
             });
     let (start, sample) = {
-        let mut state = STATE.lock().unwrap();
+        let mut state = lock();
         let State {
             lists,
             slots,
@@ -1201,7 +1210,7 @@ unsafe fn capture<R>(
         gpu
     } else {
         let new = allocate_spill(grow.as_deref().unwrap());
-        let mut state = STATE.lock().unwrap();
+        let mut state = lock();
         let current = state.slots[index]
             .recording
             .as_mut()
@@ -1241,7 +1250,7 @@ unsafe fn capture<R>(
         D3D12_QUERY_TYPE_TIMESTAMP,
         query + 1,
     );
-    let mut state = STATE.lock().unwrap();
+    let mut state = lock();
     if let Some(r) = state.slots[index]
         .recording
         .as_mut()
@@ -1281,12 +1290,12 @@ unsafe fn marker_for(device: &ID3D12Device) -> Option<Marker> {
     if WARP_FAIL_MARKER.with(Cell::get) {
         return None;
     }
-    let available = STATE.lock().unwrap().take_marker(device);
+    let available = lock().take_marker(device);
     if available.is_some() {
         return available;
     }
     let Some(fence) = super::real::create_residency_fence(device).ok() else {
-        STATE.lock().unwrap().marker_count -= 1;
+        lock().marker_count -= 1;
         return None;
     };
     Some(Marker {
@@ -1298,7 +1307,7 @@ unsafe fn marker_for(device: &ID3D12Device) -> Option<Marker> {
 
 fn park(queue: &Arc<ID3D12CommandQueue>, mut submission: Submission, flight: Option<usize>) {
     let raw = queue.as_raw() as usize;
-    let mut state = STATE.lock().unwrap();
+    let mut state = lock();
     let existing: HashSet<_> = state
         .parked
         .get(&raw)
@@ -1376,7 +1385,7 @@ unsafe fn arm(
         native::<Signal>(raw, 14)(raw, marker.fence.as_raw(), marker.value).is_ok()
     };
     if armed {
-        STATE.lock().unwrap().flights.insert(
+        lock().flights.insert(
             id,
             Flight {
                 submission,
@@ -1386,7 +1395,7 @@ unsafe fn arm(
         );
     } else {
         {
-            let mut state = STATE.lock().unwrap();
+            let mut state = lock();
             state
                 .faulted_devices
                 .insert(marker.device.as_raw() as usize);
@@ -1402,7 +1411,7 @@ unsafe fn arm(
 
 unsafe fn retry_parked() {
     let (raw, parked, base, id) = {
-        let mut state = STATE.lock().unwrap();
+        let mut state = lock();
         if state.parked.is_empty() {
             return;
         }
@@ -1466,7 +1475,7 @@ pub(super) unsafe fn submit(raw: *mut c_void, lists: &[*mut c_void], f: impl FnO
         |q| q.info,
     );
     let poll_all = {
-        let state = STATE.lock().unwrap();
+        let state = lock();
         state.marker_count >= MAX_FLIGHTS && state.available_markers.is_empty()
             || lists.iter().any(|&list| {
                 state
@@ -1477,7 +1486,7 @@ pub(super) unsafe fn submit(raw: *mut c_void, lists: &[*mut c_void], f: impl FnO
     };
     poll((!poll_all).then_some(info.id));
     let (flight_id, batch, recordings, gates, base) = {
-        let mut state = STATE.lock().unwrap();
+        let mut state = lock();
         let mut batch = info.batch(state.frame);
         let mut started: Vec<_> = lists
             .iter()
@@ -1557,7 +1566,7 @@ pub(super) unsafe fn submit(raw: *mut c_void, lists: &[*mut c_void], f: impl FnO
         UNAVAILABLE.fetch_add(1, Ordering::Relaxed);
         let removed = base.device.GetDeviceRemovedReason().is_err();
         if removed {
-            let mut state = STATE.lock().unwrap();
+            let mut state = lock();
             state.faulted_devices.insert(base.device.as_raw() as usize);
             let parked = state.parked.remove(&(raw as usize));
             drop(state);
@@ -1574,7 +1583,7 @@ pub(super) unsafe fn submit(raw: *mut c_void, lists: &[*mut c_void], f: impl FnO
         stats::record(batch);
         return;
     };
-    let parked = STATE.lock().unwrap().parked.remove(&(raw as usize));
+    let parked = lock().parked.remove(&(raw as usize));
     let (queue_hold, covered) =
         parked.map_or((None, Vec::new()), |p| (Some(p.queue), p.submissions));
     arm(raw, flight_id, submission, covered, marker);
@@ -1591,7 +1600,7 @@ pub(super) fn boundary() {
         retry_parked();
     }
     let frame = {
-        let mut state = STATE.lock().unwrap();
+        let mut state = lock();
         state.frame = state.frame.saturating_add(1);
         state.frame
     };
@@ -1611,7 +1620,7 @@ pub(super) fn epoch() -> u64 {
     if !enabled() {
         return 0;
     }
-    STATE.lock().unwrap().frame
+    lock().frame
 }
 
 unsafe fn checked_queue(raw: *mut c_void) -> Option<(u64, QueueInfo)> {
@@ -1623,7 +1632,7 @@ unsafe fn checked_queue(raw: *mut c_void) -> Option<(u64, QueueInfo)> {
         Some(_) => return None,
         None => queue_token(raw)?,
     };
-    let state = STATE.lock().unwrap();
+    let state = lock();
     state
         .queues
         .get(&(raw as usize))
@@ -1652,7 +1661,7 @@ mod tests {
     use windows::Win32::Graphics::Dxgi::{CreateDXGIFactory1, IDXGIAdapter, IDXGIFactory4};
 
     unsafe fn fence_of(id: usize, index: usize) -> (Arc<ID3D12Fence>, u64) {
-        let state = STATE.lock().unwrap();
+        let state = lock();
         let flight = state
             .flights
             .values()
@@ -1694,7 +1703,7 @@ mod tests {
                 dev.CreateCommandList(0, ty, &alloc, None).unwrap();
             let raw = list.as_raw();
             opened(raw, 0);
-            let index = STATE.lock().unwrap().lists[&(raw as usize)];
+            let index = lock().lists[&(raw as usize)];
             let token = list_token(raw);
             for _ in 0..14_500 {
                 class(raw, Kind::Transfer, || ());
@@ -1710,7 +1719,7 @@ mod tests {
             let (fence, value) = fence_of(queue_id, index);
             crate::gpu::fence::wait(&fence, value, &dev, None, 5_000).unwrap();
             let pages = {
-                let state = STATE.lock().unwrap();
+                let state = lock();
                 let slot = &state.slots[index];
                 let r = slot.recording.as_ref().unwrap();
                 assert_eq!(
@@ -1745,7 +1754,7 @@ mod tests {
             };
             poll(Some(queue_id));
             assert_eq!(
-                STATE.lock().unwrap().slots[index]
+                lock().slots[index]
                     .recording
                     .as_ref()
                     .unwrap()
@@ -1755,7 +1764,7 @@ mod tests {
             drop(execute);
             drop(list);
             list_released(token);
-            assert!(STATE.lock().unwrap().slots[index].recording.is_none());
+            assert!(lock().slots[index].recording.is_none());
 
             alloc.Reset().unwrap();
             let list: ID3D12GraphicsCommandList =
@@ -1767,7 +1776,7 @@ mod tests {
                 class(raw, Kind::Transfer, || ());
             }
             {
-                let state = STATE.lock().unwrap();
+                let state = lock();
                 let index = state.lists[&(raw as usize)];
                 let spills = &state.slots[index].recording.as_ref().unwrap().spills;
                 assert_eq!(spills.len(), 1);
@@ -1800,12 +1809,12 @@ mod tests {
             let raw = list.as_raw();
             opened(raw, 0);
             let token = list_token(raw);
-            let index = STATE.lock().unwrap().lists[&(raw as usize)];
+            let index = lock().lists[&(raw as usize)];
             for _ in 0..4 {
                 class(raw, Kind::Transfer, || ());
             }
             {
-                let state = STATE.lock().unwrap();
+                let state = lock();
                 let r = state.slots[index].recording.as_ref().unwrap();
                 assert!(r.started && r.ops.is_empty());
             }
@@ -1823,7 +1832,7 @@ mod tests {
             }
             assert_eq!(pso_calls.get(), 1);
             {
-                let mut state = STATE.lock().unwrap();
+                let mut state = lock();
                 let r = state.slots[index].recording.as_mut().unwrap();
                 assert_eq!(r.ops.len(), 1);
                 assert!(r.ops[0].sampled);
@@ -1833,7 +1842,7 @@ mod tests {
             WARP_CLASSES.with(|on| on.set(true));
             class(raw, Kind::Clear, || ());
             {
-                let state = STATE.lock().unwrap();
+                let state = lock();
                 let r = state.slots[index].recording.as_ref().unwrap();
                 assert!(r.capture_full);
                 assert_eq!(r.dropped, 1);
@@ -1865,7 +1874,7 @@ mod tests {
             let raw = list.as_raw();
             opened(raw, 0);
             let token = list_token(raw);
-            let index = STATE.lock().unwrap().lists[&(raw as usize)];
+            let index = lock().lists[&(raw as usize)];
             let small = [31, 2, 2];
             let big = [32, 2, 2];
             op_grid(
@@ -1894,7 +1903,7 @@ mod tests {
             before_close(raw);
             list.Close().unwrap();
             {
-                let state = STATE.lock().unwrap();
+                let state = lock();
                 let slot = &state.slots[index];
                 let r = slot.recording.as_ref().unwrap();
                 assert_eq!(r.ops.len(), 3);
@@ -1940,7 +1949,7 @@ mod tests {
             let raw = list.as_raw();
             opened(raw, 0);
             let token = list_token(raw);
-            let index = STATE.lock().unwrap().lists[&(raw as usize)];
+            let index = lock().lists[&(raw as usize)];
             class(raw, Kind::Transfer, || ());
             before_close(raw);
             list.Close().unwrap();
@@ -1953,7 +1962,7 @@ mod tests {
             let qraw = queue.as_raw() as usize;
             let id = queue_token(queue.as_raw()).unwrap();
             {
-                let state = STATE.lock().unwrap();
+                let state = lock();
                 assert!(state.parked.contains_key(&qraw));
                 let r = state.slots[index].recording.as_ref().unwrap();
                 assert_eq!(r.in_flight, 1);
@@ -1965,11 +1974,11 @@ mod tests {
             drop(executable);
             drop(list);
             list_released(token);
-            assert!(STATE.lock().unwrap().slots[index].recording.is_some());
+            assert!(lock().slots[index].recording.is_some());
             drop(unblock);
             crate::gpu::fence::wait(&fence, value, &dev, None, 5_000).unwrap();
             poll(Some(id));
-            let state = STATE.lock().unwrap();
+            let state = lock();
             assert!(!state.parked.contains_key(&qraw));
             assert!(state.slots[index].recording.is_none());
             drop(state);
@@ -2007,7 +2016,7 @@ mod tests {
             opened(raw, 0x1234);
             let old_token = list_token(raw);
             assert!(old_token.is_some());
-            let index = STATE.lock().unwrap().lists[&(raw as usize)];
+            let index = lock().lists[&(raw as usize)];
             let called = Cell::new(false);
             op(
                 raw,
@@ -2056,7 +2065,7 @@ mod tests {
             assert!(new_token.is_some() && new_token != old_token);
             list_released(old_token);
             let new_index = {
-                let state = STATE.lock().unwrap();
+                let state = lock();
                 let new_index = state.lists[&(raw as usize)];
                 assert_ne!(index, new_index);
                 let old = state.slots[index].recording.as_ref().unwrap();
@@ -2067,7 +2076,7 @@ mod tests {
             drop(unblock);
             crate::gpu::fence::wait(&fence, value, &dev, None, 5_000).unwrap();
             {
-                let state = STATE.lock().unwrap();
+                let state = lock();
                 let q = &state.queues[&(replay.as_raw() as usize)];
                 let mut batch = q.info.batch(state.frame);
                 state.slots[index].collect(&mut batch);
@@ -2083,7 +2092,7 @@ mod tests {
             }
             boundary();
             {
-                let state = STATE.lock().unwrap();
+                let state = lock();
                 assert!(state.slots[index].recording.is_none() && state.free.contains(&index));
                 assert!(!state.flights.values().any(|f| f.queue.id == replay_id));
             }
@@ -2092,12 +2101,12 @@ mod tests {
             drop(executable);
             drop(list);
             list_released(new_token);
-            assert!(STATE.lock().unwrap().slots[new_index].recording.is_none());
+            assert!(lock().slots[new_index].recording.is_none());
             drop(first);
             drop(replay);
             queue_released(Some(first_id));
             queue_released(Some(replay_id));
-            let state = STATE.lock().unwrap();
+            let state = lock();
             assert!(!state
                 .queues
                 .values()
