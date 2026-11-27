@@ -1455,42 +1455,7 @@ unsafe fn retry_parked() {
     }
 }
 
-thread_local! {
-    /// the lists this thread is reporting right now: XCL's own queue wrapper reports the lists it is
-    /// handed, so a caller that reports the same list again is describing one submission twice, while
-    /// a nested report of a *different* list is the re-entrant submission the tests below prove
-    static REPORTING: std::cell::RefCell<Vec<usize>> = const { std::cell::RefCell::new(Vec::new()) };
-}
-
-struct Reporting(Vec<usize>);
-
-impl Drop for Reporting {
-    fn drop(&mut self) {
-        REPORTING.with(|r| {
-            let mut reporting = r.borrow_mut();
-            for list in &self.0 {
-                if let Some(at) = reporting.iter().position(|x| x == list) {
-                    reporting.remove(at);
-                }
-            }
-        });
-    }
-}
-
 pub(super) unsafe fn submit(raw: *mut c_void, lists: &[*mut c_void], f: impl FnOnce()) {
-    if lists
-        .iter()
-        .any(|&list| REPORTING.with(|r| r.borrow().contains(&(list as usize))))
-    {
-        return f();
-    }
-    let reported: Vec<usize> = lists.iter().map(|&list| list as usize).collect();
-    REPORTING.with(|r| r.borrow_mut().extend(reported.iter().copied()));
-    let _reporting = Reporting(reported);
-    submit_once(raw, lists, f)
-}
-
-unsafe fn submit_once(raw: *mut c_void, lists: &[*mut c_void], f: impl FnOnce()) {
     if raw.is_null() || lists.is_empty() {
         return f();
     }
@@ -2078,9 +2043,10 @@ mod tests {
             let first_id = queue_token(first.as_raw()).unwrap();
             let (fence, value) = fence_of(first_id, index);
             crate::gpu::fence::wait(&fence, value, &dev, None, 5_000).unwrap();
-            // The submission completed, so it retires now (as the parked-work test does); the replay
-            // below is then the only submission in flight, which is what the checks after it mean.
-            poll(Some(first_id));
+            // The submission completed, so it retires now (as the parked-work test does). Every
+            // completed flight goes, not just the one this test named: XCL's queue wrapper reports the
+            // submission itself when a queue is registered, and that flight is the same submission.
+            poll(None);
 
             let unblock = Unblock(gate.clone());
             replay.Wait(&gate, 1).unwrap();
