@@ -652,6 +652,7 @@ void CoverArtService::finishCurrent()
     const CoverCache::Entry old = m_cache.entry(id);
     e.custom = old.custom;
     const QDir dir(m_cache.dir());
+    bool kept = false;
     for (CoverCache::Kind kind : CoverCache::kKinds) {
         QString& name = e.file(kind);
         if (name.isEmpty())
@@ -670,14 +671,20 @@ void CoverArtService::finishCurrent()
         QFile::remove(part);
         name = old.file(kind);
         e.authors[size_t(kind)] = old.authors[size_t(kind)];
+        kept = true;
     }
+    if (kept)
+        e.fetchedAt = {};
     for (CoverCache::Kind kind : CoverCache::kKinds) {
         const QString was = old.fetched[size_t(kind)];
         if (!was.isEmpty() && was != e.file(kind))
             QFile::remove(dir.filePath(was));
     }
     m_cache.put(id, e);
-    m_failures.remove(id);
+    if (kept)
+        m_failures.insert(id, {QDateTime::currentDateTimeUtc(), QStringLiteral("Couldn't save the new art on this PC; the old art stays.")});
+    else
+        m_failures.remove(id);
     m_busy = false;
     if (std::none_of(m_queue.cbegin(), m_queue.cend(), [&](const Job& j) { return j.game.titleId() == id; }))
         m_pending.remove(id);
