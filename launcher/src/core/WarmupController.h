@@ -44,6 +44,7 @@ public:
         QString phase;           // starting, giants, bound, compute, compute_blobs, rest
         qint64 done = 0;         // within the phase
         qint64 total = 0;        // within the phase
+        qint64 passDone = 0;     // pipelines this pass has finished with, its finished phases included
         qint64 estimate = 0;     // runner pre-cache: a likely total while the step gives none
         double keysPerS = 0;     // the phase's average
         std::optional<qint64> etaS; // rest of the phase; absent while unknown
@@ -90,6 +91,20 @@ public:
     std::optional<WarmupRun> lastRun() const { return m_lastRun; }
 
     static QStringList warmupArguments(bool full);
+
+    // What Continue does for a game: the pass a warm-up that stopped without finishing was running, so
+    // that running the same command again builds only the keys it left (the emulator keeps every blob
+    // it built, and a --full pass keeps its own record). Newest first: a pass the launcher did not see
+    // the end of (it closed or died) beats the newest recorded run. nullopt: nothing to continue, either
+    // because the newest run finished with nothing left, or because it stopped before building anything.
+    struct Resume {
+        bool full = false; // the pass to run again, as it was started
+        qint64 built = -1; // pipelines it built and kept; -1 when nothing counted them honestly
+        qint64 left = -1;  // pipelines it left (-1: the pass did not say, as when it crashed)
+        QString phase;     // the phase it stopped in; empty: unknown
+    };
+    static std::optional<Resume> resumable(const QList<WarmupRun>& runs, const std::optional<WarmupCheckpoint>& inFlight,
+                                          const QString& titleId, const QString& runnerId, const QString& profile);
     // XSEmu's stderr of the newest warm-up, written as it runs: <launcher data>\logs\warm-up.log.
     static QString logPath();
     // Record of a finished process (tested): how the exit code, done line and last progress add up.
@@ -116,6 +131,9 @@ private:
     void onRunnerStepFinished(int exitCode, int exitStatus);
     WarmupRun runnerRun(int exitCode) const;
     void finish(WarmupRun run);
+    // AppSettings::WarmupInFlight: the pass running now, so a launcher that stops mid-pass still knows
+    // what to continue.
+    void writeCheckpoint();
 
     AppSettings& m_settings;
     ProcessGate& m_gate;
@@ -135,4 +153,7 @@ private:
     QString m_profile;                  // XSEmu's warm-up: the run profile identity it started with
     int m_step = 0;
     qint64 m_built = 0; // what the runner's finished steps built
+    qint64 m_phaseSettled = 0; // pipelines the phases before the current one finished with
+    QDateTime m_startedAt;
+    QElapsedTimer m_checkpointClock; // throttles the checkpoint writes while progress ticks
 };

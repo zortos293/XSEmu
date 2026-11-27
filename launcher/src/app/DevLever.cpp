@@ -583,7 +583,10 @@ void DevLever::apply(const Options& o, Services& s, MainWindow& w)
             run.tookS = 160;
             run.result = WarmupRun::Result::Failed;
             run.exitCode = 3;
+            run.left = -1; // a crash reports no count of what it left
             run.finishedAt = QDateTime::currentDateTime();
+            s.settings.clearRecentWarmups();
+            s.settings.addRecentWarmup(run); // the record Continue is offered from
             QDir().mkpath(QFileInfo(WarmupController::logPath()).absolutePath());
             QFile log(WarmupController::logPath());
             if (log.open(QIODevice::WriteOnly | QIODevice::Truncate))
@@ -611,10 +614,13 @@ void DevLever::apply(const Options& o, Services& s, MainWindow& w)
             run.titleName = signal.title();
             run.done = 27292;
             run.total = 41906;
+            run.left = 41906 - 27292;
             run.tookS = 124;
             run.result = stopped ? WarmupRun::Result::StoppedPartWay : WarmupRun::Result::Cancelled;
             run.exitCode = stopped ? 0 : 4;
             run.finishedAt = QDateTime::currentDateTime();
+            s.settings.clearRecentWarmups();
+            s.settings.addRecentWarmup(run); // the record Continue is offered from
             s.warmup.simulateForScreenshot(stopped ? WarmupController::State::StoppedPartWay : WarmupController::State::Cancelled, signal, p, {}, run);
         } else if (st == QLatin1String("warmup-blocked"))
             s.emulator.simulateForScreenshot(EmulatorController::State::Paused, signal, pausedStats());
@@ -778,7 +784,7 @@ void DevLever::apply(const Options& o, Services& s, MainWindow& w)
             if (st == QLatin1String("error-crash")) {
                 info.kind = EmulatorController::ExitInfo::Kind::Crash;
                 info.exitCode = int(0xC0000005u);
-                info.message = QStringLiteral("XSEmu stopped with an access violation while the game was loading.");
+                info.message = QStringLiteral("XSEmu Core stopped with an access violation while the game was loading.");
             } else {
                 info.kind = EmulatorController::ExitInfo::Kind::DeviceRemoved;
                 info.exitCode = int(0x887A0006u);

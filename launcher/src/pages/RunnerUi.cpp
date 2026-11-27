@@ -156,8 +156,8 @@ void confirmInstall(QWidget* window, Services& s, const QString& runnerId)
     auto* d = new Dialog(window, 520);
     d->setIcon(QStringLiteral("download"), int(Theme::Tone::Accent));
     d->setTitle(QStringLiteral("%1 %2?").arg(update ? QStringLiteral("Update") : QStringLiteral("Install"), spec->name));
-    auto* lead = new Label(build ? QStringLiteral("XSEmu downloads the pinned source and builds it on this PC. Nothing runs until the build finishes.")
-                                 : QStringLiteral("XSEmu downloads the pinned release and checks it against its SHA-256 before anything runs."),
+    auto* lead = new Label(build ? QStringLiteral("XSEmu Launcher downloads the pinned source and builds it on this PC. Nothing runs until the build finishes.")
+                                 : QStringLiteral("XSEmu Launcher downloads the pinned release and checks it against its SHA-256 before anything runs."),
                            Label::Style::Small, Theme::Role::Text2);
     lead->setWordWrap(true);
     d->body()->addWidget(lead);
@@ -195,7 +195,7 @@ void confirmInstall(QWidget* window, Services& s, const QString& runnerId)
         d->body()->addSpacing(12);
         d->body()->addWidget(new InfoNote(QStringLiteral("This runner is tuned for %1 GPUs. This PC has %2, so %3 is the better fit.")
                                               .arg(spec->recommendFor == RunnerSpec::Vendor::Amd ? QStringLiteral("AMD") : QStringLiteral("NVIDIA"),
-                                                   hw.gpuNameOrUnknown(), better ? better->name : QStringLiteral("XSEmu")),
+                                                   hw.gpuNameOrUnknown(), better ? better->name : QStringLiteral("XSEmu Core")),
                                           Theme::Tone::Warning, QStringLiteral("warning")));
     }
     for (const QString& note : {build ? spec->buildNote : QString(), spec->note}) {

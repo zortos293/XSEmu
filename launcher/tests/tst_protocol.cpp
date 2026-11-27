@@ -118,12 +118,16 @@ void TestProtocol::warmupLines()
     const WarmupProgress noEta = std::get<WarmupProgress>(parse(R"j({"ev":"warmup_progress","done":0,"total":10,"keys_per_s":0,"phase":"giants","paused_for_ram":true})j"));
     QVERIFY(!noEta.etaS.has_value());
     QVERIFY(noEta.pausedForRam);
-    const WarmupDone d = std::get<WarmupDone>(parse(R"j({"ev":"warmup_done","built":41890,"failed":16,"too_big":0,"took_s":812.4,"complete":true,"cancelled":false,"code":0})j"));
+    const WarmupDone d = std::get<WarmupDone>(parse(R"j({"ev":"warmup_done","built":41890,"failed":16,"left":16,"too_big":0,"took_s":812.4,"complete":true,"cancelled":false,"code":0})j"));
     QCOMPARE(d.built, 41890);
     QCOMPARE(d.failed, 16);
+    QCOMPARE(d.left, 16);
     QCOMPARE(d.tookS, 812.4);
     QVERIFY(d.complete);
     QVERIFY(!d.cancelled);
+    // an emulator older than the field leaves `left` out: what is left of the pass is then unknown, not zero
+    const WarmupDone noLeft = std::get<WarmupDone>(parse(R"j({"ev":"warmup_done","built":400,"failed":0,"too_big":0,"took_s":12.5,"complete":true,"cancelled":false,"code":0})j"));
+    QCOMPARE(noLeft.left, qint64(-1));
     QCOMPARE(std::get<Error>(parse(R"j({"ev":"error","message":"another XSEmu process is running (XSEmu.exe 1234)"})j")).message,
              QStringLiteral("another XSEmu process is running (XSEmu.exe 1234)"));
 }

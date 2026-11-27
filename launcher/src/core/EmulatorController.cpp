@@ -98,7 +98,7 @@ EmulatorController::LaunchCheck EmulatorController::checkLaunch(const Game& game
         }
     } else if (!QFileInfo(emulator).isExecutable()) {
         c.problem = LaunchCheck::Problem::EmulatorMissing;
-        c.reason = QStringLiteral("XSEmu was not found at %1.").arg(QDir::toNativeSeparators(emulator));
+        c.reason = QStringLiteral("XSEmu Core was not found at %1.").arg(QDir::toNativeSeparators(emulator));
         return c;
     } else if (const EmulatorBuild build = EmulatorBuild::probe(emulator); !build.capable) {
         c.problem = LaunchCheck::Problem::EmulatorTooOld;
@@ -468,7 +468,7 @@ void EmulatorController::onFinished(int exitCode, int exitStatus)
         info.message = !error.isEmpty() ? error : (code == 0 ? QString() : m_recentOutput.mid(qMax(0, int(m_recentOutput.size()) - 3)).join(QLatin1Char('\n')));
     } else if (exitCode == -1 && exitStatus == static_cast<int>(QProcess::CrashExit) && m_process && m_process->error() == QProcess::FailedToStart) {
         info.kind = ExitInfo::Kind::Error;
-        info.message = QStringLiteral("XSEmu could not be started: %1").arg(m_process->errorString());
+        info.message = QStringLiteral("XSEmu Core could not be started: %1").arg(m_process->errorString());
     } else {
         info.kind = ExitInfo::Kind::Crash;
     }

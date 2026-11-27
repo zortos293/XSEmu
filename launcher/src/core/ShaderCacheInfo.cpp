@@ -209,6 +209,6 @@ ShaderCacheInfo::Cleared ShaderCacheInfo::clear(const QString& dxilDir)
         r.ok = (fi.isDir() ? QDir(fi.absoluteFilePath()).removeRecursively() : QFile::remove(fi.absoluteFilePath())) && r.ok;
     }
     if (!r.ok)
-        r.error = QStringLiteral("Some cache files could not be deleted. Close XSEmu and try again.");
+        r.error = QStringLiteral("Some cache files could not be deleted. Close XSEmu Core and try again.");
     return r;
 }

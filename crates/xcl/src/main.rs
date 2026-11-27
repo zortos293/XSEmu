@@ -310,6 +310,7 @@ fn warm_up(args: xcl::warm_up_json::Args) -> i32 {
                 out.emit(&Event::WarmupDone {
                     built: w.phases.iter().map(|p| p.built).sum(),
                     failed: w.failed(),
+                    left: w.phases.iter().map(|p| p.of.saturating_sub(p.built)).sum(),
                     too_big: w.too_big(),
                     took_s: (w.took.as_secs_f64() * 10.0).round() / 10.0,
                     complete: w.phases.iter().all(|p| p.not_started == 0),
