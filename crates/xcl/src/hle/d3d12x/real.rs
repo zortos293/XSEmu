@@ -5918,6 +5918,9 @@ unsafe fn translated_compute_pso(this: *mut c_void, f: PsoFn, desc: *const c_voi
     let legacy = driver_cache::path(&dxil, copy.Flags.0).filter(|p| Some(p) != disk.as_ref());
     if BLOCKING_WARM.with(|state| state.get().is_some()) {
         let _slot = driver_slot(dxil.len(), false, disk.iter().chain(&legacy).any(|p| driver_cache::kept(p)), || format!("CS {:016x}", crate::gpu::shader::fnv64(cs))).ok()?;
+        // a twin compiling the same program first leaves its blob on disk for this one (claimed
+        // only once the slot is held: a claim waiting for memory held a title thread for 300 s)
+        let _flight = claim_compute_flight(key);
         if let Some(hr) = library_load(this, disk.as_deref(), super::pso_library::Desc::Compute(&copy), riid, ppv, true) {
             return Some(Ok(hr));
         }
@@ -5932,8 +5935,10 @@ unsafe fn translated_compute_pso(this: *mut c_void, f: PsoFn, desc: *const c_voi
         }
         return Some(if hr < 0 { Err(()) } else { Ok(hr) });
     }
-    let mut candidates = disk.as_deref().into_iter().chain(legacy.as_deref())
-        .filter_map(|path| driver_cache::load(path).map(|b| (Arc::new(b), Some(path))));
+    fn load_candidate(path: &std::path::Path) -> Option<(Arc<Vec<u8>>, Option<&std::path::Path>)> {
+        driver_cache::load(path).map(|b| (Arc::new(b), Some(path)))
+    }
+    let mut candidates = disk.as_deref().into_iter().chain(legacy.as_deref()).filter_map(load_candidate);
     let mut cached = compute_blob(key).map(|b| (b, None)).or_else(|| candidates.next());
     let asked = std::time::Instant::now();
     // preparing (`pso_async::preparing`): a big program's driver compile is made too, for the
@@ -5958,6 +5963,23 @@ unsafe fn translated_compute_pso(this: *mut c_void, f: PsoFn, desc: *const c_voi
     // in the background, within the memory left (`DRIVER_COMPILES`)
     let Ok(slot) = driver_slot(dxil.len(), warm, cached.is_some(), || format!("CS {:016x}", crate::gpu::shader::fnv64(cs))) else {
         return Some(Err(()));
+    };
+    // one compile per program at a time (`claim_compute_flight`): a twin that waited takes the
+    // blob the first compile left, in memory or on disk, instead of compiling it again. Claimed
+    // only with the slot held, so a claim is always a compile that is running: claimed before,
+    // a background compile waiting for memory held a title thread's twin for 300 s.
+    let _flight = if cached.is_none() {
+        let (flight, _) = claim_compute_flight(key);
+        // A previous build may have finished while this caller was waiting for its driver slot.
+        candidates = disk.as_deref().into_iter().chain(legacy.as_deref())
+            .filter_map(load_candidate);
+        cached = compute_blob(key).map(|b| (b, None)).or_else(|| candidates.next());
+        if warm && cached.is_some() {
+            return Some(Err(()));
+        }
+        Some(flight)
+    } else {
+        None
     };
     // the driver's time, without the wait for a slot
     let (mut started, waited) = (std::time::Instant::now(), asked.elapsed());
@@ -8514,6 +8536,89 @@ fn forget_compute_blob(key: ComputeBlobKey) {
         if let Some(b) = m.remove(&key) {
             *total -= b.len();
         }
+    }
+}
+
+/// Compute programs whose driver compile is running, by `ComputeBlobKey`. Two pipelines with
+/// the same program reached the driver at once and each compiled it in full (a warm-up: pairs of
+/// 0.9 MB programs, 65 - 530 s each, both leaving the same blob): the second now waits for the
+/// first and is made from the blob it leaves.
+static COMPUTE_IN_FLIGHT: Mutex<Option<std::collections::HashSet<ComputeBlobKey>>> = Mutex::new(None);
+static COMPUTE_FLIGHT_ENDED: std::sync::Condvar = std::sync::Condvar::new();
+
+/// The claim on one program's compile (`claim_compute_flight`); released when dropped,
+/// however the compile ends.
+#[must_use]
+struct ComputeFlight(ComputeBlobKey);
+
+impl Drop for ComputeFlight {
+    fn drop(&mut self) {
+        let mut g = COMPUTE_IN_FLIGHT.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(set) = g.as_mut() {
+            set.remove(&self.0);
+        }
+        COMPUTE_FLIGHT_ENDED.notify_all();
+    }
+}
+
+/// Claim `key`'s compile: at once when no other thread is compiling it, else after that compile
+/// has ended (`true`: waited – the caller looks for the blob it left before compiling).
+fn claim_compute_flight(key: ComputeBlobKey) -> (ComputeFlight, bool) {
+    let mut g = COMPUTE_IN_FLIGHT.lock().unwrap_or_else(|e| e.into_inner());
+    let mut waited = false;
+    while g.as_ref().is_some_and(|set| set.contains(&key)) {
+        waited = true;
+        g = COMPUTE_FLIGHT_ENDED.wait(g).unwrap_or_else(|e| e.into_inner());
+    }
+    g.get_or_insert_with(Default::default).insert(key);
+    (ComputeFlight(key), waited)
+}
+
+#[cfg(test)]
+mod compute_flight_tests {
+    use super::claim_compute_flight;
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    #[test]
+    fn a_second_claim_of_the_same_program_waits_for_the_first() {
+        let key = (0x5eed_0001, 1, 0, 0);
+        let (first, waited) = claim_compute_flight(key);
+        assert!(!waited, "nothing compiles this program yet");
+        let (tx, rx) = mpsc::channel();
+        let twin = std::thread::spawn(move || {
+            let (_claim, waited) = claim_compute_flight(key);
+            tx.send(waited).unwrap();
+        });
+        assert!(rx.recv_timeout(Duration::from_millis(200)).is_err(), "the twin must wait while the first compiles");
+        drop(first);
+        assert_eq!(rx.recv_timeout(Duration::from_secs(5)), Ok(true), "the twin goes on, told it waited");
+        twin.join().unwrap();
+    }
+
+    #[test]
+    fn claims_of_other_programs_do_not_wait() {
+        let (_a, _) = claim_compute_flight((0x5eed_0002, 1, 0, 0));
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let other_rs = claim_compute_flight((0x5eed_0002, 2, 0, 0)).1;
+            let other_dxil = claim_compute_flight((0x5eed_0003, 1, 0, 0)).1;
+            tx.send((other_rs, other_dxil)).unwrap();
+        });
+        assert_eq!(rx.recv_timeout(Duration::from_secs(5)), Ok((false, false)));
+    }
+
+    #[test]
+    fn a_claim_is_released_when_its_compile_panics() {
+        let key = (0x5eed_0004, 1, 0, 0);
+        let _ = std::thread::spawn(move || {
+            let _claim = claim_compute_flight(key);
+            panic!("the driver compile failed");
+        })
+        .join();
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || tx.send(claim_compute_flight(key).1).unwrap());
+        assert_eq!(rx.recv_timeout(Duration::from_secs(5)), Ok(false));
     }
 }
 
