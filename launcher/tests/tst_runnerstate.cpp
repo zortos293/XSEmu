@@ -75,6 +75,7 @@ private slots:
     void changeLocationWaitsForItsRuns();
     void leftOverFilesOfferReinstallAndUninstall();
     void coolfoxAmbientSwitchIsOffByDefault();
+    void the7900xtxPinIsFetchedFromSourcesThatExist();
 
 private:
     struct Surfaces {
@@ -418,6 +419,36 @@ void TestRunnerState::coolfoxAmbientSwitchIsOffByDefault()
     QVERIFY(s.settings.runnerOptions(QStringLiteral("coolfox")).value(QStringLiteral("ambient"), false));
     QTest::mouseClick(toggle, Qt::LeftButton);
     QVERIFY(!s.settings.runnerOptions(QStringLiteral("coolfox")).value(QStringLiteral("ambient"), true));
+}
+
+void TestRunnerState::the7900xtxPinIsFetchedFromSourcesThatExist()
+{
+    // The fork's own repository (and its author's account) is gone; the curated entry must therefore
+    // name the audited commit, its tree, and more than one source to fetch it from. The feed above
+    // re-pins VIctory (DexNom) only, so this reads the curated list as it ships.
+    const RunnerSpec* r = Runners::find(QStringLiteral("victory-7900xtx"));
+    QVERIFY(r);
+    QCOMPARE(r->install, RunnerSpec::Install::BuildFromSource);
+    QCOMPARE(r->commit.size(), 40);
+    QCOMPARE(r->tree.size(), 40);
+    QVERIFY(r->remotes.size() >= 2);
+    for (const QString& url : r->fetchUrls()) {
+        QVERIFY2(url.startsWith(QLatin1String("https://")) && url.endsWith(QLatin1String(".git")), qPrintable(url));
+        QVERIFY2(url != r->cloneUrl(), qPrintable(url)); // the curated repo URL is the deleted one
+    }
+    // the build it pins is the fork's own: the diag profile and the diagnostics feature
+    QCOMPARE(r->buildSteps.size(), 1);
+    QVERIFY(r->buildSteps.first().contains(QStringLiteral("diag")));
+    QVERIFY(r->buildSteps.first().contains(QStringLiteral("diagnostics")));
+    QCOMPARE(r->artifacts, (QList<QPair<QString, QString>>{{QStringLiteral("diag/victory.exe"), QStringLiteral("victory.exe")}}));
+
+    // and the other source builds name their audited tree too
+    for (const QString& id : {QStringLiteral("victory-dexnom"), QStringLiteral("coolfox")}) {
+        const RunnerSpec* s = Runners::find(id);
+        QVERIFY(s);
+        if (s->commit != m_commit) // the feed re-pins VIctory (DexNom) here
+            QCOMPARE(s->tree.size(), 40);
+    }
 }
 
 QTEST_MAIN(TestRunnerState)
