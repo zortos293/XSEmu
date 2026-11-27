@@ -659,8 +659,9 @@ void CoverArtService::finishCurrent()
         QFile::remove(dir.filePath(name));
         if (!QFile::rename(dir.filePath(name + QStringLiteral(".part")), dir.filePath(name))) {
             QFile::remove(dir.filePath(name + QStringLiteral(".part")));
-            name.clear();
-            e.authors[size_t(kind)].clear();
+            name = old.file(kind);
+            e.authors[size_t(kind)] = old.authors[size_t(kind)];
+            e.fetchedAt = {}; // looked up again on the next request
         }
     }
     for (CoverCache::Kind kind : CoverCache::kKinds) {
