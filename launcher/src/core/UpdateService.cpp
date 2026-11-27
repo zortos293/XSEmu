@@ -672,17 +672,21 @@ bool UpdateService::applyCore(const QString& staged, const ReleasePart& part, co
         }
         return true;
     };
-    const auto restore = [&] {
+    // False when something could not be put back: the copy in `recent` is then the only one left, so
+    // it must not be deleted.
+    const auto restore = [&]() -> bool {
+        bool ok = true;
         for (const ReleaseFile& f : part.files) {
             const QString from = join(recent, f.name);
             const QString to = join(m_coreDir, f.name);
             if (QFileInfo::exists(from)) {
                 QFile::remove(to);
-                QFile::copy(from, to);
+                ok = QFile::copy(from, to) && ok;
             } else if (QFileInfo::exists(to)) {
-                QFile::remove(to);
+                ok = QFile::remove(to) && ok;
             }
         }
+        return ok;
     };
     if (!copyTo(recent)) {
         removeTree(recent);
@@ -704,9 +708,12 @@ bool UpdateService::applyCore(const QString& staged, const ReleasePart& part, co
         QDir().mkpath(QFileInfo(to).absolutePath());
         QFile::remove(to);
         if (!QFile::copy(join(staged, f.name), to) || fileSha256(to).compare(f.sha256, Qt::CaseInsensitive) != 0) {
-            restore();
-            removeTree(recent);
-            return fail(QStringLiteral("Could not put %1 in place; the Core that was there is back.").arg(f.name));
+            if (restore()) {
+                removeTree(recent);
+                return fail(QStringLiteral("Could not put %1 in place; the Core that was there is back.").arg(f.name));
+            }
+            return fail(QStringLiteral("Could not put %1 in place, and the Core that was there could not be put back: its files are kept in %2.")
+                            .arg(f.name, QDir::toNativeSeparators(recent)));
         }
     }
     return true;
