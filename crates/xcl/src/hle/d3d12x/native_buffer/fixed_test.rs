@@ -39,6 +39,7 @@ unsafe fn buffer(
 #[test]
 fn a_fixed_packet_gathers_args_and_predicate_then_executes_only_the_guest_command_conditionally() {
     unsafe {
+        let _serial = crate::hle::d3d12x::physical_directory::test_serial();
         let Some(dev) = crate::hle::d3d12x::real::test_device() else {
             crate::gpu::recomp::runner::skip_test("no GPU");
             return;

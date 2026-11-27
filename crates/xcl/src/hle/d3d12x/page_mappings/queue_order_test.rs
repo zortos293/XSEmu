@@ -7,6 +7,7 @@ use windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC;
 #[test]
 fn actual_copy_page_mapping_handler_and_worker_respect_a_future_queue_signal() {
     unsafe {
+        let _serial = crate::hle::d3d12x::physical_directory::test_serial();
         let Some(dev) = crate::hle::d3d12x::real::test_device() else {
             crate::gpu::recomp::runner::skip_test("no GPU");
             return;
