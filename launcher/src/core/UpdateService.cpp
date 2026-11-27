@@ -563,7 +563,7 @@ void UpdateService::runInstall(Part part, const ReleasePart& releasePart)
     if (part == Part::Core) {
         QString applyError;
         const QString version = releasePart.version;
-        if (!applyCore(unpacked, releasePart, &applyError)) {
+        if (!applyCore(unpacked, releasePart, updateDir, &applyError)) {
             fail(applyError);
             return;
         }
@@ -618,7 +618,7 @@ void UpdateService::runInstall(Part part, const ReleasePart& releasePart)
     });
 }
 
-bool UpdateService::applyCore(const QString& staged, const ReleasePart& part, QString* error)
+bool UpdateService::applyCore(const QString& staged, const ReleasePart& part, const QString& updateDir, QString* error)
 {
     const auto fail = [error](const QString& why) {
         if (error)
@@ -651,20 +651,20 @@ bool UpdateService::applyCore(const QString& staged, const ReleasePart& part, QS
     // compiler beside the Core belongs to the launcher and is not part of a Core update. The restore
     // also removes a file the update introduced (a version file beside an older hand-placed Core).
     const QString previous = previousCoreDir();
-    // A copy already there has not been retired by a launch yet: it is the last Core that ran, and it
-    // is a better way back than the one this update is replacing.
-    const bool keepOld = !QFileInfo::exists(previous);
-    if (keepOld) {
-        removeTree(previous);
-        if (!QDir().mkpath(previous))
-            return fail(QStringLiteral("Could not write to %1.").arg(QDir::toNativeSeparators(m_appDir)));
-    }
-    const auto keepPrevious = [&]() -> bool {
+    // Two copies, for two different jobs. `recent` is exactly what this update replaces, and a failure
+    // restores it (it is dropped with the update folder). `previous` (core.old) is the last Core a
+    // launch proved: it is what the user can go back to, so a second update must not overwrite it with
+    // a build that has not started yet.
+    const QString recent = join(updateDir, QStringLiteral("core-previous"));
+    const bool keepProven = !QFileInfo::exists(previous);
+    const auto copyTo = [&](const QString& dir) -> bool {
+        if (!QDir().mkpath(dir))
+            return false;
         for (const ReleaseFile& f : part.files) {
             const QString from = join(m_coreDir, f.name);
             if (!QFileInfo::exists(from))
                 continue;
-            const QString to = join(previous, f.name);
+            const QString to = join(dir, f.name);
             QDir().mkpath(QFileInfo(to).absolutePath());
             QFile::remove(to);
             if (!QFile::copy(from, to))
@@ -674,7 +674,7 @@ bool UpdateService::applyCore(const QString& staged, const ReleasePart& part, QS
     };
     const auto restore = [&] {
         for (const ReleaseFile& f : part.files) {
-            const QString from = join(previous, f.name);
+            const QString from = join(recent, f.name);
             const QString to = join(m_coreDir, f.name);
             if (QFileInfo::exists(from)) {
                 QFile::remove(to);
@@ -684,12 +684,18 @@ bool UpdateService::applyCore(const QString& staged, const ReleasePart& part, QS
             }
         }
     };
-    if (keepOld && !keepPrevious()) {
-        removeTree(previous);
+    if (!copyTo(recent)) {
+        removeTree(recent);
         return fail(QStringLiteral("Could not copy the current XSEmu Core aside, so nothing was replaced."));
     }
+    if (keepProven && !copyTo(previous)) {
+        removeTree(recent);
+        removeTree(previous);
+        return fail(QStringLiteral("Could not keep a copy to go back to, so nothing was replaced."));
+    }
     if (!QDir().mkpath(m_coreDir)) {
-        if (keepOld)
+        removeTree(recent);
+        if (keepProven)
             removeTree(previous);
         return fail(QStringLiteral("Could not write to %1.").arg(QDir::toNativeSeparators(m_coreDir)));
     }
@@ -699,7 +705,8 @@ bool UpdateService::applyCore(const QString& staged, const ReleasePart& part, QS
         QFile::remove(to);
         if (!QFile::copy(join(staged, f.name), to) || fileSha256(to).compare(f.sha256, Qt::CaseInsensitive) != 0) {
             restore();
-            return fail(QStringLiteral("Could not put %1 in place; the previous Core was kept.").arg(f.name));
+            removeTree(recent);
+            return fail(QStringLiteral("Could not put %1 in place; the Core that was there is back.").arg(f.name));
         }
     }
     return true;

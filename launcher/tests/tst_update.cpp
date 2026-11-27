@@ -329,6 +329,16 @@ private slots:
         }
         const QByteArray oldBytes = bytesOf(f.coreProgram());
         QVERIFY(shaOf(oldBytes) != fake.newProgramSha);
+        // A copy kept from an earlier update is the last Core a launch proved: this update must not
+        // overwrite it with the build it is replacing.
+        const QString proven = QDir(f.appDir).filePath(QStringLiteral("core.old"));
+        QVERIFY(QDir().mkpath(proven));
+        const QByteArray provenBytes = oldBytes + "proven";
+        {
+            QFile out(QDir(proven).filePath(Paths::emulatorExecutableName()));
+            QVERIFY(out.open(QIODevice::WriteOnly));
+            out.write(provenBytes);
+        }
         AppSettings settings(f.appSettingsIni);
         settings.setPrereleaseUpdates(true);
         settings.setEmulatorPathOverride(f.coreProgram());
@@ -349,7 +359,7 @@ private slots:
         QCOMPARE(updates.installedCoreVersion(), QStringLiteral("0.1.1-pre.1"));
         QCOMPARE(shaOf(bytesOf(f.coreProgram())), fake.newProgramSha);
         QVERIFY2(QFileInfo::exists(f.previousProgram()), "the previous copy stays until the new Core starts");
-        QCOMPARE(shaOf(bytesOf(f.previousProgram())), shaOf(oldBytes));
+        QCOMPARE(shaOf(bytesOf(f.previousProgram())), shaOf(provenBytes));
         QVERIFY2(QFileInfo::exists(QDir(f.coreDir).filePath(QStringLiteral("version.json"))), "the other files in core stay");
 
         updates.noteEmulatorStarted();

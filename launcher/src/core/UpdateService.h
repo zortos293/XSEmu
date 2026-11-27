@@ -128,7 +128,7 @@ private:
 
     void runCheck(const CheckInputs& in);
     void runInstall(Part part, const ReleasePart& releasePart);
-    bool applyCore(const QString& staged, const ReleasePart& part, QString* error);
+    bool applyCore(const QString& staged, const ReleasePart& part, const QString& updateDir, QString* error);
     QString writeUpdaterScript(QString* error) const;
 
     AppSettings& m_settings;
