@@ -809,14 +809,19 @@ pub fn register(obj: usize, n: u32, pc_cpu: u64, pc_gpu: u64, inc: u32, sampler:
     // avoid touching unused pages with `write_bytes` (which would mark them dirty for write-watch).
     let (p, memory) = if let Some(p) = unsafe { title_memory(u, bytes as usize) } {
         (p as *mut u8, Memory::Title)
-    } else if u.is_sparse_window(0) {
-        let Some((addr, _)) = (unsafe { super::sparse::alloc_in(0, bytes as usize, 256) }) else {
-            return false;
-        };
-        (addr as *mut u8, Memory::Sparse)
+    } else if let Some(addr) = u.is_sparse_window(0).then(|| unsafe { super::sparse::alloc_in(0, bytes as usize, 256) }).flatten() {
+        (addr.0 as *mut u8, Memory::Sparse)
     } else {
         let Some(p) = u.alloc_in(0, bytes as usize, 256) else { return false };
         unsafe { std::ptr::write_bytes(p, 0, bytes as usize) };
+        if u.is_sparse_window(0) {
+            // The adapter could not make the 4 GiB sparse windows (a software adapter cannot), so the
+            // heap lives in the committed window: a descriptor table still reaches its slots.
+            static SAID: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+            if !SAID.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                crate::xlog_warn!("console descriptor heaps: the sparse VRAM windows are not open, so heaps are kept in the committed window (descriptor tables still work, the 32-bit slot aliasing does not)");
+            }
+        }
         (p, Memory::Uma)
     };
     {
@@ -1775,8 +1780,21 @@ mod tests {
         }
     }
 
+    /// The 4 GiB sparse VRAM windows (a software adapter such as the CI runner's WARP cannot reserve
+    /// them). Tests that prove what only they do skip with this reason; XCL_REQUIRE_GPU=window makes
+    /// the skip a failure.
+    fn sparse_windows_missing() -> Option<String> {
+        if crate::hle::d3d12x::sparse::windows_ready() {
+            return None;
+        }
+        Some("no 4 GiB sparse memory window: this adapter cannot reserve one".to_string())
+    }
+
     #[test]
     fn slots_copy_and_release() {
+        if let Some(why) = sparse_windows_missing() {
+            return crate::gpu::recomp::runner::skip_test(&why);
+        }
         let Some(u) = crate::gpu::uma::get() else { return };
         let rel = |p: u64| (p as usize - u.base()) as u32;
         // views: 4 slots over a PC heap at 0x1000 (increment 32, GPU 0x5000); samplers: 2 at 0x9000
