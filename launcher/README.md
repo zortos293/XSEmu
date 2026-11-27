@@ -1,10 +1,10 @@
-# XSEmu launcher
+# XSEmu Launcher
 
-`XSEmuLauncher` is the desktop front end for XSEmu: a game library, the shader warm-up, settings,
-and the in-game window. It is a Qt 6 Widgets app in C++17. `XSEmu.exe` stays a separate process.
-The launcher starts it, talks to it over the pipe described in
-[docs/launcher-protocol.md](../docs/launcher-protocol.md), and runs only one XSEmu process tree at
-a time: one game or one warm-up.
+`XSEmuLauncher` is the desktop front end for **XSEmu Core**, the emulator bundled next to it as
+`XSEmu.exe`: a game library, the shader warm-up, settings, and the in-game window. It is a Qt 6
+Widgets app in C++17. XSEmu Core stays a separate process: the launcher starts it, talks to it over
+the pipe described in [docs/launcher-protocol.md](../docs/launcher-protocol.md), and runs only one
+XSEmu Core process tree at a time: one game or one warm-up.
 
 The design is the Paper file "XSEmu Launcher · Direction C, Cover grid". Its tokens (colours, type
 scale, radii, spacing, control heights) are in `src/theme/Theme.h` and `Theme.cpp`.
@@ -56,14 +56,14 @@ The settings file is `settings.ini` in the app's local data folder. Set `XSEMU_L
 use another folder. The launcher reads emulator data from `%LOCALAPPDATA%\XCL` (`XCL_DATA_ROOT`
 overrides it) and the shader cache from `%LOCALAPPDATA%\xcl\dxil` (`XCL_DXIL_CACHE`).
 
-The launcher needs no wrapper script: it finds the bundled Core in `core\`, or one placed next to
+The launcher needs no wrapper script: it finds the bundled Core in `core\`, or `XSEmu.exe` next to
 itself, or the one chosen in Settings, About (or from the missing-emulator dialog); `XSEMU_EMULATOR`
-still wins over all of them. The `XCL_*` switches XSEmu runs with are the run profile in Settings.
+still wins over all of them. The `XCL_*` switches XSEmu Core runs with are the run profile in Settings.
 
 On Linux the launcher looks for `core/fake-xsemu`, else `fake-xsemu` next to itself, instead of
 `XSEmu.exe`. Choose its
 behaviour with `FAKE_XSEMU_SCENARIO`: `ok`, `crash`, `device_removed`, `files_missing`,
-`slow_boot`, `warmup_fail`, `warmup_ram_floor` or `warmup_refuse`. `FAKE_XSEMU_TICK_MS` sets
+`slow_boot`, `warmup_fail`, `warmup_partial`, `warmup_ram_floor` or `warmup_refuse`. `FAKE_XSEMU_TICK_MS` sets
 its speed, and `FAKE_XSEMU_ENV_DUMP` names a folder where it writes the `XCL_*` environment of each
 run and warm-up.
 
@@ -119,7 +119,7 @@ data root and the shader cache there. It reads and writes nothing else on the ma
 ## Settings
 
 Every control is backed by an `xcl.toml` key, an `XCL_*` variable or a launcher setting. Controls
-XSEmu can't honour yet are shown disabled with the reason. The `xcl.toml` keys are launcher defaults
+XSEmu Core can't honour yet are shown disabled with the reason. The `xcl.toml` keys are launcher defaults
 (`AppSettings::xclDefault`, under `xcl/`): `LaunchConfig::prepareTitle` writes them into the title's
 `xcl.toml` at launch, and a game's own setting in Game details wins over the default. The `XCL_*`
 variables come from `LaunchConfig::runEnvironment`.
@@ -129,11 +129,11 @@ variables come from `LaunchConfig::runEnvironment`.
 | Console | Device type | `device_type` (`lockhart` or `anaconda`), from `defaultDeviceType` |
 | Network | Offline mode | `XCL_NETWORK=0` when on |
 | Network | Store behaviour | `XCL_STORE=offline-error` (Offline error), unset (Not available) |
-| Shaders | Warm up when the translator changes | Disabled: XSEmu doesn't report its translator version yet |
+| Shaders | Warm up when the translator changes | Disabled: XSEmu Core doesn't report its translator version yet |
 | Shaders | RAM floor | Read only, 1 GB (`EmulatorController::kRamFloorMb`), with the admission rule |
 | Shaders | Cache folder | `XCL_DXIL_CACHE`; a value already in the environment wins |
-| Shaders | Clear cache | Deletes the cache folder's contents when it looks like an XSEmu cache; never the driver's cache |
-| Run profile | Variables, reset to defaults | `runProfile` (`KEY=VALUE` lines, `AppSettings::defaultRunProfile` until edited), in the environment of Play and of XSEmu's warm-up alike; `XCL_NETWORK`, `XCL_STORE`, `XCL_FULL_DUMP` and `XCL_DXIL_CACHE` lines are not used |
+| Shaders | Clear cache | Deletes the cache folder's contents when it looks like an XSEmu Core cache; never the driver's cache |
+| Run profile | Variables, reset to defaults | `runProfile` (`KEY=VALUE` lines, `AppSettings::defaultRunProfile` until edited), in the environment of Play and of XSEmu Core's warm-up alike; `XCL_NETWORK`, `XCL_STORE`, `XCL_FULL_DUMP` and `XCL_DXIL_CACHE` lines are not used |
 | Game details | Use a custom run profile for this game | The game's `runProfile` override, replacing the global profile for its Play and warm-up |
 | Overlay | Stall and performance overlay | `overlayDefault`, sent over the control pipe at launch |
 | Overlay | Position, size, metrics | Disabled: not in the protocol |
@@ -149,7 +149,7 @@ variables come from `LaunchConfig::runEnvironment`.
 | Graphics | Display mode, D3D12 adapter, raytracing | `display_mode`, `d3d12_adapter`, `raytracing`; each is disabled while the run profile or the launcher's environment sets `XCL_DISPLAY_MODE`, `XCL_ADAPTER` or `XCL_RAYTRACING` |
 | Graphics | Start games in, scaling, low-latency present | Disabled: not in this build |
 | Logs | Log detail | `log_level` (`info` or `debug`) |
-| Logs | Keep logs for | Disabled: XSEmu keeps `xcl.log` and `xcl.prev.log` |
+| Logs | Keep logs for | Disabled: XSEmu Core keeps `xcl.log` and `xcl.prev.log` |
 | Logs | Crash reports | `XCL_FULL_DUMP=<data root>/<title>/logs/dumps` when on |
 | About | XSEmu.exe version | `XSEmu.exe --version` |
 | About | Emulator, Choose | `emulator/path`; `XSEMU_EMULATOR` wins |
@@ -175,9 +175,14 @@ with a `.fixture` suffix. `DevFixtures::materialize` copies them to their real n
 
 - Library scan and watch, cover tiles, locked tiles while a game or warm-up runs, search, the paused
   banner and NOW PLAYING.
-- Launch checks (emulator missing, game files missing, busy, another XSEmu running, not enough RAM)
+- Launch checks (emulator missing, game files missing, busy, another XSEmu Core process running, not enough RAM)
   with their dialogs, and the crash, GPU-removed and boot-error dialogs.
 - Warm-up start, cancel and per-phase progress from `--progress-json`, plus the recent runs.
+- Resumable pre-render: a warm-up that fails, is cancelled or stops at the RAM floor or its time
+  budget keeps every pipeline it built (XSEmu Core keeps the driver blobs on disk), and the Warm-up
+  page shows how many are left and offers Continue, which runs the same pass again and builds only
+  those. A launcher that closes or dies mid-pass leaves a checkpoint (`warmup/inFlight` in
+  `settings.ini`), so Continue is offered after a restart too.
 - Settings for console model, network, giant-compile cap, overlay, game folders and theme
   (light, dark or system, switched live).
 - First launch in three steps.

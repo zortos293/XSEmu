@@ -81,6 +81,7 @@ struct WarmupProgress {
 struct WarmupDone {
     qint64 built = 0;
     qint64 failed = 0;
+    qint64 left = -1; // pipelines this pass did not build; -1: the emulator did not say
     qint64 tooBig = 0;
     double tookS = 0;
     bool complete = false;

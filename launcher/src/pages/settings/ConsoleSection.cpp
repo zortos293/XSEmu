@@ -14,7 +14,7 @@ QWidget* SettingsSections::console(Services& s)
 {
     const SettingsKit::Section sec = SettingsKit::makeSection(
         QStringLiteral("Console"),
-        QStringLiteral("The Xbox Series model XSEmu reports to the game. It sets the title memory budget and the resolution targets the game picks."));
+        QStringLiteral("The Xbox Series model XSEmu Core reports to the game. It sets the title memory budget and the resolution targets the game picks."));
     sec.caps(QStringLiteral("Device type"));
     sec.body->addSpacing(12);
     auto* cards = new QWidget;
@@ -22,7 +22,7 @@ QWidget* SettingsSections::console(Services& s)
     h->setContentsMargins(0, 0, 0, 0);
     h->setSpacing(10);
     auto* seriesS = new ChoiceCard(QStringLiteral("Series S"), QStringLiteral("lockhart · 8 GB title memory"),
-                                   QStringLiteral("Lower resolution targets and smaller allocations. The model XSEmu is tuned for."),
+                                   QStringLiteral("Lower resolution targets and smaller allocations. The model XSEmu Core is tuned for."),
                                    QStringLiteral("DEFAULT"));
     auto* seriesX = new ChoiceCard(QStringLiteral("Series X"), QStringLiteral("anaconda · 13.5 GB title memory"),
                                    QStringLiteral("Higher resolution targets and bigger allocations. Needs much more RAM and VRAM."));

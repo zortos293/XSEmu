@@ -11,7 +11,7 @@
 QWidget* SettingsSections::network(Services& s)
 {
     const SettingsKit::Section sec = SettingsKit::makeSection(
-        QStringLiteral("Network"), QStringLiteral("XSEmu runs offline by default. Nothing in the game reaches Xbox services."));
+        QStringLiteral("Network"), QStringLiteral("XSEmu Core runs offline by default. Nothing in the game reaches Xbox services."));
     sec.caps(QStringLiteral("Connection"));
     auto* offline = new Toggle;
     offline->setChecked(s.settings.offline());
@@ -45,7 +45,7 @@ QWidget* SettingsSections::network(Services& s)
         if (key == QLatin1String(AppSettings::Key::StoreOfflineError) || key == QLatin1String(AppSettings::Key::Offline))
             sync();
     });
-    sec.add(new InfoNote(QStringLiteral("XSEmu never reports a licence it doesn't have. A game that needs a live licence check shows its own offline message.")), 20);
+    sec.add(new InfoNote(QStringLiteral("XSEmu Core never reports a licence it doesn't have. A game that needs a live licence check shows its own offline message.")), 20);
     sec.finish();
     return sec.page;
 }

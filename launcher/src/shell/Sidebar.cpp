@@ -101,7 +101,7 @@ Sidebar::Sidebar(Services& services, QWidget* parent)
     brand->setContentsMargins(8, 18, 0, 19);
     brand->setSpacing(10);
     brand->addWidget(new BrandMark(22));
-    auto* name = new Label(QStringLiteral("XSEmu"), Label::Style::Title);
+    auto* name = new Label(QStringLiteral("XSEmu Launcher"), Label::Style::Title);
     name->setFont(Theme::font(Metrics::TextLg, 600, -0.01));
     connect(&Theme::instance(), &Theme::changed, name, [name] { name->setFont(Theme::font(Metrics::TextLg, 600, -0.01)); });
     brand->addWidget(name);

@@ -65,12 +65,12 @@ std::optional<QString> ask(const QString& path, const QString& option, const std
 QString EmulatorBuild::problem() const
 {
     if (!found)
-        return QStringLiteral("XSEmu was not found at %1.").arg(QDir::toNativeSeparators(path));
+        return QStringLiteral("XSEmu Core was not found at %1.").arg(QDir::toNativeSeparators(path));
     if (capable)
         return {};
     if (version.isEmpty())
         return QStringLiteral("%1 didn't say which version it is, so the launcher won't start it.").arg(QFileInfo(path).fileName());
-    return QStringLiteral("This XSEmu build is too old for the launcher (%1 says \"%2\"). It needs a build that supports --control-pipe and --progress-json.")
+    return QStringLiteral("This XSEmu Core build is too old for the launcher (%1 says \"%2\"). It needs a build that supports --control-pipe and --progress-json.")
         .arg(QFileInfo(path).fileName(), version);
 }
 

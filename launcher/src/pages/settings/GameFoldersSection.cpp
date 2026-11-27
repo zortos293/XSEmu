@@ -76,7 +76,7 @@ bool inFolder(const QString& path, const QString& folder)
 QWidget* SettingsSections::gameFolders(Services& s, std::function<void()> addFolder)
 {
     const SettingsKit::Section sec = SettingsKit::makeSection(
-        QStringLiteral("Game folders"), QStringLiteral("XSEmu scans these folders for extracted titles: one game per subfolder, each with a MicrosoftGame.config."));
+        QStringLiteral("Game folders"), QStringLiteral("XSEmu Launcher scans these folders for extracted titles: one game per subfolder, each with a MicrosoftGame.config."));
     sec.caps(QStringLiteral("Folders"));
     sec.body->addSpacing(8);
     auto* list = new FolderList;
@@ -148,7 +148,7 @@ QWidget* SettingsSections::gameFolders(Services& s, std::function<void()> addFol
     sec.caps(QStringLiteral("Scanning"));
     auto* atStart = new Toggle;
     atStart->setChecked(true);
-    sec.row(QStringLiteral("Rescan when XSEmu starts"), QStringLiteral("Picks up games you copied in while it was closed."), atStart)
+    sec.row(QStringLiteral("Rescan when XSEmu Launcher starts"), QStringLiteral("Picks up games you copied in while it was closed."), atStart)
         ->setUnavailable(QStringLiteral("Always on in this launcher."));
     auto* watch = new Toggle;
     watch->setChecked(true);

@@ -23,6 +23,7 @@ struct WarmupRun {
     qint64 done = 0;    // pipelines built (built + failed)
     qint64 total = 0;
     qint64 failed = 0;
+    qint64 left = -1;   // pipelines this pass did not build (-1: the emulator did not say)
     double tookS = 0;
     Result result = Result::Finished;
     int exitCode = 0;
@@ -37,6 +38,23 @@ struct WarmupRun {
 };
 
 Q_DECLARE_METATYPE(WarmupRun)
+
+// The warm-up the launcher is running now, kept in AppSettings (Key::WarmupInFlight) while it runs and
+// dropped when its result lands. A launcher that closes or dies mid-pass leaves it behind, so the next
+// start knows which pass it was and how far it got and offers Continue instead of a fresh pass.
+struct WarmupCheckpoint {
+    QString titleId;
+    QString titleName;
+    QString runnerId;  // empty: XSEmu Core's warm-up
+    QString profile;   // the run profile the pass started with; empty: not recorded
+    bool full = false; // the pass was started with --full
+    QString phase;     // the phase it had reached; empty: none reported yet
+    QDateTime startedAt;
+
+    bool isValid() const { return startedAt.isValid(); }
+    QVariantMap toMap() const;
+    static WarmupCheckpoint fromMap(const QVariantMap& m);
+};
 
 // Launcher preferences (QSettings ini at Paths::settingsFile()). Every setter writes at once and
 // emits changed(key) with one of the AppSettings::Key constants, so a page can follow one setting:
@@ -74,6 +92,7 @@ public:
         static constexpr const char* LaunchNeedMb = "memory/launchNeedMb";
         static constexpr const char* GameOverrides = "games/overrides";
         static constexpr const char* RecentWarmups = "warmup/recentRuns";
+        static constexpr const char* WarmupInFlight = "warmup/inFlight";
         static constexpr const char* PlayStats = "games/play";
         static constexpr const char* LibrarySort = "library/sort";
         static constexpr const char* RunProfile = "emulator/runProfile";
@@ -202,6 +221,11 @@ public:
     QList<WarmupRun> recentWarmups() const; // newest first
     void addRecentWarmup(const WarmupRun& run);
     void clearRecentWarmups();
+
+    // The pass running now (WarmupCheckpoint); invalid when none is, so a pass that ended cleanly is
+    // never offered as one to continue.
+    std::optional<WarmupCheckpoint> warmupInFlight() const;
+    void setWarmupInFlight(const std::optional<WarmupCheckpoint>& pass);
 
     qint64 playSeconds(const QString& titleId) const;
     QDateTime lastPlayed(const QString& titleId) const;

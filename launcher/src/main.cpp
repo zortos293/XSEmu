@@ -15,7 +15,7 @@ int main(int argc, char** argv)
     QApplication app(argc, argv);
     QApplication::setApplicationName(QStringLiteral("XSEmuLauncher"));
     QApplication::setOrganizationName(QStringLiteral("XSEmu"));
-    QApplication::setApplicationDisplayName(QStringLiteral("XSEmu"));
+    QApplication::setApplicationDisplayName(QStringLiteral("XSEmu Launcher"));
     QApplication::setApplicationVersion(QStringLiteral(XSEMU_VERSION));
 
 #ifdef XSEMU_DEV_TOOLS

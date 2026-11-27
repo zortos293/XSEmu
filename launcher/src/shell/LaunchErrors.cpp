@@ -216,7 +216,7 @@ void showStopFirst(QWidget* window, Services& s, const Game& game, std::function
     const QString owner = s.gate.ownerTitle();
     if (s.gate.owner() == ProcessGate::Owner::Warmup) {
         begin(d, QStringLiteral("bolt"), Theme::Tone::Warning, QStringLiteral("Cancel the warm-up first?"));
-        d->body()->addWidget(paragraph(QStringLiteral("%1 can't start while the shader warm-up for %2 runs, because XSEmu runs one process at a time. Compiles in flight finish before it stops.").arg(game.title(), owner)));
+        d->body()->addWidget(paragraph(QStringLiteral("%1 can't start while the shader warm-up for %2 runs, because XSEmu Core runs one process at a time. Compiles in flight finish before it stops.").arg(game.title(), owner)));
         d->addButton(closeButton(d, QStringLiteral("Keep warming up")));
         d->addButton(actionButton(d, QStringLiteral("Cancel and play %1").arg(game.title()), [&s, retry] {
             s.gate.stopOwner();
@@ -230,8 +230,8 @@ void showStopFirst(QWidget* window, Services& s, const Game& game, std::function
     begin(d, QStringLiteral("stop"), Theme::Tone::Warning, QStringLiteral("Stop %1 first?").arg(owner));
     const qint64 heldBytes = s.emulator.stats().heldBytes;
     QString why = QStringLiteral("%1 can't start while %2 is %3.").arg(game.title(), owner, paused ? QStringLiteral("paused") : QStringLiteral("running"));
-    why += heldBytes > 0 ? QStringLiteral(" It still holds %1, and XSEmu runs one game at a time.").arg(Format::gigabytes(heldBytes))
-                         : QStringLiteral(" XSEmu runs one game at a time.");
+    why += heldBytes > 0 ? QStringLiteral(" It still holds %1, and XSEmu Core runs one game at a time.").arg(Format::gigabytes(heldBytes))
+                         : QStringLiteral(" XSEmu Core runs one game at a time.");
     d->body()->addWidget(paragraph(why));
     d->body()->addSpacing(16);
 
@@ -278,18 +278,18 @@ void showFilesMissing(QWidget* window, Services& s, const Game& game, std::funct
     begin(d, QStringLiteral("folder"), Theme::Tone::Danger, QStringLiteral("%1 can't start").arg(game.title()));
     const bool folderGone = !QFileInfo(game.folder).isDir() || !QFileInfo::exists(game.configPath);
     if (folderGone) {
-        d->body()->addWidget(paragraph(QStringLiteral("Its folder is gone or a drive is disconnected. XSEmu looked for MicrosoftGame.config here:")));
+        d->body()->addWidget(paragraph(QStringLiteral("Its folder is gone or a drive is disconnected. XSEmu Launcher looked for MicrosoftGame.config here:")));
         d->body()->addSpacing(12);
         d->body()->addWidget(pathBox(game.folder));
     } else {
         const QString exe = game.exe.isEmpty() ? game.executables.value(0) : game.exe;
-        d->body()->addWidget(paragraph(exe.isEmpty() ? QStringLiteral("Its MicrosoftGame.config names no executable, so XSEmu has nothing to start in:")
-                                                     : QStringLiteral("Its MicrosoftGame.config names %1, but that file isn't in the game folder. XSEmu looked here:").arg(QDir::toNativeSeparators(exe))));
+        d->body()->addWidget(paragraph(exe.isEmpty() ? QStringLiteral("Its MicrosoftGame.config names no executable, so XSEmu Launcher has nothing to start in:")
+                                                     : QStringLiteral("Its MicrosoftGame.config names %1, but that file isn't in the game folder. XSEmu Launcher looked here:").arg(QDir::toNativeSeparators(exe))));
         d->body()->addSpacing(12);
         d->body()->addWidget(pathBox(exe.isEmpty() ? game.folder : QDir(game.folder).filePath(exe)));
     }
     d->body()->addSpacing(12);
-    d->body()->addWidget(paragraph(QStringLiteral("Reconnect the drive and try again, or point XSEmu at the new folder. The shader cache stays either way."),
+    d->body()->addWidget(paragraph(QStringLiteral("Reconnect the drive and try again, or point XSEmu Launcher at the new folder. The shader cache stays either way."),
                                    Theme::Role::Text3, Label::Style::Small));
 
     const QStringList roots = s.settings.gameFolders();
@@ -334,8 +334,8 @@ void showNotEnoughRam(QWidget* window, const Game& game, const EmulatorControlle
     const qint64 floorMb = EmulatorController::kRamFloorMb;
     const qint64 extraMb = qMax<qint64>(0, check.needMb - floorMb);
     QString body = extraMb > 0
-        ? QStringLiteral("%1 needs %2 free to start: the %3 you set in Settings, plus the 1 GB floor XSEmu keeps free.").arg(game.title(), Format::gigabytesFromMb(check.needMb), Format::gigabytesFromMb(extraMb))
-        : QStringLiteral("XSEmu keeps 1 GB of RAM free while %1 runs, and stops the game below that.").arg(game.title());
+        ? QStringLiteral("%1 needs %2 free to start: the %3 you set in Settings, plus the 1 GB floor XSEmu Core keeps free.").arg(game.title(), Format::gigabytesFromMb(check.needMb), Format::gigabytesFromMb(extraMb))
+        : QStringLiteral("XSEmu Core keeps 1 GB of RAM free while %1 runs, and stops the game below that.").arg(game.title());
     body += QStringLiteral(" This PC has %1 free right now.").arg(Format::gigabytesFromMb(check.freeMb));
     auto* text = paragraph(body);
     d->body()->addWidget(text);
@@ -349,7 +349,7 @@ void showNotEnoughRam(QWidget* window, const Game& game, const EmulatorControlle
         facts.add(QStringLiteral("Biggest other app"), QStringLiteral("%1 \u00B7 %2").arg(big.name, Format::gigabytes(big.bytes)));
     d->body()->addWidget(facts.card);
     d->body()->addSpacing(12);
-    auto* note = paragraph(QStringLiteral("Close other apps and XSEmu starts the game as soon as enough memory is free."), Theme::Role::Text3, Label::Style::Small);
+    auto* note = paragraph(QStringLiteral("Close other apps and XSEmu Launcher starts the game as soon as enough memory is free."), Theme::Role::Text3, Label::Style::Small);
     d->body()->addWidget(note);
 
     auto* timer = new QTimer(d);
@@ -416,8 +416,9 @@ void LaunchErrors::confirmPlay(QWidget* window, Services& s, const Game& game, s
     QString why;
     switch (state) {
     case TitleShaderState::LastRunIncomplete:
-        why = last && last->total > 0 ? QStringLiteral("The last warm-up for %1 stopped part way, at %2 of %3 pipelines.").arg(game.title(), Format::count(last->done), Format::count(last->total))
-                                      : QStringLiteral("The last warm-up for %1 stopped part way.").arg(game.title());
+        why = last && last->left > 0   ? QStringLiteral("The last warm-up for %1 stopped part way, with %2 pipelines left.").arg(game.title(), Format::count(last->left))
+            : last && last->total > 0  ? QStringLiteral("The last warm-up for %1 stopped part way, at %2 of %3 pipelines.").arg(game.title(), Format::count(last->done), Format::count(last->total))
+                                       : QStringLiteral("The last warm-up for %1 stopped part way.").arg(game.title());
         break;
     case TitleShaderState::ProfileChanged:
         why = QStringLiteral("The run profile for %1 changed since its last warm-up, so its shaders build again.").arg(game.title());
@@ -433,13 +434,16 @@ void LaunchErrors::confirmPlay(QWidget* window, Services& s, const Game& game, s
     d->body()->addWidget(paragraph(why));
 
     if (last && last->total > 0 && last->done > 0 && last->tookS > 0) {
-        const double estimate = last->tookS / double(last->done) * double(last->total);
+        // what is left of that pass, at the rate it built the rest
+        const qint64 rest = last->left > 0 ? last->left : last->total;
+        const double estimate = last->tookS / double(last->done) * double(rest);
         auto* row = new QHBoxLayout;
         row->setSpacing(8);
         row->addWidget(new IconView(QStringLiteral("clock"), Theme::Role::Text3, 14));
         const qint64 secs = qint64(estimate + 0.5);
         const QString about = secs < 90 ? QStringLiteral("%1 seconds").arg(secs) : QStringLiteral("%1 minutes").arg((secs + 30) / 60);
-        row->addWidget(new Label(QStringLiteral("About %1 on this PC · %2 pipelines").arg(about, Format::count(last->total)), Label::Style::Small, Theme::Role::Text2), 1);
+        row->addWidget(new Label(QStringLiteral("About %1 on this PC · %2%3").arg(about, Format::count(rest), last->left > 0 ? QStringLiteral(" left") : QStringLiteral(" pipelines")),
+                                 Label::Style::Small, Theme::Role::Text2), 1);
         d->body()->addSpacing(16);
         d->body()->addLayout(row);
     }
@@ -466,7 +470,7 @@ void LaunchErrors::confirmPlay(QWidget* window, Services& s, const Game& game, s
 bool LaunchErrors::chooseEmulator(QWidget* parent, AppSettings& settings)
 {
     const QString picked = QFileDialog::getOpenFileName(parent, QStringLiteral("Choose the emulator"), QFileInfo(settings.emulatorPath()).absolutePath(),
-                                                        QStringLiteral("XSEmu (XSEmu.exe xcl.exe);;Programs (*.exe);;All files (*)"));
+                                                        QStringLiteral("XSEmu Core (XSEmu.exe xcl.exe);;Programs (*.exe);;All files (*)"));
     if (picked.isEmpty())
         return false;
     settings.setEmulatorPathOverride(picked);
@@ -506,7 +510,7 @@ void LaunchErrors::showLaunchProblem(QWidget* window, Services& s, const Game& g
     }
     case P::EmulatorTooOld: {
         auto* d = new Dialog(window, 500);
-        begin(d, QStringLiteral("warning"), Theme::Tone::Danger, QStringLiteral("This XSEmu build is too old for the launcher"));
+        begin(d, QStringLiteral("warning"), Theme::Tone::Danger, QStringLiteral("This XSEmu Core build is too old for the launcher"));
         d->body()->addWidget(paragraph(check.reason));
         d->body()->addSpacing(12);
         d->body()->addWidget(pathBox(s.settings.emulatorPath()));
@@ -522,7 +526,7 @@ void LaunchErrors::showLaunchProblem(QWidget* window, Services& s, const Game& g
         auto* d = new Dialog(window, 500);
         begin(d, QStringLiteral("download"), Theme::Tone::Accent, QStringLiteral("%1 is not installed").arg(runner.name));
         d->body()->addWidget(paragraph(check.reason));
-        d->addButton(actionButton(d, QStringLiteral("Play with XSEmu"), [&s, game, retry] {
+        d->addButton(actionButton(d, QStringLiteral("Play with XSEmu Core"), [&s, game, retry] {
             s.settings.setGameOverride(game.titleId(), QStringLiteral("runner"), QString::fromLatin1(Runners::XSEmu));
             retry();
         }, Button::Variant::Secondary));
@@ -592,13 +596,13 @@ LaunchErrors::ExitReport LaunchErrors::describeExit(const EmulatorController::Ex
         r.icon = QStringLiteral("warning");
         r.status = QStringLiteral("Stopped \u00B7 crashed");
         r.title = QStringLiteral("%1 crashed").arg(title);
-        r.body = (info.message.isEmpty() ? QStringLiteral("XSEmu stopped unexpectedly%1.").arg(after) : info.message) + saved;
+        r.body = (info.message.isEmpty() ? QStringLiteral("XSEmu Core stopped unexpectedly%1.").arg(after) : info.message) + saved;
         break;
     case K::Error:
         r.icon = QStringLiteral("warning");
         r.status = QStringLiteral("Couldn't start");
         r.title = QStringLiteral("%1 couldn't start").arg(title);
-        r.body = info.message.isEmpty() ? QStringLiteral("XSEmu reported an error while starting the game.") : info.message;
+        r.body = info.message.isEmpty() ? QStringLiteral("XSEmu Core reported an error while starting the game.") : info.message;
         break;
     }
     const bool report = QFileInfo::exists(Paths::reportJson(info.game.titleId()));

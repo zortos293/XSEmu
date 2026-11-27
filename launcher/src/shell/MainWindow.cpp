@@ -53,7 +53,7 @@ MainWindow::MainWindow(Services& services, QWidget* parent)
     , m_firstLaunch(new FirstLaunchPage(services))
     , m_inGame(new InGameView(services))
 {
-    setWindowTitle(QStringLiteral("XSEmu"));
+    setWindowTitle(QStringLiteral("XSEmu Launcher"));
     setWindowIcon(Icon::appIcon());
     setMinimumSize(960, 600);
 
@@ -150,7 +150,7 @@ void MainWindow::syncMode()
     const bool inGame = !setup && m_inGameMode;
     m_modes->setCurrentIndex(setup ? SetupMode : inGame ? InGameMode : ShellMode);
     m_titleBar->setVisible(!inGame);
-    m_titleBar->setCaption(setup ? QStringLiteral("XSEmu \u00B7 Setup") : QString());
+    m_titleBar->setCaption(setup ? QStringLiteral("XSEmu Launcher \u00B7 Setup") : QString());
 }
 
 void MainWindow::showPage(Page page)

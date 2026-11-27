@@ -63,7 +63,7 @@ void open(QWidget* window, Services& s, SettingsProfile::Profile profile, const 
     d->setTitle(title);
     QVBoxLayout* b = d->body();
     b->setSpacing(0);
-    auto* lead = new Label(QStringLiteral("Anyone with XSEmu can paste the code or open the file. They see exactly what would change before anything is applied."),
+    auto* lead = new Label(QStringLiteral("Anyone with XSEmu Launcher can paste the code or open the file. They see exactly what would change before anything is applied."),
                            Label::Style::Small, Theme::Role::Text2);
     lead->setWordWrap(true);
     b->addWidget(lead);

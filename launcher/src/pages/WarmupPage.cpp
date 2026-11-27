@@ -3,6 +3,7 @@
 #include "PageScaffold.h"
 #include "app/Services.h"
 #include "core/Format.h"
+#include "core/LaunchConfig.h"
 #include "core/Runner.h"
 #include "core/ShaderCacheInfo.h"
 #include "settings/SettingsKit.h"
@@ -211,12 +212,8 @@ WarmupPage::WarmupPage(Services& services, QWidget* parent)
     page.content->addStretch(1);
 
     connect(m_start, &Button::clicked, this, [this] { start(false); });
-    connect(m_warm, &Button::clicked, this, [this] { start(false); });
-    connect(m_resume, &Button::clicked, this, [this] {
-        // stopped part way: the full pass builds what the budgeted one left; otherwise run the same pass again
-        const bool full = m_s.warmup.state() == WarmupController::State::StoppedPartWay || m_s.warmup.progress().full;
-        start(full);
-    });
+    connect(m_warm, &Button::clicked, this, [this] { start(m_fullPass); });
+    connect(m_resume, &Button::clicked, this, [this] { start(m_continueFull); });
     connect(m_play, &Button::clicked, this, [this] {
         if (auto* w = qobject_cast<MainWindow*>(window()))
             w->play(m_s.warmup.game());
@@ -352,8 +349,8 @@ void WarmupPage::refresh()
         const bool paused = m_s.emulator.state() == EmulatorController::State::Paused;
         const qint64 held = m_s.emulator.stats().heldBytes;
         m_bannerTitle->setText(QStringLiteral("Warm-up waits for %1").arg(playing.title()));
-        const QString holds = held > 0 ? QStringLiteral("The %1 game still holds %2, and XSEmu runs one process at a time.").arg(paused ? QStringLiteral("paused") : QStringLiteral("running"), Format::gigabytes(held))
-                                       : QStringLiteral("XSEmu runs one process at a time.");
+        const QString holds = held > 0 ? QStringLiteral("The %1 game still holds %2, and XSEmu Core runs one process at a time.").arg(paused ? QStringLiteral("paused") : QStringLiteral("running"), Format::gigabytes(held))
+                                       : QStringLiteral("XSEmu Core runs one process at a time.");
         m_bannerText->setText(holds + (pickedName.isEmpty() ? QStringLiteral(" Stop the game to warm up.") : QStringLiteral(" Stop the game to warm up %1.").arg(pickedName)));
     } else if (bannerShown) {
         m_bannerTitle->setText(QStringLiteral("Warm-up can't start"));
@@ -420,9 +417,58 @@ void WarmupPage::refresh()
         fromProgress.failed = pr.failed;
         fromProgress.tookS = pr.elapsedS;
         const WarmupRun run = m_s.warmup.lastRun().value_or(fromProgress);
-        const QString at = QStringLiteral("at %1 of %2").arg(Format::count(run.done), Format::count(run.total));
-        const bool comparable = run.total > 0 && run.done <= run.total;
-        const bool canPlay = m_s.warmup.game().isValid() && m_s.gate.isFree();
+        const Game runGame = m_s.warmup.game();
+        // Continue applies while the launcher knows what the pass left: not to a refusal that never
+        // started one, not to a pass that finished, and not across a run profile change
+        const auto resume = WarmupController::resumable(m_s.settings.recentWarmups(), m_s.settings.warmupInFlight(),
+                                                        runGame.titleId(), QString(),
+                                                        LaunchConfig::profileIdentity(m_s.settings, runGame.titleId()));
+        const QString leftCount = run.left > 0 ? Format::count(run.left) : QString();
+        const QString atOf = run.total > 0 && run.done <= run.total ? QStringLiteral("at %1 of %2").arg(Format::count(run.done), Format::count(run.total)) : game;
+        // A failed build is not built: `done` counts what the pass settled with, failures included, so
+        // take them out and built + left is the whole pass. Without a done line there is no honest
+        // whole-pass count, so the phase position says where it stopped instead.
+        const qint64 built = qMax<qint64>(0, run.done - run.failed);
+        const QString sofar = run.left > 0 ? QStringLiteral("%1 built · %2 left").arg(Format::count(built), leftCount)
+                            : run.left == 0 ? QStringLiteral("%1 built · nothing left").arg(Format::count(built))
+                            : pr.total > 0  ? QStringLiteral("stopped in %1 at %2 of %3").arg(WarmupController::phaseLabel(pr.phase).toLower(), Format::count(pr.done), Format::count(pr.total))
+                                            : atOf;
+        const double fraction = run.left > 0  ? fractionOf(built, built + run.left)
+                              : run.left == 0 ? 1.0
+                              : pr.total > 0  ? pr.phaseFraction()
+                              : run.total > 0 && run.done <= run.total ? fractionOf(run.done, run.total)
+                              : -1;
+        const bool canPlay = runGame.isValid() && m_s.gate.isFree();
+        // what an unfinished pass leaves behind: go on with the leftovers, play anyway, or build everything
+        const auto unfinished = [&] {
+            m_continueFull = resume ? resume->full : run.full;
+            m_resume->setVariant(resume ? Button::Variant::Primary : Button::Variant::Secondary);
+            m_resume->setText(resume ? QStringLiteral("Continue") : QStringLiteral("Retry"));
+            m_resume->setToolTip(!resume ? QString()
+                                 : !leftCount.isEmpty() ? QStringLiteral("Builds the %1 pipelines this pass left. Everything it built is kept.").arg(leftCount)
+                                                        : QStringLiteral("Goes on from what this pass built. Everything it built is kept."));
+            m_resume->show();
+            m_fullPass = !run.full && st == State::StoppedPartWay;
+            m_warm->setVisible(m_fullPass);
+            m_warm->setText(QStringLiteral("Full pass"));
+            m_warm->setToolTip(QStringLiteral("Every pipeline with no time limit, including the ones a budgeted pass leaves."));
+            m_warm->setEnabled(cannot.isEmpty());
+            if (canPlay) {
+                m_play->setVariant(Button::Variant::Secondary);
+                m_play->setText(runGame.title().size() > 24 ? QStringLiteral("Play") : QStringLiteral("Play %1").arg(runGame.title()));
+                m_play->show();
+            }
+            // the log as a note-row link, so the header keeps room for Continue and Play
+            if (QFileInfo::exists(WarmupController::logPath()))
+                m_showLog->show();
+            m_dismiss->show();
+        };
+        // what the pass kept, and what Continue would build from it
+        const QString keeps = QStringLiteral("XSEmu Core keeps every pipeline it built. ");
+        const QString then = resume ? (leftCount.isEmpty() ? QStringLiteral("Continue goes on from where this pass stopped.")
+                                                           : QStringLiteral("Continue builds only the %1 that are left.").arg(leftCount))
+                                    : (leftCount.isEmpty() ? QStringLiteral("Nothing is built twice.")
+                                                           : QStringLiteral("The %1 that are left build again when the game needs them.").arg(leftCount));
         switch (st) {
         case State::Finished: {
             m_block->setState(ProgressBlock::State::Finished);
@@ -437,10 +483,19 @@ void WarmupPage::refresh()
                 {QStringLiteral("Free RAM"), pr.ramFreeMb ? Format::gigabytesFromMb(*pr.ramFreeMb) : QStringLiteral("Unknown")},
             });
             if (run.failed > 0)
-                m_block->setNote(QStringLiteral("%1 pipelines failed to build; the game compiles them when it needs them. The log names them.").arg(Format::count(run.failed)));
+                m_block->setNote(QStringLiteral("%1 pipelines failed to build; the game compiles them when it needs them. The log names them.").arg(Format::count(run.failed))
+                                 + (resume ? QStringLiteral(" Continue tries them again.") : QString()));
+            m_fullPass = false;
+            m_continueFull = resume && resume->full;
+            if (resume) {
+                m_resume->setVariant(Button::Variant::Secondary);
+                m_resume->setText(QStringLiteral("Continue"));
+                m_resume->setToolTip(QStringLiteral("Tries the %1 pipelines this pass could not build again. Everything it built is kept.").arg(leftCount));
+                m_resume->show();
+            }
             if (canPlay) {
-                const QString name = m_s.warmup.game().title();
-                m_play->setText(name.size() > 24 ? QStringLiteral("Play") : QStringLiteral("Play %1").arg(name));
+                m_play->setVariant(Button::Variant::Primary);
+                m_play->setText(runGame.title().size() > 24 ? QStringLiteral("Play") : QStringLiteral("Play %1").arg(runGame.title()));
                 m_play->show();
             }
             if (run.failed > 0)
@@ -451,54 +506,36 @@ void WarmupPage::refresh()
         case State::Cancelled: {
             m_block->setState(ProgressBlock::State::Cancelled);
             m_block->setTitle(QStringLiteral("Warm-up cancelled"));
-            m_block->setSubtitle(comparable ? at : game);
-            m_block->setFraction(comparable ? fractionOf(run.done, run.total) : -1);
+            m_block->setSubtitle(sofar);
+            m_block->setFraction(fraction);
             m_block->setColumns({});
-            const QString left = comparable && run.total > run.done
-                                     ? QStringLiteral(" Playing now still stalls on the %1 that are left.").arg(Format::count(run.total - run.done))
-                                     : QString();
-            m_block->setNote(QStringLiteral("Finished pipelines are kept, so resuming picks up where it stopped.") + left);
-            m_resume->setText(QStringLiteral("Resume warm-up"));
-            m_resume->show();
-            m_dismiss->show();
+            m_block->setNote(keeps + then);
+            unfinished();
             return;
         }
         case State::StoppedPartWay: {
             m_block->setState(ProgressBlock::State::Paused);
             m_block->setTitle(QStringLiteral("Warm-up stopped part way"));
-            m_block->setSubtitle(comparable ? at : game);
-            m_block->setFraction(comparable ? fractionOf(run.done, run.total) : -1);
+            m_block->setSubtitle(sofar);
+            m_block->setFraction(fraction);
             m_block->setColumns({});
-            m_block->setNote(run.stoppedForRam
-                                 ? QStringLiteral("Free RAM stayed below the 1 GB floor. Close other apps, then run it again; finished pipelines are kept.")
-                                 : QStringLiteral("The budgeted pass builds the rest largest first for 20 minutes. A full pass builds everything with no time limit and goes on where an earlier full pass stopped."));
-            m_resume->setText(run.stoppedForRam ? QStringLiteral("Run again") : QStringLiteral("Run full pass"));
-            m_resume->show();
-            m_dismiss->show();
+            m_block->setNote((run.stoppedForRam ? QStringLiteral("Free RAM stayed below the 1 GB floor; close other apps, then continue. ")
+                                                : QStringLiteral("The 20-minute budget ran out, and a full pass has no limit. "))
+                             + keeps + then);
+            unfinished();
             return;
         }
         case State::Failed: {
             m_block->setState(ProgressBlock::State::Failed);
             m_block->setTitle(QStringLiteral("Warm-up failed"));
+            m_block->setSubtitle(sofar);
+            m_block->setFraction(fraction);
             m_block->setColumns({});
-            QString kept;
-            if (!m_s.warmup.doneLine() && pr.total > 0) {
-                // no warmup_done line: say where the last progress line had it
-                m_block->setSubtitle(QStringLiteral("in %1, at %2 of %3").arg(WarmupController::phaseLabel(pr.phase).toLower(), Format::count(pr.done), Format::count(pr.total)));
-                m_block->setFraction(pr.phaseFraction());
-                kept = QStringLiteral(" Finished pipelines are kept.");
-            } else {
-                m_block->setSubtitle(comparable ? at : game);
-                m_block->setFraction(comparable ? fractionOf(run.done, run.total) : -1);
-                if (run.done > 0)
-                    kept = QStringLiteral(" The %1 finished pipelines are kept.").arg(Format::count(qMax<qint64>(0, run.done - run.failed)));
-            }
             const QString why = m_s.warmup.errorMessage().isEmpty() ? QString() : QStringLiteral(" ") + sentence(m_s.warmup.errorMessage());
-            m_block->setNote(QStringLiteral("XSEmu exited with code %1.").arg(Format::exitCode(run.exitCode)) + kept + why);
-            m_resume->setText(QStringLiteral("Retry"));
-            m_resume->show();
-            m_log->setEnabled(QFileInfo::exists(WarmupController::logPath()));
-            m_log->show();
+            const QString code = QStringLiteral("XSEmu Core exited with code %1.").arg(Format::exitCode(run.exitCode));
+            // a refusal before the pass started built nothing, so only the code and the reason are worth saying
+            m_block->setNote(built > 0 ? code + QLatin1Char(' ') + keeps + then + why : code + why);
+            unfinished();
             return;
         }
         default:
@@ -538,6 +575,17 @@ void WarmupPage::refresh()
             break;
         }
     }
+    // a pass that stopped without finishing (or one the launcher did not see the end of) is what this
+    // button runs again, and the leftovers are what it says it has
+    const auto resume = WarmupController::resumable(recent, m_s.settings.warmupInFlight(), picked.titleId(), QString(),
+                                                    LaunchConfig::profileIdentity(m_s.settings, picked.titleId()));
+    if (resume) {
+        lastRunText = resume->built >= 0 && resume->left > 0 ? QStringLiteral("%1 built · %2 left").arg(Format::count(resume->built), Format::count(resume->left))
+                     : resume->built >= 0 && resume->left == 0 ? QStringLiteral("%1 built · nothing left").arg(Format::count(resume->built))
+                     : resume->left > 0                       ? QStringLiteral("%1 left").arg(Format::count(resume->left))
+                     : !resume->phase.isEmpty()               ? QStringLiteral("a pass stopped in %1").arg(WarmupController::phaseLabel(resume->phase).toLower())
+                                                              : QStringLiteral("a pass was interrupted");
+    }
     m_block->setSubtitle(pickedState == TitleShaderState::NeverWarmed ? QStringLiteral("never warmed up") : lastRunText);
 
     double built = 0, took = 0;
@@ -554,7 +602,7 @@ void WarmupPage::refresh()
             note += QStringLiteral(", about %1 on this PC").arg(Format::duration(qint64(cache.pipelines / (built / took) + 0.5)));
         note += QStringLiteral(". ");
     } else {
-        note = QStringLiteral("XSEmu records each pipeline a game builds; play a game once and a warm-up builds them all ahead of time. ");
+        note = QStringLiteral("XSEmu Core records each pipeline a game builds; play a game once and a warm-up builds them all ahead of time. ");
     }
     QStringList others;
     for (const Game& g : m_s.library.games()) {
@@ -565,9 +613,14 @@ void WarmupPage::refresh()
             others << s;
     }
     m_block->setNote((note + joinSentences(others)).trimmed());
-    m_warm->setText(pickedName.isEmpty() || pickedName.size() > 24 ? QStringLiteral("Warm up") : QStringLiteral("Warm up %1").arg(pickedName));
+    const bool shortName = pickedName.isEmpty() || pickedName.size() > 24;
+    m_warm->setText(resume ? (shortName ? QStringLiteral("Continue") : QStringLiteral("Continue %1").arg(pickedName))
+                           : (shortName ? QStringLiteral("Warm up") : QStringLiteral("Warm up %1").arg(pickedName)));
+    m_fullPass = resume && resume->full;
     m_warm->setEnabled(cannot.isEmpty());
-    m_warm->setToolTip(cannot);
+    m_warm->setToolTip(!cannot.isEmpty() ? cannot
+                       : resume        ? QStringLiteral("Builds only what the last pass left; everything it built is kept.")
+                                       : QString());
     m_warm->show();
 }
 
@@ -602,7 +655,7 @@ void WarmupPage::refreshRunner(const RunnerSpec& spec, const Game& picked, bool 
             {QStringLiteral("Free RAM"), freeRam},
         });
         const bool gentle = pr.step > 0 && pr.step <= spec.precache.size() && spec.precache.at(pr.step - 1).cancel == RunnerSpec::PrecacheCancel::CloseStdin;
-        m_block->setNote(!m_s.warmup.cancelRequested() ? QStringLiteral("%1 runs in the background with no console window. XSEmu reads its progress; its output goes to the logs folder.").arg(spec.name)
+        m_block->setNote(!m_s.warmup.cancelRequested() ? QStringLiteral("%1 runs in the background with no console window. XSEmu Core reads its progress; its output goes to the logs folder.").arg(spec.name)
                          : gentle                      ? QStringLiteral("%1 finishes the pipelines in flight, then stops.").arg(spec.name)
                                                        : QStringLiteral("Stopping %1.").arg(spec.name));
         m_cancel->setText(m_s.warmup.cancelRequested() ? QStringLiteral("Cancelling...") : QStringLiteral("Cancel"));
@@ -625,6 +678,7 @@ void WarmupPage::refreshRunner(const RunnerSpec& spec, const Game& picked, bool 
                 m_block->setSubtitle(joined({m_s.warmup.game().title(), version}));
                 m_block->setFraction(-1);
                 m_block->setNote(run.message);
+                m_continueFull = false;
                 m_resume->setText(QStringLiteral("Run again"));
                 m_resume->show();
                 m_log->setEnabled(QFileInfo::exists(WarmupController::logPath()));
@@ -664,6 +718,7 @@ void WarmupPage::refreshRunner(const RunnerSpec& spec, const Game& picked, bool 
             m_block->setFraction(comparable ? fractionOf(run.done, run.total) : -1);
             m_block->setNote(QStringLiteral("%1 exited with code %2.").arg(spec.name, Format::exitCode(run.exitCode))
                              + (run.message.isEmpty() ? QString() : QStringLiteral(" ") + sentence(run.message)));
+            m_continueFull = false;
             m_resume->setText(QStringLiteral("Retry"));
             m_resume->show();
             m_log->setEnabled(QFileInfo::exists(WarmupController::logPath()));
@@ -675,6 +730,7 @@ void WarmupPage::refreshRunner(const RunnerSpec& spec, const Game& picked, bool 
             m_block->setSubtitle(joined({comparable ? at : m_s.warmup.game().title(), version}));
             m_block->setFraction(comparable ? fractionOf(run.done, run.total) : -1);
             m_block->setNote(QStringLiteral("What %1 built is kept in its own cache.").arg(spec.name));
+            m_continueFull = false;
             m_resume->setText(QStringLiteral("Run again"));
             m_resume->show();
             m_dismiss->show();
@@ -707,6 +763,7 @@ void WarmupPage::refreshRunner(const RunnerSpec& spec, const Game& picked, bool 
                      : last && last->result == WarmupRun::Result::NothingToBuild && !last->message.isEmpty() ? last->message
                                                                                                              : spec.precacheNote);
     m_warm->setText(QStringLiteral("Pre-cache with %1").arg(spec.name));
+    m_fullPass = false;
     m_warm->setEnabled(cannot.isEmpty());
     m_warm->setToolTip(cannot);
     m_warm->show();

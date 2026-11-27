@@ -379,7 +379,7 @@ LibraryPage::LibraryPage(Services& services, QWidget* parent)
     ev->addSpacing(28);
     ev->addWidget(new Label(QStringLiteral("Add your first game"), Label::Style::Display), 0, Qt::AlignHCenter);
     ev->addSpacing(12);
-    auto* emptyText = new Label(QStringLiteral("Pick a folder that holds extracted Xbox Series titles. XSEmu checks each subfolder for a MicrosoftGame.config and adds what it finds."),
+    auto* emptyText = new Label(QStringLiteral("Pick a folder that holds extracted Xbox Series titles. XSEmu Launcher checks each subfolder for a MicrosoftGame.config and adds what it finds."),
                                 Label::Style::Body, Theme::Role::Text2);
     emptyText->setAlignment(Qt::AlignHCenter);
     emptyText->setWordWrap(true);
@@ -405,7 +405,7 @@ LibraryPage::LibraryPage(Services& services, QWidget* parent)
     nv->addSpacing(20);
     nv->addWidget(m_noResultsTitle, 0, Qt::AlignHCenter);
     nv->addSpacing(10);
-    auto* noText = new Label(QStringLiteral("Search looks at titles, publishers and folder names in your library. The game may be in a folder XSEmu doesn't scan yet."),
+    auto* noText = new Label(QStringLiteral("Search looks at titles, publishers and folder names in your library. The game may be in a folder XSEmu Launcher doesn't scan yet."),
                              Label::Style::Body, Theme::Role::Text2);
     noText->setAlignment(Qt::AlignHCenter);
     noText->setWordWrap(true);
@@ -630,8 +630,8 @@ void LibraryPage::refreshState()
         const qint64 held = m_s.emulator.stats().heldBytes;
         m_bannerHeld->setVisible(held > 0);
         m_bannerHeld->setText(QStringLiteral("%1 held").arg(Format::gigabytes(held)));
-        m_bannerText->setText(paused ? QStringLiteral("A paused game keeps its memory. Warm-ups and other games wait until you stop it, because only one XSEmu process runs at a time.")
-                                     : QStringLiteral("Warm-ups and other games wait until you stop it, because only one XSEmu process runs at a time."));
+        m_bannerText->setText(paused ? QStringLiteral("A paused game keeps its memory. Warm-ups and other games wait until you stop it, because only one XSEmu Core process runs at a time.")
+                                     : QStringLiteral("Warm-ups and other games wait until you stop it, because only one XSEmu Core process runs at a time."));
         m_resume->setText(paused ? QStringLiteral("Resume") : QStringLiteral("Back to game"));
         m_resume->setIconName(paused ? QStringLiteral("play") : QString());
         m_resume->setVisible(st != EmulatorController::State::Stopping);
@@ -643,7 +643,7 @@ void LibraryPage::refreshState()
             m_bannerHeld->setTone(Theme::Tone::Accent);
             m_bannerHeld->setText(runner.name);
             m_bannerHeld->setVisible(true);
-            m_bannerText->setText(QStringLiteral("%1 can't embed in XSEmu, so the game has a separate window. Pause and the overlay aren't available here; "
+            m_bannerText->setText(QStringLiteral("%1 can't embed in XSEmu Core, so the game has a separate window. Pause and the overlay aren't available here; "
                                                  "Stop game ends it. Other games and warm-ups wait until it stops.").arg(runner.name));
             m_resume->setText(QStringLiteral("Show window"));
             m_resume->setIconName(QStringLiteral("play"));

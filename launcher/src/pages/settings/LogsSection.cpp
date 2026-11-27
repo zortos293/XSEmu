@@ -74,7 +74,7 @@ QString when(const QDateTime& t)
 QWidget* SettingsSections::logs(Services& s)
 {
     const SettingsKit::Section sec = SettingsKit::makeSection(
-        QStringLiteral("Logs & crash reports"), QStringLiteral("Everything stays on this PC. XSEmu never uploads logs or crash reports."));
+        QStringLiteral("Logs & crash reports"), QStringLiteral("Everything stays on this PC. XSEmu Launcher never uploads logs or crash reports."));
     sec.caps(QStringLiteral("Logs"));
     auto* pathRow = new QWidget;
     auto* ph = new QHBoxLayout(pathRow);
@@ -95,7 +95,7 @@ QWidget* SettingsSections::logs(Services& s)
     });
     sec.row(QStringLiteral("Log detail"), QStringLiteral("Verbose writes debug lines too. Logs grow much faster."), detail);
     auto* keep = SettingsKit::dropdown({{QStringLiteral("Last 2 runs"), 2}}, 2);
-    sec.row(QStringLiteral("Keep logs for"), {}, keep)->setUnavailable(QStringLiteral("XSEmu keeps the newest log and the one before it (xcl.log, xcl.prev.log)."));
+    sec.row(QStringLiteral("Keep logs for"), {}, keep)->setUnavailable(QStringLiteral("XSEmu Core keeps the newest log and the one before it (xcl.log, xcl.prev.log)."));
 
     sec.caps(QStringLiteral("Crash reports"));
     auto* dumpsOn = new Toggle;

@@ -15,7 +15,7 @@ namespace SettingsKit {
 
 QString notInBuild()
 {
-    return QStringLiteral("Not in this XSEmu build yet.");
+    return QStringLiteral("Not in this XSEmu Core build yet.");
 }
 
 Row::Row(const QString& label, const QString& help, QWidget* parent)

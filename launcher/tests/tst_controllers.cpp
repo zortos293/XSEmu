@@ -39,6 +39,10 @@ private slots:
     void warmupFinishesThroughEveryPhase();
     void warmupCancel();
     void warmupFailure();
+    void warmupFailureKeepsWhatItBuilt();
+    void warmupContinueBuildsOnlyWhatIsLeft();
+    void warmupFinishedWithLeftoversIsNotAFailure();
+    void warmupResumeSurvivesTheLauncherClosing();
     void warmupRefused();
     void runnerPrecacheRunsEachStep();
     void runnerPrecacheCancelClosesStdin();
@@ -466,6 +470,136 @@ void TestControllers::warmupFinishesThroughEveryPhase()
     QCOMPARE(runs.first().result, WarmupRun::Result::Finished);
     QCOMPARE(runs.first().titleId, QStringLiteral("NorthwindInteractive.SignalGarden"));
     QVERIFY(runs.first().done > 3000);
+    // what a pass leaves is what it failed to build: the fake fails a random pipeline every so often
+    QCOMPARE(runs.first().left, runs.first().failed);
+    // the pass is over, so no checkpoint offers to continue it: only the builds it could not make are
+    // left for a later pass
+    QVERIFY(!m_settings->warmupInFlight().has_value());
+    QCOMPARE(WarmupController::resumable(runs, m_settings->warmupInFlight(), runs.first().titleId, QString(), {}).has_value(),
+             runs.first().left > 0);
+}
+
+void TestControllers::warmupFailureKeepsWhatItBuilt()
+{
+    qputenv("FAKE_XSEMU_SCENARIO", "warmup_fail");
+    WarmupController w(*m_settings, *m_gate);
+    QSignalSpy finished(&w, &WarmupController::finished);
+    QVERIFY(w.start(false, fixtureGame(QStringLiteral("Signal Garden"))));
+    QVERIFY2(finished.wait(20000), qPrintable(w.stderrTail().join(QLatin1Char('|'))));
+    QCOMPARE(w.state(), WarmupController::State::Failed);
+    const WarmupRun run = *w.lastRun();
+    // a crash has no done line: what the pass built is what its last progress line said, and what it
+    // left is unknown rather than zero, so the page cannot claim a count it does not have
+    QVERIFY2(run.done > 0, qPrintable(QStringLiteral("done %1").arg(run.done)));
+    QCOMPARE(run.left, qint64(-1));
+    QVERIFY(run.message.contains(QStringLiteral("driver compile")));
+    // a failed pass left a record the Warm-up page can offer Continue from
+    const auto resume = WarmupController::resumable(m_settings->recentWarmups(), m_settings->warmupInFlight(),
+                                                   run.titleId, QString(), {});
+    QVERIFY(resume.has_value());
+    QCOMPARE(resume->built, qint64(-1)); // a crash has no build count, only the phase it reached
+    QVERIFY(!resume->full);
+    // and the launcher is usable again: the gate is free for Play or another pass
+    QVERIFY(m_gate->isFree());
+}
+
+void TestControllers::warmupContinueBuildsOnlyWhatIsLeft()
+{
+    // the cache the fake keeps its built count in, so it can go on from an earlier pass as the real
+    // emulator's driver blobs do
+    QTemporaryDir cache;
+    QVERIFY(cache.isValid());
+    qputenv("XCL_DXIL_CACHE", cache.path().toUtf8());
+    const auto restoreCache = qScopeGuard([] { qunsetenv("XCL_DXIL_CACHE"); });
+    const Game game = fixtureGame(QStringLiteral("Signal Garden"));
+    qint64 firstTargets = 0;
+    qint64 builtFirst = 0;
+    {
+        qputenv("FAKE_XSEMU_SCENARIO", "warmup_fail");
+        WarmupController w(*m_settings, *m_gate);
+        QSignalSpy finished(&w, &WarmupController::finished);
+        QVERIFY(w.start(false, game));
+        QVERIFY2(finished.wait(20000), qPrintable(w.stderrTail().join(QLatin1Char('|'))));
+        QCOMPARE(w.state(), WarmupController::State::Failed);
+        firstTargets = w.progress().targets;
+        builtFirst = w.lastRun() ? w.lastRun()->done : 0;
+        QVERIFY(firstTargets > 0);
+        QVERIFY(builtFirst > 0);
+        QVERIFY(builtFirst < firstTargets);
+    }
+    const auto resume = WarmupController::resumable(m_settings->recentWarmups(), m_settings->warmupInFlight(), game.titleId(), QString(), {});
+    QVERIFY(resume.has_value());
+    qputenv("FAKE_XSEMU_SCENARIO", "ok");
+    {
+        WarmupController w(*m_settings, *m_gate);
+        QSignalSpy finished(&w, &WarmupController::finished);
+        QSignalSpy progress(&w, &WarmupController::progressChanged);
+        QVERIFY(w.start(resume->full, game));
+        QVERIFY2(finished.wait(20000), qPrintable(w.stderrTail().join(QLatin1Char('|'))));
+        QCOMPARE(w.state(), WarmupController::State::Finished);
+        // the second pass is offered only what the first one did not build
+        const qint64 left = firstTargets - builtFirst;
+        QVERIFY2(qAbs(w.progress().targets - left) <= 200,
+                 qPrintable(QStringLiteral("first pass %1, built %2, so about %3 left; the second pass took %4").arg(firstTargets).arg(builtFirst).arg(left).arg(w.progress().targets)));
+        QVERIFY(w.progress().targets < firstTargets / 2);
+        QVERIFY(w.lastRun()->left >= 0);
+    }
+}
+
+void TestControllers::warmupFinishedWithLeftoversIsNotAFailure()
+{
+    // exit code 1 says some builds failed, not that the pass did not run: the game builds those when
+    // it needs them, and Continue goes on with them
+    qputenv("FAKE_XSEMU_SCENARIO", "warmup_partial");
+    WarmupController w(*m_settings, *m_gate);
+    QSignalSpy finished(&w, &WarmupController::finished);
+    QVERIFY(w.start(false, fixtureGame(QStringLiteral("Signal Garden"))));
+    QVERIFY2(finished.wait(20000), qPrintable(w.stderrTail().join(QLatin1Char('|'))));
+    QCOMPARE(w.state(), WarmupController::State::Finished);
+    const WarmupRun run = *w.lastRun();
+    QCOMPARE(run.exitCode, 1);
+    QVERIFY(run.failed > 0);
+    QVERIFY(run.left > 0);
+    QCOMPARE(m_settings->recentWarmups().first().result, WarmupRun::Result::Finished);
+    // the pass went through everything, but the builds it could not make are still there to try again
+    const auto resume = WarmupController::resumable(m_settings->recentWarmups(), m_settings->warmupInFlight(), run.titleId, QString(), {});
+    QVERIFY(resume.has_value());
+    QCOMPARE(resume->left, run.left);
+}
+
+void TestControllers::warmupResumeSurvivesTheLauncherClosing()
+{
+    // the launcher closing mid-pass kills the tree and never sees the result: the checkpoint it wrote
+    // while the pass ran is what offers Continue next time
+    qputenv("FAKE_XSEMU_TICK_MS", "40");
+    const Game game = fixtureGame(QStringLiteral("Signal Garden"));
+    {
+        WarmupController w(*m_settings, *m_gate);
+        QVERIFY(w.start(false, game));
+        QTRY_VERIFY_WITH_TIMEOUT(w.progress().phase == QLatin1String("bound") && w.progress().passDone > 100, 10000);
+    }
+    qputenv("FAKE_XSEMU_TICK_MS", "5");
+    m_gate->release(ProcessGate::Owner::Warmup); // the launcher that held it is gone too
+    QVERIFY(m_settings->recentWarmups().isEmpty());
+    const auto pass = m_settings->warmupInFlight();
+    QVERIFY2(pass.has_value(), "a pass the launcher did not see the end of leaves a checkpoint");
+    QCOMPARE(pass->titleId, game.titleId());
+    QVERIFY(!pass->phase.isEmpty());
+    QVERIFY(!pass->full);
+    // and it is what Continue runs, before any recorded run: the phase it had reached, and no count,
+    // because progress counts pipelines the pass dealt with rather than pipelines it built
+    const auto resume = WarmupController::resumable(m_settings->recentWarmups(), m_settings->warmupInFlight(), game.titleId(), QString(), {});
+    QVERIFY(resume.has_value());
+    QCOMPARE(resume->built, qint64(-1));
+    QCOMPARE(resume->phase, pass->phase);
+    // a pass that runs to its end drops it
+    {
+        WarmupController w(*m_settings, *m_gate);
+        QSignalSpy finished(&w, &WarmupController::finished);
+        QVERIFY(w.start(resume->full, game));
+        QVERIFY2(finished.wait(20000), qPrintable(w.stderrTail().join(QLatin1Char('|'))));
+    }
+    QVERIFY(!m_settings->warmupInFlight().has_value());
 }
 
 void TestControllers::warmupCancel()
