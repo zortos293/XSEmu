@@ -6,6 +6,8 @@ on:
       - launcher/**
       - assets/logo/**
       - docs/launcher-protocol.md
+      - scripts/package_release.py
+      - scripts/test_package_release.py
       - .github/workflows/launcher.yml
   push:
     branches: [main]
@@ -13,6 +15,8 @@ on:
       - launcher/**
       - assets/logo/**
       - docs/launcher-protocol.md
+      - scripts/package_release.py
+      - scripts/test_package_release.py
       - .github/workflows/launcher.yml
   workflow_dispatch:
 
@@ -81,7 +85,10 @@ jobs:
       - name: Install Qt 6 and build tools
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends cmake ninja-build g++ qt6-base-dev qt6-svg-dev qt6-qpa-plugins libgl-dev libxcb1-dev pkg-config xvfb xauth
+          # unzip: tst_update unpacks a Core update's archive the way the launcher does
+          sudo apt-get install -y --no-install-recommends cmake ninja-build g++ qt6-base-dev qt6-svg-dev qt6-qpa-plugins libgl-dev libxcb1-dev pkg-config xvfb xauth unzip
+      - name: Test the release packaging script
+        run: python3 -m unittest discover -s scripts -p 'test_package_release.py' -v
       - name: Configure
         run: cmake -S launcher -B build -G Ninja -DCMAKE_BUILD_TYPE=Debug -DCMAKE_COMPILE_WARNING_AS_ERROR=ON
       - name: Build

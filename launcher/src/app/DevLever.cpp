@@ -402,7 +402,7 @@ QStringList DevLever::states()
         QStringLiteral("settings-shaders-clear"), QStringLiteral("settings-overlay"), QStringLiteral("settings-folders"),
         QStringLiteral("settings-input"), QStringLiteral("settings-graphics"), QStringLiteral("settings-logs"),
         QStringLiteral("settings-runners-folder"),
-        QStringLiteral("settings-about"),
+        QStringLiteral("settings-about"), QStringLiteral("settings-updates"),
         QStringLiteral("first-launch"), QStringLiteral("first-launch-network"), QStringLiteral("first-launch-folders"),
         QStringLiteral("first-launch-folders-found"),
         QStringLiteral("error-files-missing"), QStringLiteral("error-not-enough-ram"), QStringLiteral("error-crash"),
@@ -643,8 +643,30 @@ void DevLever::apply(const Options& o, Services& s, MainWindow& w)
         else if (st == QLatin1String("settings-logs")) {
             seedCrashDump(signal);
             w.settingsPage()->showSection(SettingsPage::Section::Logs);
-        } else if (st == QLatin1String("settings-about"))
+        } else if (st == QLatin1String("settings-about")) {
             w.settingsPage()->showSection(SettingsPage::Section::About);
+        } else if (st == QLatin1String("settings-updates")) {
+            UpdateService::Status shown;
+            shown.state = UpdateService::State::Available;
+            shown.launcherVersion = QStringLiteral(XSEMU_VERSION);
+            shown.installedCore = QStringLiteral("0.1.0-pre.1");
+            shown.corePath = QDir(s.updates.coreDir()).filePath(QStringLiteral("XSEmu.exe"));
+            shown.coreBundled = true;
+            shown.corePreviousKept = true;
+            shown.launcherUpdate = true;
+            shown.coreUpdate = true;
+            shown.checkedAt = QDateTime::currentDateTimeUtc();
+            ReleaseInfo release;
+            release.tag = QStringLiteral("v0.1.0-pre.2");
+            release.version = QStringLiteral("0.1.0-pre.2");
+            release.prerelease = true;
+            release.launcher.version = QStringLiteral("0.1.0-pre.2");
+            release.core.version = QStringLiteral("0.1.0-pre.2");
+            shown.release = release;
+            shown.message = QStringLiteral("XSEmu Launcher 0.1.0-pre.2 and XSEmu Core 0.1.0-pre.2 are available.");
+            s.updates.simulateForScreenshot(shown);
+            w.settingsPage()->showSection(SettingsPage::Section::Updates);
+        }
     } else if (st.startsWith(QLatin1String("runners"))) {
         w.showPage(Page::Runners);
         const QString xtx = QStringLiteral("victory-7900xtx");

@@ -1,6 +1,10 @@
 cmake_minimum_required(VERSION 3.21)
 
-project(XSEmuLauncher VERSION 0.1.0 DESCRIPTION "XSEmu launcher" LANGUAGES CXX)
+# The version the About page, the update check and the release it came from agree on.
+# .github/workflows/release.yml passes the tag's version (-DXSEMU_LAUNCHER_VERSION=0.1.0-pre.2).
+set(XSEMU_LAUNCHER_VERSION "0.1.0" CACHE STRING "Version reported by the launcher and compared with releases")
+
+project(XSEmuLauncher VERSION ${XSEMU_LAUNCHER_VERSION} DESCRIPTION "XSEmu launcher" LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -49,6 +53,8 @@ add_library(xsemu_core STATIC
     src/core/ProcessGate.cpp src/core/ProcessGate.h
     src/core/EmulatorBuild.cpp src/core/EmulatorBuild.h
     src/core/ProcessTree.cpp src/core/ProcessTree.h
+    src/core/Release.cpp src/core/Release.h
+    src/core/UpdateService.cpp src/core/UpdateService.h
     src/core/ProgressParsers.cpp src/core/ProgressParsers.h
     src/core/Runner.cpp src/core/Runner.h
     src/core/RunnerInstall.cpp src/core/RunnerInstall.h
@@ -61,6 +67,7 @@ add_library(xsemu_core STATIC
     src/core/WarmupController.cpp src/core/WarmupController.h
 )
 target_include_directories(xsemu_core PUBLIC src src/core)
+target_compile_definitions(xsemu_core PUBLIC XSEMU_VERSION="${PROJECT_VERSION}")
 target_link_libraries(xsemu_core PUBLIC Qt6::Core Qt6::Network)
 if(WIN32)
     target_link_libraries(xsemu_core PUBLIC dxgi psapi user32)
@@ -89,7 +96,6 @@ file(GLOB_RECURSE XSEMU_UI_SOURCES CONFIGURE_DEPENDS
 add_library(xsemu_ui OBJECT ${XSEMU_UI_SOURCES} resources/launcher.qrc)
 target_include_directories(xsemu_ui PUBLIC src)
 target_link_libraries(xsemu_ui PUBLIC xsemu_core Qt6::Gui Qt6::Widgets Qt6::Svg)
-target_compile_definitions(xsemu_ui PUBLIC XSEMU_VERSION="${PROJECT_VERSION}")
 if(XSEMU_DEV_TOOLS)
     target_compile_definitions(xsemu_ui PUBLIC XSEMU_DEV_TOOLS XSEMU_FIXTURES_DIR="${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures")
 endif()

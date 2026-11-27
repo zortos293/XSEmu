@@ -2,6 +2,7 @@
 
 #include <QCoreApplication>
 #include <QDir>
+#include <QFileInfo>
 #include <QHash>
 #include <QStandardPaths>
 
@@ -120,10 +121,25 @@ QString coverCacheDir() { return join(launcherDataDir(), QStringLiteral("covers"
 
 QString defaultEmulatorPath()
 {
+    const QString app = appDir();
+    const QString bundled = join(coreDir(), emulatorExecutableName());
+    if (QFileInfo::exists(bundled))
+        return bundled;
+    const QString beside = join(app, emulatorExecutableName());
+    if (QFileInfo::exists(beside))
+        return beside;
+    return bundled;
+}
+
+QString appDir() { return QCoreApplication::applicationDirPath(); }
+QString coreDir() { return join(appDir(), QStringLiteral("core")); }
+
+QString emulatorExecutableName()
+{
 #ifdef Q_OS_WIN
-    return join(QCoreApplication::applicationDirPath(), QStringLiteral("XSEmu.exe"));
+    return QStringLiteral("XSEmu.exe");
 #else
-    return join(QCoreApplication::applicationDirPath(), QStringLiteral("fake-xsemu"));
+    return QStringLiteral("fake-xsemu");
 #endif
 }
 

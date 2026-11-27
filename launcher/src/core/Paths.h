@@ -44,7 +44,18 @@ QString runnerLocation(const QString& runnerId); // the folder that holds runner
 QString localAppDataDir(); // %LOCALAPPDATA% (Linux: ~/.local/share), where runners keep their caches
 QString runnerDir(const QString& runnerId); // <runnerLocation(id)>\\<id>
 
-// The emulator executable's default location: XSEmu.exe next to the launcher (Linux: fake-xsemu).
+// The folder the launcher runs from: its own folder, which holds the Qt runtime and the bundled
+// XSEmu Core in core\.
+QString appDir();
+// The bundled XSEmu Core: <launcher dir>\core (Linux: core/fake-xsemu). A Core update replaces the
+// files in it and keeps the previous copy in core.old until the new one has started.
+QString coreDir();
+// The emulator program's file name: XSEmu.exe (Linux: fake-xsemu).
+QString emulatorExecutableName();
+
+// The emulator executable's default location: the bundled Core at <launcher dir>\core\XSEmu.exe,
+// else XSEmu.exe next to the launcher (a copy placed by hand, the layout of the 0.1.0 release), else
+// where the bundled Core would be.
 QString defaultEmulatorPath();
 
 }

@@ -18,6 +18,7 @@ QWidget* gameFolders(Services& s, std::function<void()> addFolder);
 QWidget* input(Services& s);
 QWidget* graphics(Services& s);
 QWidget* logs(Services& s);
+QWidget* updates(Services& s);
 QWidget* about(Services& s);
 
 }

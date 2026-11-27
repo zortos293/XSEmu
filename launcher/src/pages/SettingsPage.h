@@ -12,7 +12,7 @@ class Services;
 class SettingsPage : public QWidget {
     Q_OBJECT
 public:
-    enum class Section { Console, Network, Shaders, RunProfile, Overlay, GameFolders, Input, Graphics, Logs, About };
+    enum class Section { Console, Network, Shaders, RunProfile, Overlay, GameFolders, Input, Graphics, Logs, Updates, About };
     explicit SettingsPage(Services& services, QWidget* parent = nullptr);
     void showSection(Section section);
     QWidget* sectionPage(Section section) const;

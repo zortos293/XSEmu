@@ -78,6 +78,10 @@ public:
         static constexpr const char* LibrarySort = "library/sort";
         static constexpr const char* RunProfile = "emulator/runProfile";
         static constexpr const char* XsemuWarmup = "warmup/xsemu";
+        static constexpr const char* CheckForUpdates = "update/automatic";
+        static constexpr const char* PrereleaseUpdates = "update/prereleases";
+        static constexpr const char* LastUpdateCheck = "update/lastChecked";
+        static constexpr const char* AnnouncedUpdate = "update/announcedVersion";
     };
 
     static constexpr int kRecentWarmupLimit = 20;
@@ -206,6 +210,20 @@ public:
     // seconds, fpsAverage, stalls, worstMs, heldPeakBytes, freeMinMb), empty when it never ran.
     QVariantMap lastRun(const QString& titleId) const;
     void setLastRun(const QString& titleId, const QVariantMap& run);
+
+    // Updates of the launcher and of the bundled XSEmu Core, from the GitHub releases of zortos293/XSEmu
+    // (UpdateService). On by default, and off means no request at all.
+    bool checkForUpdates() const;
+    void setCheckForUpdates(bool on);
+    // Offer pre-release versions (0.1.0-pre.2) as well as releases. On by default for a pre-release
+    // build, which is what a test build is: the channel follows the build until the user chooses.
+    bool prereleaseUpdates() const;
+    void setPrereleaseUpdates(bool on);
+    QDateTime lastUpdateCheck() const;
+    void setLastUpdateCheck(const QDateTime& at);
+    // The version the startup notice already named, so an available update is said once, not every start.
+    QString announcedUpdate() const;
+    void setAnnouncedUpdate(const QString& version);
 
     // The library's sort: "recent" (default), "name" or "size".
     QString librarySort() const;

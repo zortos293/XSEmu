@@ -22,7 +22,11 @@ cmake --build build
 cmake --install build --prefix dist   # runs windeployqt into dist/bin
 ```
 
-Put `XSEmu.exe` next to `XSEmuLauncher.exe`, or set its path in Settings.
+A release puts XSEmu Core in the launcher's own folder, `<launcher dir>\core\XSEmu.exe`, with the
+shader compiler it loads (`dxcompiler.dll`, `dxil.dll`) beside it, and the launcher finds it there.
+For a build from source, put `XSEmu.exe` in `core\` next to `XSEmuLauncher.exe`, or leave it beside
+the launcher, or set its path in Settings: the launcher looks for `core\XSEmu.exe` first, then
+`XSEmu.exe` next to itself, and a path chosen in Settings or `XSEMU_EMULATOR` wins over both.
 
 Linux (Ubuntu 24.04, development only):
 
@@ -52,15 +56,43 @@ The settings file is `settings.ini` in the app's local data folder. Set `XSEMU_L
 use another folder. The launcher reads emulator data from `%LOCALAPPDATA%\XCL` (`XCL_DATA_ROOT`
 overrides it) and the shader cache from `%LOCALAPPDATA%\xcl\dxil` (`XCL_DXIL_CACHE`).
 
-The launcher needs no wrapper script: it finds `XSEmu.exe` next to itself, or the one chosen in
-Settings, About (or from the missing-emulator dialog); `XSEMU_EMULATOR` still wins over both. The
-`XCL_*` switches XSEmu runs with are the run profile in Settings.
+The launcher needs no wrapper script: it finds the bundled Core in `core\`, or one placed next to
+itself, or the one chosen in Settings, About (or from the missing-emulator dialog); `XSEMU_EMULATOR`
+still wins over all of them. The `XCL_*` switches XSEmu runs with are the run profile in Settings.
 
-On Linux the launcher looks for `fake-xsemu` next to itself instead of `XSEmu.exe`. Choose its
+On Linux the launcher looks for `core/fake-xsemu`, else `fake-xsemu` next to itself, instead of
+`XSEmu.exe`. Choose its
 behaviour with `FAKE_XSEMU_SCENARIO`: `ok`, `crash`, `device_removed`, `files_missing`,
 `slow_boot`, `warmup_fail`, `warmup_ram_floor` or `warmup_refuse`. `FAKE_XSEMU_TICK_MS` sets
 its speed, and `FAKE_XSEMU_ENV_DUMP` names a folder where it writes the `XCL_*` environment of each
 run and warm-up.
+
+## Updates
+
+The launcher and XSEmu Core update separately from the releases of `zortos293/XSEmu`
+(`src/core/UpdateService.cpp`). Settings → Updates shows both versions, checks on request, and turns
+the automatic check and pre-release versions on or off. The automatic check runs a few seconds after
+the launcher starts when it is on; a build that is itself a pre-release (`XSEMU_LAUNCHER_VERSION`
+with `-`) offers pre-releases by default, and nothing is ever installed without the user pressing
+Update.
+
+The launcher takes each release's `xsemu-manifest.json`, checks the downloaded asset against its
+SHA-256 before unpacking it, checks every file inside the archive again, and asks a new Core
+`--version` before it goes into place. It updates nothing while a game or a warm-up runs. The
+previous Core is kept in `core.old` until the new one has started, and Settings → Updates can put it
+back. A launcher update stages the new files, starts a PowerShell script that waits for the launcher
+to exit, replaces the files (keeping a backup) and starts the launcher again.
+
+A Core update replaces only the files the manifest names, by default `XSEmu.exe` and
+`version.json`; the shader compiler DLLs belong to the launcher's bundle and stay. A release is
+packaged by `scripts/package_release.py` from `.github/workflows/release.yml`:
+
+| Asset | What it is |
+| --- | --- |
+| `XSEmuLauncher-windows.zip` | `XSEmuLauncher/bin/`: the launcher, Qt, `dxcompiler.dll`, `dxil.dll`, `core/` |
+| `XSEmuCore-windows.zip` | `XSEmu.exe` and `version.json`: the Core alone, for a Core update |
+| `XSEmu.exe` | the emulator alone, for someone who copies it by hand |
+| `xsemu-manifest.json` | schema 1: the tag, and per part its version, asset, size, SHA-256 and files |
 
 ## Screenshot lever
 

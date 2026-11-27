@@ -147,6 +147,7 @@ Sidebar::Sidebar(Services& services, QWidget* parent)
     connect(&m_s.warmup, &WarmupController::progressChanged, this, &Sidebar::refresh);
     connect(&m_s.settings, &AppSettings::changed, this, &Sidebar::refresh);
     connect(&m_s.covers, &CoverArtService::artChanged, this, &Sidebar::refresh);
+    connect(&m_s.updates, &UpdateService::changed, this, &Sidebar::refresh);
     refresh();
 }
 
@@ -197,6 +198,10 @@ void Sidebar::refresh()
             updates += m_s.runners.status(r.id).state == RunnerManager::State::UpdateAvailable ? 1 : 0;
         m_runners->setTrailingText(updates == 0 ? QString() : updates == 1 ? QStringLiteral("1 update") : QStringLiteral("%1 updates").arg(updates), Theme::Role::AccentText);
     }
+
+    // Settings: a launcher or Core update the update check found
+    const UpdateService::Status updates = m_s.updates.status();
+    m_settings->setTrailingText(updates.updateAvailable() ? QStringLiteral("Update") : QString(), Theme::Role::AccentText);
 
     const EmulatorController::State st = m_s.emulator.state();
     const bool playing = st != EmulatorController::State::Idle;

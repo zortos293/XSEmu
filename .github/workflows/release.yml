@@ -1,0 +1,149 @@
+# A tagged release: one zip of the launcher with XSEmu Core inside it, the Core alone, the emulator
+# alone, and xsemu-manifest.json (scripts/package_release.py). The launcher updates itself and the Core
+# from these assets, separately (launcher/src/core/UpdateService.cpp).
+#
+#   git tag v0.1.0-pre.2 && git push origin v0.1.0-pre.2
+#
+# A tag with a pre-release suffix publishes a GitHub pre-release, which only a launcher that offers
+# pre-releases installs (Settings → Updates). Re-running on an existing tag replaces its assets.
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing tag to (re)build and publish, e.g. v0.1.0-pre.2"
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: windows-2025
+    timeout-minutes: 90
+    env:
+      TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref }}
+          persist-credentials: false
+      - name: Read the version from the tag
+        id: version
+        shell: pwsh
+        run: |
+          $tag = $env:TAG
+          if ($tag -notmatch '^v\d+\.\d+\.\d+(-[0-9A-Za-z.-]+)?$') { throw "the tag '$tag' is not v<version>" }
+          $version = $tag.Substring(1)
+          "tag=$tag" >> $env:GITHUB_OUTPUT
+          "version=$version" >> $env:GITHUB_OUTPUT
+          "prerelease=$($version.Contains('-'))" >> $env:GITHUB_OUTPUT
+          Write-Host "releasing $version from $tag"
+      - name: Install Rust
+        run: rustup toolchain install 1.99.0-x86_64-pc-windows-msvc --profile minimal
+      - name: Build XSEmu Core
+        run: cargo +1.99.0-x86_64-pc-windows-msvc build --release --locked -p xcl
+      - name: Install Qt 6.8 (MSVC 2022, x64)
+        uses: jurplel/install-qt-action@b344308e4483fc892e0d27b3cd1b173ebdd95f06 # v4.5.0
+        with:
+          version: "6.8.3"
+          host: windows
+          target: desktop
+          arch: win64_msvc2022_64
+          cache: true
+      - name: Set up the MSVC environment
+        uses: ilammy/msvc-dev-cmd@7defe9254715b088f12dddd9942945a3d75cdad5 # v1.9.0
+        with:
+          arch: x64
+      - name: Configure the launcher
+        run: cmake -S launcher -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DXSEMU_LAUNCHER_VERSION=${{ steps.version.outputs.version }}
+      - name: Build the launcher
+        run: cmake --build build
+      - name: Install the launcher and deploy Qt
+        run: cmake --install build --prefix dist
+      - name: Add the shader compiler the Core needs
+        shell: pwsh
+        run: |
+          # dxcompiler.dll and dxil.dll are not part of Windows. XSEmu.exe loads them from its own
+          # folder (gpu/recomp/dxc.rs), so they go into core/ beside the bundled Core; bin/ keeps a
+          # copy for someone who drops XSEmu.exe next to the launcher by hand.
+          $dxc = Get-ChildItem "$env:ProgramFiles(x86)\Windows Kits\10\bin\*\x64\dxcompiler.dll" |
+            Sort-Object FullName -Descending | Select-Object -First 1
+          if ($null -eq $dxc) { throw 'no dxcompiler.dll in the Windows SDK' }
+          $dxil = Join-Path $dxc.DirectoryName 'dxil.dll'
+          if (-not (Test-Path $dxil)) { throw 'no dxil.dll beside the SDK dxcompiler.dll' }
+          New-Item -ItemType Directory -Force -Path dist\bin\core | Out-Null
+          foreach ($dir in @('dist\bin', 'dist\bin\core')) {
+            Copy-Item $dxc.FullName $dir -Force
+            Copy-Item $dxil $dir -Force
+          }
+          Write-Host "DXC from $($dxc.DirectoryName)"
+      - name: Fetch Microsoft's VC++ runtime installer
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          try {
+            Invoke-WebRequest -UseBasicParsing -Uri 'https://aka.ms/vs/17/release/vc_redist.x64.exe' -OutFile "$env:RUNNER_TEMP\vc_redist.x64.exe"
+            Write-Host "vc_redist.x64.exe $((Get-Item "$env:RUNNER_TEMP\vc_redist.x64.exe").Length) bytes"
+          } catch { Write-Warning "no vc_redist.x64.exe this run: $_" }
+      - name: Check XSEmu Core answers --version
+        shell: pwsh
+        run: |
+          $core = 'target\release\XSEmu.exe'
+          $line = & $core --version
+          if ($LASTEXITCODE -ne 0 -or $line -notmatch '^XSEmu \d') { throw "the Core does not answer --version: '$line'" }
+          Write-Host "Core: $line"
+      - name: Package the release
+        shell: pwsh
+        run: |
+          $redist = "$env:RUNNER_TEMP\vc_redist.x64.exe"
+          $args = @('--dist', 'dist\bin', '--core', 'target\release\XSEmu.exe', '--out', 'out',
+                    '--version', '${{ steps.version.outputs.version }}', '--tag', '${{ steps.version.outputs.tag }}',
+                    '--notes', 'out\notes.md')
+          if (Test-Path $redist) { $args += @('--vc-redist', $redist) }
+          python scripts/package_release.py @args
+          if ($LASTEXITCODE -ne 0) { throw 'packaging failed' }
+          Get-ChildItem out -File | ForEach-Object { "{0} {1} bytes" -f $_.Name, $_.Length }
+      - name: Check the packaged launcher carries the Core
+        shell: pwsh
+        run: |
+          if (-not (Test-Path 'out\XSEmuLauncher\bin\XSEmuLauncher.exe')) { throw 'the bundle has no launcher' }
+          if (-not (Test-Path 'out\XSEmuLauncher\bin\core\XSEmu.exe')) { throw 'the bundle has no Core' }
+          $line = & 'out\XSEmuLauncher\bin\core\XSEmu.exe' --version
+          if ($line -notmatch '^XSEmu \d') { throw "the bundled Core does not answer --version: '$line'" }
+          Write-Host "bundled Core: $line"
+      - name: Upload the assets as job artifacts
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: XSEmu-${{ steps.version.outputs.version }}
+          path: |
+            out/XSEmuLauncher-windows.zip
+            out/XSEmuCore-windows.zip
+            out/XSEmu.exe
+            out/xsemu-manifest.json
+            out/notes.md
+          if-no-files-found: error
+      - name: Publish the release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.version.outputs.version }}
+          PRERELEASE: ${{ steps.version.outputs.prerelease }}
+        run: |
+          $tag = $env:TAG
+          $assets = @('out\XSEmuLauncher-windows.zip', 'out\XSEmuCore-windows.zip', 'out\XSEmu.exe', 'out\xsemu-manifest.json')
+          $prerelease = if ($env:PRERELEASE -eq 'true') { @('--prerelease') } else { @() }
+          gh release view $tag --repo $env:GITHUB_REPOSITORY *> $null
+          if ($LASTEXITCODE -eq 0) {
+            Write-Host "the release $tag exists: replacing its assets and notes"
+            gh release upload $tag @assets --clobber --repo $env:GITHUB_REPOSITORY
+            gh release edit $tag --notes-file out\notes.md @prerelease --repo $env:GITHUB_REPOSITORY
+          } else {
+            gh release create $tag @assets --title "XSEmu $env:VERSION" --notes-file out\notes.md @prerelease `
+              --verify-tag --repo $env:GITHUB_REPOSITORY
+          }
+          if ($LASTEXITCODE -ne 0) { throw 'publishing the release failed' }
+          gh release view $tag --repo $env:GITHUB_REPOSITORY --json assets,isPrerelease --jq '{ prerelease: .isPrerelease, assets: [.assets[].name] }'

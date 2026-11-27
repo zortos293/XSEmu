@@ -391,6 +391,24 @@ void AppSettings::setLastRun(const QString& titleId, const QVariantMap& run)
     write(Key::PlayStats, QString::fromUtf8(QJsonDocument(QJsonObject::fromVariantMap(all)).toJson(QJsonDocument::Compact)));
 }
 
+bool AppSettings::checkForUpdates() const { return read(Key::CheckForUpdates, true).toBool(); }
+void AppSettings::setCheckForUpdates(bool on) { write(Key::CheckForUpdates, on); }
+
+bool AppSettings::prereleaseUpdates() const
+{
+    return read(Key::PrereleaseUpdates, QStringLiteral(XSEMU_VERSION).contains(QLatin1Char('-'))).toBool();
+}
+void AppSettings::setPrereleaseUpdates(bool on) { write(Key::PrereleaseUpdates, on); }
+
+QDateTime AppSettings::lastUpdateCheck() const
+{
+    return QDateTime::fromString(read(Key::LastUpdateCheck).toString(), Qt::ISODate);
+}
+void AppSettings::setLastUpdateCheck(const QDateTime& at) { write(Key::LastUpdateCheck, at.toUTC().toString(Qt::ISODate)); }
+
+QString AppSettings::announcedUpdate() const { return read(Key::AnnouncedUpdate).toString(); }
+void AppSettings::setAnnouncedUpdate(const QString& version) { write(Key::AnnouncedUpdate, version); }
+
 QString AppSettings::librarySort() const { return read(Key::LibrarySort, QStringLiteral("recent")).toString(); }
 void AppSettings::setLibrarySort(const QString& sort) { write(Key::LibrarySort, sort); }
 

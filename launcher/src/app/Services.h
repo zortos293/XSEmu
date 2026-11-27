@@ -8,6 +8,7 @@
 #include "core/ProcessGate.h"
 #include "core/RunnerManager.h"
 #include "core/ShaderCacheMonitor.h"
+#include "core/UpdateService.h"
 #include "core/WarmupController.h"
 
 #include <QHash>
@@ -30,6 +31,7 @@ public:
     WarmupController warmup;
     CoverArtService covers;
     ShaderCacheMonitor shaderCache;
+    UpdateService updates;
     HardwareMonitor hardware;
 
     // A game's cover art decoded once and kept in memory (null when there is none), so refreshes and
