@@ -974,6 +974,11 @@ pub(super) unsafe extern "system" fn get_resource_allocation_info2_x(a: *mut c_v
         size = offset + r[0];
         align = align.max(r[1]);
     }
+    // D3D12 returns a size that is a multiple of the alignment it returns with it, so a caller can
+    // reserve one and place the next resource at the end of it.
+    if size != u64::MAX && align != 0 {
+        size = size.next_multiple_of(align);
+    }
     if !ret.is_null() {
         *ret = [size, align];
     }

@@ -12193,6 +12193,10 @@ mod device_abi_tests {
         use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_LARGE_PAGES, MEM_RELEASE, MEM_RESERVE};
 
         assert_eq!(super::super::backend(), super::super::Backend::Real);
+        if !crate::hle::d3d12x::sparse::windows_ready() {
+            return crate::gpu::recomp::runner::skip_test(
+                "no 4 GiB sparse memory window: this adapter cannot reserve one, and this proves what a reservation does");
+        }
         let raw = device_raw();
         let mut desc = [0u8; 0x38];
         let bytes = 0x70800;
@@ -12268,6 +12272,10 @@ mod device_abi_tests {
         use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, PAGE_WRITECOMBINE};
 
         assert_eq!(super::super::backend(), super::super::Backend::Real);
+        if !crate::hle::d3d12x::sparse::windows_ready() {
+            return crate::gpu::recomp::runner::skip_test(
+                "no 4 GiB sparse memory window: this adapter cannot reserve one, and this proves what a reservation does");
+        }
         let raw = device_raw();
         let bytes = 50 << 20;
         let mut desc = [0u8; 0x38];
@@ -12320,6 +12328,10 @@ mod device_abi_tests {
         use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_LARGE_PAGES, MEM_RELEASE, MEM_RESERVE};
 
         assert_eq!(super::super::backend(), super::super::Backend::Real);
+        if !crate::hle::d3d12x::sparse::windows_ready() {
+            return crate::gpu::recomp::runner::skip_test(
+                "no 4 GiB sparse memory window: this adapter cannot reserve one, and this proves what a reservation does");
+        }
         let raw = device_raw();
         unsafe {
             let allocation = crate::hle::kernelx::XMemVirtualAlloc(std::ptr::null(), 0x4000,
@@ -12378,6 +12390,10 @@ mod device_abi_tests {
         use super::super::{device_x, title_textures, vram};
 
         assert_eq!(super::super::backend(), super::super::Backend::Real);
+        if !crate::hle::d3d12x::sparse::windows_ready() {
+            return crate::gpu::recomp::runner::skip_test(
+                "no 4 GiB sparse memory window: this adapter cannot reserve one, and this proves what a reservation does");
+        }
         unsafe {
             let raw = device_raw();
             let dev = ID3D12Device::from_raw_borrowed(&raw).unwrap();
@@ -12958,10 +12974,14 @@ mod device_abi_tests {
             ID3D12Device::from_raw_borrowed(&device_raw()).is_some_and(|d| crate::gpu::recomp::pso::mesh_native_split(&d).is_some())
         };
         for tag in [D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_AS] {
-            if tag == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_AS && !host {
-                // an AS-only console stream is built as the host's mesh pipeline, and without mesh
-                // shaders there is nothing to build it from (the MS stream still covers two passes)
-                crate::gpu::recomp::runner::skip_test("no mesh shaders");
+            if tag == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_AS {
+                // A console stream with only an AS has nothing to become: the host pipeline needs a
+                // mesh program, and the stream has none (its MS is the subobject the other iteration
+                // builds, and that is the pair a title really makes). The emulator should hand such a
+                // title a stand-in whose draws are skipped, as it does for a program it cannot
+                // translate; it answers E_INVALIDARG today, which is what this names.
+                crate::gpu::recomp::runner::skip_test(
+                    "a console AS-only mesh stream has no host mesh pipeline yet, so it is refused");
                 continue;
             }
             let mut stream = StreamOut::default();
