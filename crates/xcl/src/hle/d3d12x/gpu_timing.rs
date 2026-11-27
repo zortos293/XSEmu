@@ -2043,6 +2043,9 @@ mod tests {
             let first_id = queue_token(first.as_raw()).unwrap();
             let (fence, value) = fence_of(first_id, index);
             crate::gpu::fence::wait(&fence, value, &dev, None, 5_000).unwrap();
+            // The submission completed, so it retires now (as the parked-work test does); the replay
+            // below is then the only submission in flight, which is what the checks after it mean.
+            poll(Some(first_id));
 
             let unblock = Unblock(gate.clone());
             replay.Wait(&gate, 1).unwrap();

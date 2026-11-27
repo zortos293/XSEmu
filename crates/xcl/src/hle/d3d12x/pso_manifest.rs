@@ -880,6 +880,7 @@ mod tests {
     fn temp_dir(name: &str) -> PathBuf {
         let d = std::env::temp_dir().join(format!("xcl-pso-manifest-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).expect("a temporary folder for the manifest test");
         d
     }
 
