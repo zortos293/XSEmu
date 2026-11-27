@@ -17,6 +17,7 @@
 
 #include <QAbstractButton>
 #include <QApplication>
+#include <QComboBox>
 #include <QDir>
 #include <QFile>
 #include <QFileInfo>
@@ -396,6 +397,30 @@ void TestInGame::warmupFailureOffersContinueAndPlay()
     cont->click();
     QTRY_VERIFY_WITH_TIMEOUT(m_s->warmup.isActive(), 10000);
     QVERIFY2(m_s->warmup.progress().full, "Continue kept the pass the stop belonged to");
+    m_s->warmup.cancel();
+    QTRY_VERIFY_WITH_TIMEOUT(!m_s->warmup.isActive(), 20000);
+
+    // the idle card's Continue is the same promise: it is the warm-up button with another label, and
+    // it too must run the pass that stopped rather than a budgeted one
+    QComboBox* games = warmupPage->findChild<QComboBox*>();
+    QVERIFY(games);
+    const QString idleTitle = games->currentData().toString();
+    QVERIFY(!idleTitle.isEmpty());
+    WarmupRun idleRun = run;
+    idleRun.titleId = idleTitle;
+    m_s->settings.clearRecentWarmups();
+    m_s->settings.addRecentWarmup(idleRun);
+    m_s->warmup.simulateForScreenshot(WarmupController::State::Idle, Game{}, WarmupController::Progress{});
+    QApplication::processEvents();
+    QAbstractButton* idleContinue = nullptr;
+    for (QAbstractButton* b : warmupPage->findChildren<QAbstractButton*>()) {
+        if (b->isVisibleTo(warmupPage) && b->isEnabled() && b->text().startsWith(QLatin1String("Continue")))
+            idleContinue = b;
+    }
+    QVERIFY2(idleContinue, "the idle card offers Continue for a pass that stopped");
+    idleContinue->click();
+    QTRY_VERIFY_WITH_TIMEOUT(m_s->warmup.isActive(), 10000);
+    QVERIFY2(m_s->warmup.progress().full, "the idle Continue kept the pass the stop belonged to");
     m_s->warmup.cancel();
     QTRY_VERIFY_WITH_TIMEOUT(!m_s->warmup.isActive(), 20000);
 }

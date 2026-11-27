@@ -99,7 +99,7 @@ public:
     // because the newest run finished with nothing left, or because it stopped before building anything.
     struct Resume {
         bool full = false; // the pass to run again, as it was started
-        qint64 built = 0;  // pipelines it built and kept (a failed build is not built)
+        qint64 built = -1; // pipelines it built and kept; -1 when nothing counted them honestly
         qint64 left = -1;  // pipelines it left (-1: the pass did not say, as when it crashed)
         QString phase;     // the phase it stopped in; empty: unknown
     };

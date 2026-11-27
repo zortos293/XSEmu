@@ -497,7 +497,7 @@ void TestControllers::warmupFailureKeepsWhatItBuilt()
     const auto resume = WarmupController::resumable(m_settings->recentWarmups(), m_settings->warmupInFlight(),
                                                    run.titleId, QString(), {});
     QVERIFY(resume.has_value());
-    QCOMPARE(resume->built, run.done - run.failed);
+    QCOMPARE(resume->built, qint64(-1)); // a crash has no build count, only the phase it reached
     QVERIFY(!resume->full);
     // and the launcher is usable again: the gate is free for Play or another pass
     QVERIFY(m_gate->isFree());
@@ -584,13 +584,13 @@ void TestControllers::warmupResumeSurvivesTheLauncherClosing()
     const auto pass = m_settings->warmupInFlight();
     QVERIFY2(pass.has_value(), "a pass the launcher did not see the end of leaves a checkpoint");
     QCOMPARE(pass->titleId, game.titleId());
-    QVERIFY(pass->built > 0);
     QVERIFY(!pass->phase.isEmpty());
     QVERIFY(!pass->full);
-    // and it is what Continue runs, before any recorded run
+    // and it is what Continue runs, before any recorded run: the phase it had reached, and no count,
+    // because progress counts pipelines the pass dealt with rather than pipelines it built
     const auto resume = WarmupController::resumable(m_settings->recentWarmups(), m_settings->warmupInFlight(), game.titleId(), QString(), {});
     QVERIFY(resume.has_value());
-    QCOMPARE(resume->built, pass->built);
+    QCOMPARE(resume->built, qint64(-1));
     QCOMPARE(resume->phase, pass->phase);
     // a pass that runs to its end drops it
     {

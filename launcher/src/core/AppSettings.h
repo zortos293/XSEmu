@@ -48,8 +48,6 @@ struct WarmupCheckpoint {
     QString runnerId;  // empty: XSEmu Core's warm-up
     QString profile;   // the run profile the pass started with; empty: not recorded
     bool full = false; // the pass was started with --full
-    qint64 built = 0;  // pipelines it had finished with when this was written, failed builds included
-    qint64 failed = 0; // of those, the ones that failed to build
     QString phase;     // the phase it had reached; empty: none reported yet
     QDateTime startedAt;
 

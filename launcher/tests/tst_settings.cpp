@@ -427,10 +427,11 @@ void TestSettings::warmupResume()
     QVERIFY(r.has_value());
     QCOMPARE(r->built, 90);
     QCOMPARE(r->left, 20);
-    // a crash that built something: Continue goes on from it, with the same pass and no honest count left
+    // a crash that built something: Continue goes on from it, with the same pass and no count at all,
+    // because progress counts pipelines the pass dealt with instead of pipelines it built
     r = resumable({run(WarmupRun::Result::Failed, 2180, -1), run(WarmupRun::Result::Finished, 3120, 0)}, std::nullopt);
     QVERIFY(r.has_value());
-    QCOMPARE(r->built, 2180);
+    QCOMPARE(r->built, qint64(-1));
     QCOMPARE(r->left, qint64(-1));
     QVERIFY(!r->full);
     // a refusal before the pass started left nothing to continue
@@ -448,16 +449,16 @@ void TestSettings::warmupResume()
     WarmupRun other = run(WarmupRun::Result::Cancelled, 100, 20);
     other.titleId = QStringLiteral("Other.Title");
     QVERIFY(!resumable({other}, std::nullopt).has_value());
-    // a pass the launcher did not see the end of (it closed or died) beats the recorded runs
+    // a pass the launcher did not see the end of (it closed or died) beats the recorded runs, and the
+    // phase it had reached is all it can say
     WarmupCheckpoint pass;
     pass.titleId = id;
     pass.full = true;
-    pass.built = 700;
     pass.phase = QStringLiteral("bound");
     pass.startedAt = QDateTime::currentDateTime();
     r = resumable({run(WarmupRun::Result::Cancelled, 100, 20)}, pass);
     QVERIFY(r.has_value());
-    QCOMPARE(r->built, 700);
+    QCOMPARE(r->built, qint64(-1));
     QCOMPARE(r->phase, QStringLiteral("bound"));
     QVERIFY(r->full);
 }
@@ -475,7 +476,6 @@ void TestSettings::warmupCheckpointRoundTrip()
         pass.titleName = QStringLiteral("Signal Garden");
         pass.profile = QStringLiteral("lockhart|hlsl");
         pass.full = true;
-        pass.built = 2180;
         pass.phase = QStringLiteral("bound");
         pass.startedAt = QDateTime::currentDateTime();
         settings.setWarmupInFlight(pass);
@@ -484,7 +484,6 @@ void TestSettings::warmupCheckpointRoundTrip()
         const auto back = again.warmupInFlight();
         QVERIFY(back.has_value());
         QCOMPARE(back->titleId, pass.titleId);
-        QCOMPARE(back->built, 2180);
         QCOMPARE(back->phase, QStringLiteral("bound"));
         QCOMPARE(back->profile, QStringLiteral("lockhart|hlsl"));
         QVERIFY(back->full);

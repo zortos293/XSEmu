@@ -84,8 +84,6 @@ QVariantMap WarmupCheckpoint::toMap() const
         {QStringLiteral("runnerId"), runnerId},
         {QStringLiteral("profile"), profile},
         {QStringLiteral("full"), full},
-        {QStringLiteral("built"), built},
-        {QStringLiteral("failed"), failed},
         {QStringLiteral("phase"), phase},
         {QStringLiteral("startedAt"), startedAt.toUTC().toString(Qt::ISODate)},
     };
@@ -99,8 +97,6 @@ WarmupCheckpoint WarmupCheckpoint::fromMap(const QVariantMap& m)
     p.runnerId = m.value(QStringLiteral("runnerId")).toString();
     p.profile = m.value(QStringLiteral("profile")).toString();
     p.full = m.value(QStringLiteral("full")).toBool();
-    p.built = m.value(QStringLiteral("built")).toLongLong();
-    p.failed = m.value(QStringLiteral("failed")).toLongLong();
     p.phase = m.value(QStringLiteral("phase")).toString();
     p.startedAt = QDateTime::fromString(m.value(QStringLiteral("startedAt")).toString(), Qt::ISODate);
     return p;

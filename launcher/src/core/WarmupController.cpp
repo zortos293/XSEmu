@@ -472,8 +472,6 @@ void WarmupController::writeCheckpoint()
     pass.runnerId = m_spec ? m_spec->id : QString();
     pass.profile = m_profile;
     pass.full = m_progress.full;
-    pass.built = m_progress.passDone;
-    pass.failed = m_progress.failed;
     pass.phase = m_progress.phase;
     pass.startedAt = m_startedAt;
     m_settings.setWarmupInFlight(pass);
@@ -488,14 +486,17 @@ std::optional<WarmupController::Resume> WarmupController::resumable(const QList<
     // a pass the launcher did not see the end of: it closed or died, so no run recorded it
     if (inFlight && inFlight->isValid() && inFlight->titleId == titleId && inFlight->runnerId == runnerId
         && (profile.isEmpty() || inFlight->profile.isEmpty() || inFlight->profile == profile))
-        return Resume{inFlight->full, qMax<qint64>(0, inFlight->built - inFlight->failed), -1, inFlight->phase};
+        // progress counts pipelines the pass dealt with, giants left and too big included, so only the
+        // phase it had reached is worth carrying: nothing here is a count of builds
+        return Resume{inFlight->full, -1, -1, inFlight->phase};
     for (const WarmupRun& r : runs) {
         if (r.titleId != titleId || r.runnerId != runnerId)
             continue;
         if (!profile.isEmpty() && !r.profile.isEmpty() && r.profile != profile)
             return std::nullopt; // the run profile changed, so its keys are not this profile's keys
-        // `done` counts what the pass settled with, failed builds included; `built` is what it kept
-        const qint64 built = qMax<qint64>(0, r.done - r.failed);
+        // The done line says what the pass built; without one, progress counts what it dealt with
+        // (failures, giants held back and too-big entries among it), so there is no build count
+        const qint64 built = r.left >= 0 ? qMax<qint64>(0, r.done - r.failed) : -1;
         switch (r.result) {
         case WarmupRun::Result::Cancelled:
         case WarmupRun::Result::StoppedPartWay:

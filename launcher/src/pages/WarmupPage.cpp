@@ -579,12 +579,12 @@ void WarmupPage::refresh()
     // button runs again, and the leftovers are what it says it has
     const auto resume = WarmupController::resumable(recent, m_s.settings.warmupInFlight(), picked.titleId(), QString(),
                                                     LaunchConfig::profileIdentity(m_s.settings, picked.titleId()));
-    m_continueFull = resume && resume->full;
     if (resume) {
-        lastRunText = resume->left > 0 && resume->built > 0 ? QStringLiteral("%1 built · %2 left").arg(Format::count(resume->built), Format::count(resume->left))
-                     : resume->left > 0                      ? QStringLiteral("%1 left").arg(Format::count(resume->left))
-                     : resume->built > 0                     ? QStringLiteral("%1 built · the rest is left").arg(Format::count(resume->built))
-                                                             : QStringLiteral("a pass was interrupted");
+        lastRunText = resume->built >= 0 && resume->left > 0 ? QStringLiteral("%1 built · %2 left").arg(Format::count(resume->built), Format::count(resume->left))
+                     : resume->built >= 0 && resume->left == 0 ? QStringLiteral("%1 built · nothing left").arg(Format::count(resume->built))
+                     : resume->left > 0                       ? QStringLiteral("%1 left").arg(Format::count(resume->left))
+                     : !resume->phase.isEmpty()               ? QStringLiteral("a pass stopped in %1").arg(WarmupController::phaseLabel(resume->phase).toLower())
+                                                              : QStringLiteral("a pass was interrupted");
     }
     m_block->setSubtitle(pickedState == TitleShaderState::NeverWarmed ? QStringLiteral("never warmed up") : lastRunText);
 
@@ -616,7 +616,7 @@ void WarmupPage::refresh()
     const bool shortName = pickedName.isEmpty() || pickedName.size() > 24;
     m_warm->setText(resume ? (shortName ? QStringLiteral("Continue") : QStringLiteral("Continue %1").arg(pickedName))
                            : (shortName ? QStringLiteral("Warm up") : QStringLiteral("Warm up %1").arg(pickedName)));
-    m_fullPass = false;
+    m_fullPass = resume && resume->full;
     m_warm->setEnabled(cannot.isEmpty());
     m_warm->setToolTip(!cannot.isEmpty() ? cannot
                        : resume        ? QStringLiteral("Builds only what the last pass left; everything it built is kept.")
