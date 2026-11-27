@@ -2840,8 +2840,13 @@ mod tests {
         unsafe {
             let factory: IDXGIFactory4 = CreateDXGIFactory1().expect("DXGI factory");
             let Ok(adapter) = factory.EnumAdapters1(0) else { return };
-            if adapter.GetDesc1().is_ok_and(|d| d.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0) {
-                return;
+            // a CI runner's adapter is not WARP-flagged but has no local video memory of its own,
+            // and what these prove (arenas living in it) needs some
+            let hardware = adapter.GetDesc1().is_ok_and(|d| {
+                d.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 == 0 && d.DedicatedVideoMemory != 0
+            });
+            if !hardware {
+                return crate::gpu::recomp::runner::skip_test("no hardware adapter: no local video memory");
             }
             let mut dev: Option<ID3D12Device> = None;
             let _ = D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_11_0, &mut dev);
@@ -2929,8 +2934,13 @@ mod tests {
         unsafe {
             let factory: IDXGIFactory4 = CreateDXGIFactory1().expect("DXGI factory");
             let Ok(adapter) = factory.EnumAdapters1(0) else { return };
-            if adapter.GetDesc1().is_ok_and(|d| d.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0) {
-                return;
+            // a CI runner's adapter is not WARP-flagged but has no local video memory of its own,
+            // and what these prove (arenas living in it) needs some
+            let hardware = adapter.GetDesc1().is_ok_and(|d| {
+                d.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 == 0 && d.DedicatedVideoMemory != 0
+            });
+            if !hardware {
+                return crate::gpu::recomp::runner::skip_test("no hardware adapter: no local video memory");
             }
             let mut dev: Option<ID3D12Device> = None;
             let _ = D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_11_0, &mut dev);
@@ -3004,8 +3014,13 @@ mod tests {
         unsafe {
             let factory: IDXGIFactory4 = CreateDXGIFactory1().expect("DXGI factory");
             let Ok(adapter) = factory.EnumAdapters1(0) else { return };
-            if adapter.GetDesc1().is_ok_and(|d| d.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0) {
-                return;
+            // a CI runner's adapter is not WARP-flagged but has no local video memory of its own,
+            // and what these prove (arenas living in it) needs some
+            let hardware = adapter.GetDesc1().is_ok_and(|d| {
+                d.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 == 0 && d.DedicatedVideoMemory != 0
+            });
+            if !hardware {
+                return crate::gpu::recomp::runner::skip_test("no hardware adapter: no local video memory");
             }
             let mut dev: Option<ID3D12Device> = None;
             let _ = D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_11_0, &mut dev);

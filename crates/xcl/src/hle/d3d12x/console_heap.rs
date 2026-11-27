@@ -1442,6 +1442,9 @@ mod tests {
             println!("SKIPPED texture3d_uav_companion_reads_written_mip: {e}");
             return;
         }
+        if let Some(why) = sparse_windows_missing() {
+            return crate::gpu::recomp::runner::skip_test(&why);
+        }
         unsafe {
             let raw = real::device_raw();
             let dev = ID3D12Device::from_raw_borrowed(&raw).unwrap();
@@ -1854,6 +1857,9 @@ mod tests {
         use windows::Win32::Graphics::Dxgi::*;
         if crate::gpu::uma::get().is_none() {
             return;
+        }
+        if let Some(why) = sparse_windows_missing() {
+            return crate::gpu::recomp::runner::skip_test(&why);
         }
         let dev = unsafe {
             let mut dev: Option<ID3D12Device> = None;

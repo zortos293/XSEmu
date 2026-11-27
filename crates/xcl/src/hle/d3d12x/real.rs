@@ -580,6 +580,15 @@ pub fn device_raw() -> *mut c_void {
     DEVICE.load(Ordering::Acquire) as *mut c_void
 }
 
+/// The process's device: the one the unified memory, the physical directory and the descriptor
+/// heaps belong to. A test that needs the directory uses this rather than a device of its own,
+/// which the singletons refuse - and whose memory would belong to the other device anyway.
+#[cfg(test)]
+pub(crate) unsafe fn test_device() -> Option<ID3D12Device> {
+    init().ok()?;
+    ID3D12Device::from_raw_borrowed(&device_raw()).cloned()
+}
+
 /// (driver compiles running, giants among them, the bytes reserved for them), for `memdiag`.
 pub(crate) fn diag_driver_compiles() -> (usize, usize, u64) {
     let s = DRIVER_COMPILES.state.lock().unwrap_or_else(|e| e.into_inner());
@@ -12765,7 +12774,14 @@ mod device_abi_tests {
 
         let method = console_slots(Kind::Device).into_iter().find_map(|(slot, f)| (slot == 108).then_some(f))
             .expect("console allocation information adapter at slot 108");
-        type Console = unsafe extern "system" fn(*mut c_void, *mut c_void, u32, u32, *const [u8; 0x38], *mut D3D12_RESOURCE_ALLOCATION_INFO1) -> *mut [u64; 2];
+        type Console = unsafe extern "system" fn(*mut c_void, *mut c_void, u32, u32, *const [u8; 0x48], *mut D3D12_RESOURCE_ALLOCATION_INFO1) -> *mut [u64; 2];
+        // slot 108 takes D3D12_RESOURCE_DESC1 records (0x48), each a resource desc then its trailing
+        // mip levels and sample desc
+        let desc1 = |d: &[u8; 0x38]| {
+            let mut b = [0u8; 0x48];
+            b[..0x38].copy_from_slice(d);
+            b
+        };
         assert_eq!(super::super::backend(), super::super::Backend::Real);
         let mut desc = [0u8; 0x38];
         for (offset, value) in [(0, 3u32), (0x10, 1), (0x18, 1), (0x1c, 0x10001), (0x20, 28), (0x24, 4), (0x30, 1)] {
@@ -12792,7 +12808,7 @@ mod device_abi_tests {
             let mut detail = D3D12_RESOURCE_ALLOCATION_INFO1::default();
             let mut ret = [u64::MAX; 2];
             let out = &mut ret as *mut [u64; 2];
-            assert_eq!(console(out.cast(), raw, 1, 1, &desc, &mut detail), out);
+            assert_eq!(console(out.cast(), raw, 1, 1, &desc1(&desc), &mut detail), out);
             assert_eq!(ret, [native.SizeInBytes, native.Alignment]);
             assert_eq!(detail, native_detail);
 
@@ -12800,7 +12816,7 @@ mod device_abi_tests {
             for (offset, value) in [(0, 4u32), (8, 0x1000), (0x24, 1), (0x2c, 0x105), (0x30, 0)] {
                 volume[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
             }
-            let descs = [volume, desc, volume];
+            let descs = [desc1(&volume), desc1(&desc), desc1(&volume)];
             let mut details = [D3D12_RESOURCE_ALLOCATION_INFO1::default(); 3];
             assert_eq!(console(out.cast(), raw, 1, 3, descs.as_ptr(), details.as_mut_ptr()), out);
             let ceil = |size: u64| size.next_multiple_of(native.Alignment);
@@ -12812,7 +12828,7 @@ mod device_abi_tests {
                 D3D12_RESOURCE_ALLOCATION_INFO1 { Offset: msaa_offset, ..native_detail },
                 D3D12_RESOURCE_ALLOCATION_INFO1 { Offset: last_offset, Alignment: 0x1000, SizeInBytes: 0x1000 },
             ]);
-            assert_eq!(console(out.cast(), raw, 1, 1, &volume, std::ptr::null_mut()), out);
+            assert_eq!(console(out.cast(), raw, 1, 1, &desc1(&volume), std::ptr::null_mut()), out);
             assert_eq!(ret, [0x1000, 0x1000]);
         }
     }
@@ -12937,7 +12953,17 @@ mod device_abi_tests {
         let mut rt = D3D12_RT_FORMAT_ARRAY::default();
         rt.RTFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
         rt.NumRenderTargets = 1;
+        // a host mesh shader where the adapter runs console mesh programs as one, else two passes
+        let host = unsafe {
+            ID3D12Device::from_raw_borrowed(&device_raw()).is_some_and(|d| crate::gpu::recomp::pso::mesh_native_split(&d).is_some())
+        };
         for tag in [D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_AS] {
+            if tag == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_AS && !host {
+                // an AS-only console stream is built as the host's mesh pipeline, and without mesh
+                // shaders there is nothing to build it from (the MS stream still covers two passes)
+                crate::gpu::recomp::runner::skip_test("no mesh shaders");
+                continue;
+            }
             let mut stream = StreamOut::default();
             stream.shader(tag, &ms);
             stream.shader(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS, ps);
@@ -12949,10 +12975,6 @@ mod device_abi_tests {
                 let hr = dev_create_pipeline_state(device_raw(), desc.as_ptr().cast(), &pc_iid(Kind::PipelineState), &mut raw);
                 assert_eq!(hr, S_OK, "Xbox MS in subobject {}: {hr:#x}", tag.0);
                 let pso = ID3D12PipelineState::from_raw(raw);
-                // a host mesh shader where the adapter runs console mesh programs as one, else
-                // two passes
-                let dev = device_raw();
-                let host = ID3D12Device::from_raw_borrowed(&dev).is_some_and(|d| crate::gpu::recomp::pso::mesh_native_split(d).is_some());
                 let p = pso.as_raw() as usize;
                 assert_eq!((is_native_mesh(p), two_pass_of(p).is_some()), (host, !host));
             }
@@ -12982,6 +13004,10 @@ mod device_abi_tests {
         rt.RTFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
         rt.NumRenderTargets = 1;
         unsafe {
+            if !ID3D12Device::from_raw_borrowed(&device_raw()).is_some_and(|d| crate::gpu::recomp::pso::mesh_native_split(&d).is_some()) {
+                // no mesh shaders: the async build this waits for cannot finish
+                return crate::gpu::recomp::runner::skip_test("no mesh shaders");
+            }
             // (a title's stream has its root signature, and the stand-in is made with it)
             let rs = abi_rs_for(device_raw(), &[]).expect("root signature");
             let mut stream = StreamOut::default();

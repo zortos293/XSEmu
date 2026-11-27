@@ -5482,6 +5482,10 @@ mod tests {
             crate::gpu::recomp::runner::skip_test("no unified memory");
             return;
         }
+        if !crate::hle::d3d12x::sparse::windows_ready() {
+            crate::gpu::recomp::runner::skip_test("no 4 GiB sparse memory window: this adapter cannot reserve one");
+            return;
+        }
         unsafe {
             let Ok(factory) = CreateDXGIFactory1::<IDXGIFactory4>() else {
                 crate::gpu::recomp::runner::skip_test("no WARP");

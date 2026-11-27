@@ -1,16 +1,16 @@
 use super::*;
 use crate::hle::d3d12x::physical_directory::{self as dir, recordings};
 use windows::core::Interface;
-use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0;
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC;
 
 #[test]
 fn actual_copy_page_mapping_handler_and_worker_respect_a_future_queue_signal() {
     unsafe {
-        let mut dev=None;
-        D3D12CreateDevice(None,D3D_FEATURE_LEVEL_11_0,&mut dev).unwrap();
-        let dev:ID3D12Device=dev.unwrap();
+        let Some(dev) = crate::hle::d3d12x::real::test_device() else {
+            crate::gpu::recomp::runner::skip_test("no GPU");
+            return;
+        };
         assert!(dir::init(&dev));
         let make=||->ID3D12CommandQueue{dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC{Type:D3D12_COMMAND_LIST_TYPE_DIRECT,..Default::default()}).unwrap()};
         let (q1,q2)=(make(),make());
