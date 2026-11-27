@@ -11,6 +11,7 @@ pub mod alias;
 pub mod manifest;
 pub mod memmap;
 pub mod memdiag;
+pub mod dxc_heap;
 
 #[global_allocator]
 static ALLOCATOR: memdiag::Counting = memdiag::Counting;

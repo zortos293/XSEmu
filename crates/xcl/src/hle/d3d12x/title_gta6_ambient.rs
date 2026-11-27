@@ -6,8 +6,9 @@
 //! diffuse light of its screen probes (`CS_ScreenProbes_TemporalResolve_*`) then leaves the sky's light
 //! outdoors, nothing indoors (walls are black where no lamp or sun reaches) and, in blocks of the
 //! picture's tiles, what the probes' memory held. Right after that program's dispatch the light is
-//! raised to an estimate taken from the frame and bounded by a multiple of it: the light the visible
-//! surfaces send out (the title keeps it for its own screen traces, `CS_CacheScreenSpaceRadiance`,
+//! raised to an estimate taken from the frame (bounded by a multiple of it with
+//! `XCL_GTA6_AMBIENT_CAP`): the light the visible surfaces send out (the title keeps it for its own
+//! screen traces, `CS_CacheScreenSpaceRadiance`,
 //! the frame before) is averaged in 64x36 cells, and every point gets the mean of the cells weighted
 //! by the share of its surroundings they cover, as a directional value (first-order harmonics at
 //! 160x90 points, taken between them by depth). What is not on screen is assumed to send out what
@@ -24,15 +25,35 @@
 //!   the title has it. Nothing with the flat light.
 //! - `XCL_GTA6_AMBIENT_SHADE=<strength>,<radius in metres>`: the shade of creases (1 and 0.6 unless
 //!   set; a strength of `0` turns it off).
+//! - `XCL_GTA6_AMBIENT_CAP=<multiple>`: the title's own light is cut to that multiple of the
+//!   estimate (cool_fox runs 4). Unset or `0`: it is kept whole. The cut feeds on itself: what the
+//!   title leaves is the light of the next frame's surfaces, so a dimmer estimate cuts more, and
+//!   play-108 faded to black in 20 minutes with 4.
+//! - `XCL_GTA6_AMBIENT_FLOOR=<share>`: the estimate is at least that share of the slow mean (0
+//!   unless set: no floor).
+//! - `XCL_GTA6_AMBIENT_FALL=<share>`: how fast the slow mean follows a darker frame, a frame's share
+//!   (0.04 unless set, as fast as it follows a brighter one, as cool_fox has it; 0: it only rises).
+//!   A floor on a mean that only rises feeds on itself the other way: what the raise adds is the
+//!   light of the next frame's surfaces, the mean can only take it in, and play-110 went white a
+//!   minute after the stand-in engaged with a floor of 0.5 and a fall of 0.
+//!   `XCL_GTA6_AMBIENT_CAP=4` is cool_fox's light.
+//! - `XCL_GTA6_AMBIENT_BOUND=<multiple>`: the estimate is at most that multiple of the mean light
+//!   the title's own program left in the frame, before the raise (1 unless set; `0`: unbounded).
+//!   The title's light follows its exposure, so the stand-in cannot outshine the frame it is put in.
 //!
-//! None of the three changes a translated shader, so none is in the translation cache's identity:
+//! None of these changes a translated shader, so none is in the translation cache's identity:
 //! the passes here are XCL's own programs, compiled like its other helpers (`real::compile`).
 //!
 //! The patch follows three of the title's compute programs by the name in their container
 //! (`role`) and takes their images from fixed places in their root tables (`LIGHT`, `DEPTH`,
 //! `RADIANCE`, `AIR`): both are this title's, as the build cool_fox runs lays them out. Before anything is
-//! recorded the views found there are checked (`view_fits`, `accept`), and a view of another kind,
-//! format or size is refused and logged with what was found. General fix: inline ray tracing the
+//! recorded the views found there are checked (`view_fits`, `accept`). The places are those of
+//! cool_fox's game build, and this build's root signatures can lay the tables out otherwise (in
+//! play-105 the radiance's place had no unordered-access range), so when the view at a place is not
+//! of the kind, format and size the pass needs, the program's root tables are searched for the one
+//! view that is (`find_image`, `find_depth`; `XCL_GTA6_AMBIENT_SCAN=0`: the fixed places only), and
+//! where it was found is logged once and kept. No view, or more than one where the pass writes, is
+//! refused and logged with what was found. General fix: inline ray tracing the
 //! driver can compile in bounded memory, then ray tracing on; the title's own probes then find
 //! their light.
 //!
@@ -81,7 +102,10 @@ use std::sync::{Mutex, OnceLock};
 
 use windows::core::Interface;
 use windows::Win32::Graphics::Direct3D12::*;
-use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_R11G11B10_FLOAT, DXGI_FORMAT_R32_TYPELESS, DXGI_FORMAT_R32_UINT, DXGI_SAMPLE_DESC};
+use windows::Win32::Graphics::Dxgi::Common::{
+    DXGI_FORMAT_D16_UNORM, DXGI_FORMAT_D24_UNORM_S8_UINT, DXGI_FORMAT_D32_FLOAT, DXGI_FORMAT_D32_FLOAT_S8X24_UINT, DXGI_FORMAT_R11G11B10_FLOAT, DXGI_FORMAT_R16_TYPELESS, DXGI_FORMAT_R24G8_TYPELESS,
+    DXGI_FORMAT_R32G8X24_TYPELESS, DXGI_FORMAT_R32_FLOAT, DXGI_FORMAT_R32_TYPELESS, DXGI_FORMAT_R32_UINT, DXGI_SAMPLE_DESC,
+};
 
 use super::console_list::{Layout, Param, UavBinding};
 use super::title_gta6::Patch;
@@ -175,6 +199,11 @@ fn parse_air(set: &str) -> f32 {
     number(set).unwrap_or(0.0)
 }
 
+/// A share of 0 or more that `set` names, `default` when it names none.
+fn parse_share(set: &str, default: f32) -> f32 {
+    set.trim().parse::<f32>().ok().filter(|v| v.is_finite() && *v >= 0.0).unwrap_or(default)
+}
+
 /// Strength and radius of the creases' shade: what `set` names of the two, 1 and 0.6 m otherwise.
 fn parse_shade(set: &str) -> [f32; 2] {
     let mut shade = [1.0, 0.6];
@@ -190,13 +219,29 @@ struct Settings {
     light: Set,
     air: f32,
     shade: [f32; 2],
+    /// The most of the title's own light that is kept, as a multiple of the estimate (0: all).
+    cap: f32,
+    /// The least the estimate is, as a share of the slow mean.
+    lowest: f32,
+    /// How fast the slow mean follows a darker frame.
+    fall: f32,
+    /// The most the estimate is, as a multiple of the mean of the title's own light (0: no bound).
+    bound: f32,
 }
 
 fn settings() -> &'static Settings {
     static SET: OnceLock<Settings> = OnceLock::new();
     SET.get_or_init(|| {
         let var = |name: &str| std::env::var(name).unwrap_or_default();
-        Settings { light: parse(&var(Patch::Ambient.switch())), air: parse_air(&var("XCL_GTA6_AMBIENT_AIR")), shade: parse_shade(&var("XCL_GTA6_AMBIENT_SHADE")) }
+        Settings {
+            light: parse(&var(Patch::Ambient.switch())),
+            air: parse_air(&var("XCL_GTA6_AMBIENT_AIR")),
+            shade: parse_shade(&var("XCL_GTA6_AMBIENT_SHADE")),
+            cap: parse_share(&var("XCL_GTA6_AMBIENT_CAP"), 0.0),
+            lowest: parse_share(&var("XCL_GTA6_AMBIENT_FLOOR"), 0.0),
+            fall: parse_share(&var("XCL_GTA6_AMBIENT_FALL"), FOLLOW).min(1.0),
+            bound: parse_share(&var("XCL_GTA6_AMBIENT_BOUND"), 1.0),
+        }
     })
 }
 
@@ -221,10 +266,14 @@ pub(super) fn wanted() -> bool {
             Set::Off => return false,
         };
         let air = if s.air > 0.0 && matches!(s.light, Set::Estimate(_)) { format!("the air scatters at most {} times the light around", s.air) } else { "the air is left as the title has it (XCL_GTA6_AMBIENT_AIR)".into() };
+        let cap = if s.cap > 0.0 { format!("the title's own light cut to {} times the estimate", s.cap) } else { "the title's own light kept whole".into() };
         crate::xlog_info!(
-            "D3D12.X: title patch {what} on ({switch}=0 turns it off): {light}, creases shaded with strength {} over {} m (XCL_GTA6_AMBIENT_SHADE), {air}; it engages at the first dispatch of {}",
+            "D3D12.X: title patch {what} on ({switch}=0 turns it off): {light}, creases shaded with strength {} over {} m (XCL_GTA6_AMBIENT_SHADE), {air}, {cap} (XCL_GTA6_AMBIENT_CAP), the estimate at least {} of the slow mean (XCL_GTA6_AMBIENT_FLOOR), which follows a darker frame at {} a frame (XCL_GTA6_AMBIENT_FALL), and at most {} times the mean of the title's own light (XCL_GTA6_AMBIENT_BOUND); it engages at the first dispatch of {}",
             s.shade[0],
             s.shade[1],
+            s.lowest,
+            s.fall,
+            s.bound,
             Role::Resolve.name()
         );
         true
@@ -362,10 +411,12 @@ fn accept(role: Role, image: &Viewed, depth: &Viewed) -> Result<([u32; 2], u32),
 unsafe fn viewed(layout: &Layout, args: &[u8], role: Role, place: Place, image: bool) -> Result<Viewed, String> {
     let fail = |why: String| format!("{} ({}): {why}", if image { "the image" } else { "the depth" }, place_text(place));
     let at = descriptor_at(layout, args, place).map_err(fail)?;
-    if image && !declares_uav(layout, place) {
-        return Err(fail("the root signature has no unordered-access range there".into()));
-    }
     let words = super::console_heap::words_at(at).ok_or_else(|| fail(format!("{at:#x} is in no console view heap")))?;
+    // (the pass writes the image through the view beside its shader view: one the title's program
+    // writes through, or one XCL made for the view because its resource takes unordered access)
+    if image && !declares_uav(layout, place) && super::console_heap::native_uav_at(at, words[0]).is_none() {
+        return Err(fail("the root signature has no unordered-access range there, and the view there has no unordered-access view".into()));
+    }
     let view = crate::gpu::desc::image(&words).ok_or_else(|| fail(format!("{at:#x} holds no image view")))?;
     view_fits(role, image, &view).map_err(fail)?;
     let resource = super::console_heap::image_resource_at(at, words[0]).ok_or_else(|| fail(format!("no PC resource is known behind view {} at {at:#x}", words[0])))?;
@@ -379,16 +430,18 @@ unsafe fn viewed(layout: &Layout, args: &[u8], role: Role, place: Place, image: 
 }
 
 const SOURCE: &str = r#"
-#define RS "RootConstants(num32BitConstants=12, b0), DescriptorTable(SRV(t0)), DescriptorTable(UAV(u0)), UAV(u1), UAV(u2)"
+#define RS "RootConstants(num32BitConstants=16, b0), DescriptorTable(SRV(t0)), DescriptorTable(UAV(u0)), UAV(u1), UAV(u2)"
 #define CX 64
 #define CY 36
 #define CELLS (CX * CY)
+#define OWN_AT (2 * CELLS + 1)
 #define PX 160
 #define PY 90
 cbuffer Set : register(b0) {
     float level; float constant; float strength; float radius;
     float near; float tan_y; uint width; uint height;
-    float follow; float most; float air; float unused;
+    float follow; float most; float air; float lowest;
+    float fall; float bound; float unused1; float unused2;
 };
 Texture2D<float> depth : register(t0);
 // Cells: the light they send out (then, at CELLS, the slow mean), from
@@ -406,6 +459,23 @@ float3 seen(int2 p, float2 size) {
     return float3(ndc.x * tan_y * size.x / size.y * z, -ndc.y * tan_y * z, z);
 }
 
+float3 unpack(uint v) {
+    return float3(v & 511, (v >> 9) & 511, (v >> 18) & 511) * exp2(float(v >> 27) - 24.0);
+}
+
+#ifdef OWN
+RWTexture2D<uint> light : register(u0);
+[RootSignature(RS)]
+[numthreads(1, 1, 1)]
+void main() {
+    float sum = 0;
+    for (uint y = 0; y < CY; y++) for (uint x = 0; x < CX; x++) {
+        sum += dot(unpack(light[uint2((float2(x, y) + 0.5) * float2(width, height) / float2(CX, CY))]), LUMA);
+    }
+    cells[OWN_AT] = float4(sum / CELLS, 0.0, 0.0, 1.0);
+}
+#endif
+
 #ifdef KEEP
 RWTexture2D<float3> radiance : register(u0);
 [RootSignature(RS)]
@@ -416,8 +486,8 @@ void main(uint3 at : SV_DispatchThreadID) {
     float3 sum = 0;
     for (uint y = 0; y < 5; y++) for (uint x = 0; x < 5; x++) {
         uint2 p = uint2((float2(at.xy) + (float2(x, y) + 0.5) / 5.0) * float2(w, h) / float2(CX, CY));
-        float3 c = max(radiance[p], 0.0);
-        c = any(isnan(c)) || any(isinf(c)) ? 0.0 : c;
+        uint3 bits = asuint(radiance[p]);
+        float3 c = any((bits & 0x7f800000u) == 0x7f800000u) ? 0.0 : max(asfloat(bits), 0.0);
         // Lamps and glints count, but not for everything.
         sum += c / max(1.0, dot(c, LUMA) / 20.0);
     }
@@ -433,7 +503,8 @@ void main() {
     for (uint i = 0; i < CELLS; i++) sum += cells[i].rgb;
     float4 was = cells[CELLS];
     float3 now = sum / CELLS;
-    cells[CELLS] = float4(was.a > 0.0 ? lerp(was.rgb, now, follow) : now, 1.0);
+    float rate = dot(now, LUMA) < dot(was.rgb, LUMA) ? fall : follow;
+    cells[CELLS] = float4(was.a > 0.0 ? lerp(was.rgb, now, rate) : now, 1.0);
 }
 #endif
 
@@ -473,10 +544,11 @@ void main(uint3 at : SV_DispatchThreadID) {
     whole = max(whole, 1e-6);
     light /= whole;
     toward /= whole;
+    float3 low = max(light, lowest * cells[CELLS].rgb);
     uint at0 = (at.y * PX + at.x) * 3;
-    points[at0] = float4(red / whole - light.r * toward, light.r);
-    points[at0 + 1] = float4(green / whole - light.g * toward, light.g);
-    points[at0 + 2] = float4(blue / whole - light.b * toward, light.b);
+    points[at0] = float4(red / whole - light.r * toward, low.r);
+    points[at0 + 1] = float4(green / whole - light.g * toward, low.g);
+    points[at0 + 2] = float4(blue / whole - light.b * toward, low.b);
 }
 #endif
 
@@ -504,9 +576,6 @@ void main(uint3 at : SV_DispatchThreadID) {
 
 #ifdef RAISE
 RWTexture2D<uint> light : register(u0);
-float3 unpack(uint v) {
-    return float3(v & 511, (v >> 9) & 511, (v >> 18) & 511) * exp2(float(v >> 27) - 24.0);
-}
 uint pack(float3 c) {
     c = clamp(c, 0.0, 65408.0);
     float top = max(c.r, max(c.g, c.b));
@@ -573,20 +642,26 @@ void main(uint3 at : SV_DispatchThreadID) {
     float3 all = float3(sr.w, sg.w, sb.w) / sum;
     found = all + 1.2 * float3(dot(sr.xyz, n), dot(sg.xyz, n), dot(sb.xyz, n)) / sum;
     found = clamp(found, 0.2 * all, 2.5 * all);
+    found = max(found, lowest * cells[CELLS].rgb);
     found = lerp(found, cells[CELLS].rgb, 0.2) * level * open;
+    if (bound > 0.0) {
+        found *= min(1.0, bound * cells[OWN_AT].x / max(dot(found, LUMA), 1e-6));
+    }
     float3 was = unpack(light[p]);
     // What the program left counts as far as it can be true: the sky's light
     // outdoors, not the blocks of other memory.
-    float top = max(dot(found, LUMA) * most, 1e-6);
-    float has = dot(was, LUMA);
-    was *= min(1.0, top / max(has, 1e-6));
+    if (most > 0.0) {
+        float top = max(dot(found, LUMA) * most, 1e-6);
+        float has = dot(was, LUMA);
+        was *= min(1.0, top / max(has, 1e-6));
+    }
     light[p] = pack(max(was, found));
 }
 #endif
 "#;
 
 /// The six passes, by the part of `SOURCE` each is.
-const PARTS: [&str; 6] = ["KEEP", "MEAN", "PLACE", "GATHER", "RAISE", "AIR"];
+const PARTS: [&str; 7] = ["KEEP", "MEAN", "PLACE", "GATHER", "RAISE", "AIR", "OWN"];
 
 /// The source of one pass: `SOURCE` with that part's entry.
 fn source(part: &str) -> String {
@@ -598,22 +673,21 @@ fn source(part: &str) -> String {
 /// float4 a point).
 const CELLS: [u32; 2] = [64, 36];
 const POINTS: [u32; 2] = [160, 90];
-const CELL_BYTES: u64 = (2 * (CELLS[0] * CELLS[1]) as u64 + 1) * 16;
+const CELL_BYTES: u64 = (2 * (CELLS[0] * CELLS[1]) as u64 + 2) * 16;
 const POINT_BYTES: u64 = (POINTS[0] * POINTS[1]) as u64 * 48;
 
 /// The distance of the near plane in metres and the tangent of half the view's height, which the
-/// passes take the place of a texel from; how fast the slow mean follows (a frame's share); and
-/// the most of the title's own light that is kept, as a multiple of the estimate.
+/// passes take the place of a texel from; and how fast the slow mean follows a brighter frame (a
+/// frame's share).
 const NEAR: f32 = 0.1;
 const TAN_Y: f32 = 0.45;
 const FOLLOW: f32 = 0.04;
-const MOST: f32 = 4.0;
 
 /// XCL's objects for the passes, raw (never released): the root signature, the pipelines in the
 /// order of `PARTS`, and the GPU addresses of the two buffers.
 struct Passes {
     rs: usize,
-    pipelines: [usize; 6],
+    pipelines: [usize; 7],
     cells: u64,
     points: u64,
 }
@@ -624,6 +698,7 @@ const PLACE: usize = 2;
 const GATHER: usize = 3;
 const RAISE: usize = 4;
 const CLEAR_AIR: usize = 5;
+const OWN: usize = 6;
 
 /// The passes, made at the first dispatch that takes them; None when they could not be (logged).
 fn passes() -> Option<&'static Passes> {
@@ -638,7 +713,7 @@ fn passes() -> Option<&'static Passes> {
             }
             super::title_textures::own_work(|| {
                 let rs: ID3D12RootSignature = dev.CreateRootSignature(0, &code[0]).map_err(|e| format!("root signature: {e}"))?;
-                let mut pipelines = [0usize; 6];
+                let mut pipelines = [0usize; 7];
                 for (k, code) in code.iter().enumerate() {
                     let desc = D3D12_COMPUTE_PIPELINE_STATE_DESC {
                         pRootSignature: std::mem::transmute_copy(&rs),
@@ -694,9 +769,9 @@ static KEPT: AtomicBool = AtomicBool::new(false);
 static GATHERED: AtomicBool = AtomicBool::new(false);
 
 /// The constants of the passes (`SOURCE`'s `Set`) for an image of `size`.
-fn constants(level: f32, constant: f32, shade: [f32; 2], air: f32, size: [u32; 2]) -> [u32; 12] {
+fn constants(level: f32, constant: f32, s: &Settings, size: [u32; 2]) -> [u32; 16] {
     let f = f32::to_bits;
-    [f(level), f(constant), f(shade[0]), f(shade[1]), f(NEAR), f(TAN_Y), size[0], size[1], f(FOLLOW), f(MOST), f(air), 0]
+    [f(level), f(constant), f(s.shade[0]), f(s.shade[1]), f(NEAR), f(TAN_Y), size[0], size[1], f(FOLLOW), f(s.cap), f(s.air), f(s.lowest), f(s.fall), f(s.bound), 0, 0]
 }
 
 /// The passes after `role` and the groups each is dispatched with (a pipeline of `PARTS` each), for
@@ -708,14 +783,14 @@ fn schedule(role: Role, flat: bool, size: [u32; 2], slices: u32) -> Vec<(usize, 
         Role::Radiance => vec![(KEEP, [CELLS[0] / 8, CELLS[1] / 4, 1]), (MEAN, [1, 1, 1])],
         Role::Air => vec![(CLEAR_AIR, image(slices.div_ceil(2)))],
         Role::Resolve if flat => vec![(RAISE, image(1))],
-        Role::Resolve => vec![(PLACE, [CELLS[0] / 8, CELLS[1] / 4, 1]), (GATHER, [POINTS[0] / 8, POINTS[1] / 2, 1]), (RAISE, image(1))],
+        Role::Resolve => vec![(PLACE, [CELLS[0] / 8, CELLS[1] / 4, 1]), (GATHER, [POINTS[0] / 8, POINTS[1] / 2, 1]), (OWN, [1, 1, 1]), (RAISE, image(1))],
     }
 }
 
 /// Records `passes` on `list`, with `image` and `depth` as the handles of the title's views in the shared
 /// view heap. A barrier for all unordered access goes before the first and after each: a pass
 /// reads what the title's program and the pass before it wrote.
-unsafe fn record(list: *mut c_void, p: &Passes, words: &[u32; 12], image: u64, depth: u64, passes: &[(usize, [u32; 3])]) -> bool {
+unsafe fn record(list: *mut c_void, p: &Passes, words: &[u32; 16], image: u64, depth: u64, passes: &[(usize, [u32; 3])]) -> bool {
     let (rs, Some(l)) = (p.rs as *mut c_void, ID3D12GraphicsCommandList::from_raw_borrowed(&list)) else { return false };
     let Some(rs) = ID3D12RootSignature::from_raw_borrowed(&rs) else { return false };
     let barrier = || [D3D12_RESOURCE_BARRIER { Type: D3D12_RESOURCE_BARRIER_TYPE_UAV, ..Default::default() }];
@@ -739,6 +814,175 @@ unsafe fn record(list: *mut c_void, p: &Passes, words: &[u32; 12], image: u64, d
 
 /// A dispatch of the title's pipeline `title_pso` was recorded on `list` just now: when the pipeline has
 /// a role, the stand-in's passes for it follow on `list`, or the reason they do not is logged.
+/// Whether the root tables are searched for a view that is not at its fixed place
+/// (`XCL_GTA6_AMBIENT_SCAN`, on unless `0`).
+fn scan() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var("XCL_GTA6_AMBIENT_SCAN").map_or(true, |v| v.trim() != "0"))
+}
+
+/// The most slots one search reads.
+const SCAN_SLOTS: usize = 4096;
+/// Frames between two searches that found nothing.
+const SCAN_EVERY: u64 = 60;
+
+/// Every slot of the unordered-access ranges of the root signature's tables, in order: where a
+/// program's images are looked for.
+fn uav_places(layout: &Layout) -> Vec<Place> {
+    let dwords = super::console_heap::SLOT / 4;
+    layout
+        .uavs
+        .iter()
+        .filter_map(|u| match *u {
+            UavBinding::Table { param, first, count, .. } => Some((param, first, count)),
+            UavBinding::Root { .. } => None,
+        })
+        .flat_map(|(param, first, count)| (first..first.saturating_add(count)).map(move |slot| (param, slot.saturating_mul(dwords))))
+        .take(SCAN_SLOTS)
+        .collect()
+}
+
+/// Every slot of the root signature's descriptor tables (of a table whose end is not known, the
+/// first 1024): where the depth is looked for.
+fn table_places(layout: &Layout) -> Vec<Place> {
+    let dwords = super::console_heap::SLOT / 4;
+    layout
+        .params
+        .iter()
+        .enumerate()
+        .filter(|(_, p)| matches!(p, Param::Table { .. }))
+        .flat_map(|(param, _)| {
+            let end = layout.tables.get(param).copied().unwrap_or(0);
+            (0..if end == u32::MAX { 1024 } else { end }).map(move |slot| (param, slot.saturating_mul(dwords)))
+        })
+        .take(SCAN_SLOTS)
+        .collect()
+}
+
+/// Whether a resource of `format` holds a depth: a depth format, or a typeless format a depth
+/// buffer is made in.
+fn depth_like(format: i32) -> bool {
+    [DXGI_FORMAT_R32_TYPELESS, DXGI_FORMAT_D32_FLOAT, DXGI_FORMAT_R32G8X24_TYPELESS, DXGI_FORMAT_D32_FLOAT_S8X24_UINT, DXGI_FORMAT_R24G8_TYPELESS, DXGI_FORMAT_D24_UNORM_S8_UINT, DXGI_FORMAT_R16_TYPELESS, DXGI_FORMAT_D16_UNORM]
+        .iter()
+        .any(|f| f.0 == format)
+}
+
+fn places_text(found: &[(Place, Viewed)]) -> String {
+    found.iter().map(|(p, v)| format!("{} ({}x{}, format {}, view {})", place_text(*p), v.width, v.height, v.format, v.index)).collect::<Vec<_>>().join(", ")
+}
+
+/// The image of the views a search found that are of the kind, format and size the pass after
+/// `role` needs: the one there is; of several, the largest for the light of visible surfaces (the
+/// pass only reads it), and none for the images a pass writes (a guess could write the wrong one).
+fn choose(role: Role, found: &[(Place, Viewed)]) -> Result<(Place, Viewed), String> {
+    match found {
+        [] => Err("no view there is of that kind, format and size".into()),
+        [one] => Ok(*one),
+        _ if role == Role::Radiance => Ok(*found.iter().rev().max_by_key(|(_, v)| v.width * u64::from(v.height)).unwrap()),
+        _ => Err(format!("{} views there are of that kind, format and size, and the pass would write one: {}", found.len(), places_text(found))),
+    }
+}
+
+/// The depth of the views a search found that are as large as the light: the one held in a depth
+/// format, or else the one 32-bit float image.
+fn choose_depth(found: &[(Place, Viewed)]) -> Result<(Place, Viewed), String> {
+    let depth: Vec<_> = found.iter().copied().filter(|(_, v)| depth_like(v.format)).collect();
+    let floats: Vec<_> = found.iter().copied().filter(|(_, v)| v.format == DXGI_FORMAT_R32_FLOAT.0).collect();
+    match (depth.as_slice(), floats.as_slice()) {
+        ([one], _) | ([], [one]) => Ok(*one),
+        ([], []) => Err("no 2D view there is of a depth as large as the light".into()),
+        ([], several) => Err(format!("{} 32-bit float images there are as large as the light: {}", several.len(), places_text(several))),
+        (several, _) => Err(format!("{} depths there are as large as the light: {}", several.len(), places_text(several))),
+    }
+}
+
+/// Where the views were found away from their fixed places (the image of each role, then the
+/// depth), and the frame of the last search of each that found nothing.
+static FOUND: Mutex<[Option<Place>; ROLES_N + 1]> = Mutex::new([None; ROLES_N + 1]);
+static SEARCHED: Mutex<[Option<u64>; ROLES_N + 1]> = Mutex::new([None; ROLES_N + 1]);
+
+/// A view the pass after `role` takes (`which`: its index in `FOUND`): at the place it was found the
+/// last time or at its fixed place `fixed`, when `fits` takes the view there; else, with `scan`, of
+/// the views at `places` that `fits` takes, the one `choose` picks (searched again at most every
+/// `SCAN_EVERY` frames while none is found). Where it was found is logged once.
+fn find(
+    role: Role,
+    which: usize,
+    what: &str,
+    fixed: Place,
+    places: impl FnOnce() -> Vec<Place>,
+    fits: impl Fn(Place) -> Result<Viewed, String>,
+    choose: impl FnOnce(&[(Place, Viewed)]) -> Result<(Place, Viewed), String>,
+) -> Result<(Place, Viewed), String> {
+    let last = FOUND.lock().unwrap()[which];
+    if let Some(place) = last {
+        if let Ok(v) = fits(place) {
+            return Ok((place, v));
+        }
+    }
+    let why = match fits(fixed) {
+        Ok(v) => return Ok((fixed, v)),
+        Err(why) => why,
+    };
+    if !scan() {
+        return Err(why);
+    }
+    let frame = super::present::counters().0;
+    if SEARCHED.lock().unwrap()[which].is_some_and(|f| frame < f + SCAN_EVERY) {
+        return Err(format!("{why}; the last search of the root tables found none (XCL_GTA6_AMBIENT_SCAN; searched again every {SCAN_EVERY} frames)"));
+    }
+    let places = places();
+    let found: Vec<_> = places.iter().filter(|&&p| p != fixed).filter_map(|&p| fits(p).ok().map(|v| (p, v))).collect();
+    match choose(&found) {
+        Ok((place, v)) => {
+            SEARCHED.lock().unwrap()[which] = None;
+            if last != Some(place) {
+                FOUND.lock().unwrap()[which] = Some(place);
+                crate::xlog_info!(
+                    "D3D12.X: title patch {} finds {what} for the pass after {} at {} ({}x{}, format {}, view {}), not at cool_fox's {}: {why}",
+                    Patch::Ambient.what(),
+                    role.name(),
+                    place_text(place),
+                    v.width,
+                    v.height,
+                    v.format,
+                    v.index,
+                    place_text(fixed)
+                );
+            }
+            Ok((place, v))
+        }
+        Err(e) => {
+            SEARCHED.lock().unwrap()[which] = Some(frame);
+            Err(format!("{why}; of the {} slots searched (XCL_GTA6_AMBIENT_SCAN): {e}", places.len()))
+        }
+    }
+}
+
+/// The image the pass after `role` writes (reads, for the light of visible surfaces) and where it is:
+/// searched in the unordered-access ranges of the root signature first, then in every slot of its
+/// tables (a view there that has an unordered-access view of its own).
+unsafe fn find_image(layout: &Layout, args: &[u8], role: Role) -> Result<(Place, Viewed), String> {
+    let fits = |place| unsafe { viewed(layout, args, role, place, true) }.and_then(|v| accept(role, &v, &v).map(|_| v));
+    let uavs: std::collections::HashSet<Place> = uav_places(layout).into_iter().collect();
+    let places = || {
+        let mut all = uav_places(layout);
+        all.extend(table_places(layout).into_iter().filter(|p| !uavs.contains(p)));
+        all
+    };
+    let pick = |found: &[(Place, Viewed)]| {
+        let inside: Vec<_> = found.iter().copied().filter(|(p, _)| uavs.contains(p)).collect();
+        choose(role, if inside.is_empty() { found } else { &inside })
+    };
+    find(role, role as usize, "the image", role.image(), places, fits, pick)
+}
+
+/// The scene's depth the resolve's pass reads beside `image`, and where it is.
+unsafe fn find_depth(layout: &Layout, args: &[u8], role: Role, image: &Viewed) -> Result<(Place, Viewed), String> {
+    let fits = |place| unsafe { viewed(layout, args, role, place, false) }.and_then(|d| if d.index == image.index { Err("the light itself".into()) } else { accept(role, image, &d).map(|_| d) });
+    find(role, ROLES_N, "the depth", DEPTH, || table_places(layout), fits, choose_depth)
+}
+
 pub(super) unsafe fn after_dispatch(list: *mut c_void, title_pso: usize) {
     let Some(role) = role_of(title_pso) else { return };
     #[cfg(test)]
@@ -763,14 +1007,14 @@ pub(super) unsafe fn after_dispatch(list: *mut c_void, title_pso: usize) {
     let Some((layout, args)) = super::bind::compute_arguments(list) else {
         return refused(role, "the list has no compute root signature".into());
     };
-    let image = match viewed(&layout, &args, role, role.image(), true) {
-        Ok(v) => v,
+    let (image_place, image) = match find_image(&layout, &args, role) {
+        Ok(found) => found,
         Err(why) => return refused(role, why),
     };
     // (the passes that read no depth get the image's view there, as cool_fox binds them)
     let depth = match role {
-        Role::Resolve => match viewed(&layout, &args, role, DEPTH, false) {
-            Ok(v) => Some(v),
+        Role::Resolve => match find_depth(&layout, &args, role, &image) {
+            Ok((_, v)) => Some(v),
             Err(why) => return refused(role, why),
         },
         Role::Radiance | Role::Air => None,
@@ -783,7 +1027,7 @@ pub(super) unsafe fn after_dispatch(list: *mut c_void, title_pso: usize) {
         return refused(role, "its views are not in the shared view heap".into());
     };
     let Some(p) = passes() else { return };
-    let words = constants(level, constant, s.shade, s.air, size);
+    let words = constants(level, constant, s, size);
     if !record(list, p, &words, image_at, depth_at, &schedule(role, constant > 0.0, size, slices)) {
         return refused(role, "the list or the passes' objects are gone".into());
     }
@@ -800,7 +1044,7 @@ pub(super) unsafe fn after_dispatch(list: *mut c_void, title_pso: usize) {
             Role::Resolve => format!("the diffuse light raised to {level} of the estimate in"),
         };
         let depth = depth.map_or(String::new(), |d| format!(", depth view {} of a {}x{} resource of format {}", d.index, d.width, d.height, d.format));
-        format!("{what} a {}x{}x{slices} image of format {} (view {}){depth}", size[0], size[1], image.format, image.index + 1)
+        format!("{what} a {}x{}x{slices} image of format {} (view {} at {}){depth}", size[0], size[1], image.format, image.index + 1, place_text(image_place))
     });
 }
 
@@ -895,6 +1139,14 @@ mod tests {
         assert_eq!(parse_shade("0, 2"), [0.0, 2.0]);
         assert_eq!(parse_shade("x,0.3"), [1.0, 0.3]);
         assert_eq!(parse_shade("-1,nan"), [1.0, 0.6]);
+        // the cap and the floor are off, and the slow mean falls as fast as it rises, unless set
+        assert_eq!(parse_share("", 0.0), 0.0);
+        assert_eq!(parse_share("4", 0.0), 4.0);
+        assert_eq!(parse_share("", 0.5), 0.5);
+        assert_eq!(parse_share("0", 0.5), 0.0);
+        assert_eq!(parse_share("-1", 0.5), 0.5);
+        assert_eq!(parse_share("nan", 0.5), 0.5);
+        assert_eq!(parse_share(" 0.04 ", 0.0), 0.04);
     }
 
     #[test]
@@ -961,6 +1213,48 @@ mod tests {
         assert!(!declares_uav(&none, LIGHT));
     }
 
+    #[test]
+    fn the_searches_read_every_unordered_access_slot_and_every_table_slot() {
+        let mut l = layout();
+        l.uavs.insert(0, UavBinding::Root { param: 2, at: 8 });
+        l.uavs.push(UavBinding::Table { param: 0, at: 0, first: 60, count: 2 });
+        let uavs = uav_places(&l);
+        assert_eq!(uavs.len(), 26, "the root view is no table slot");
+        assert_eq!((uavs[0], uavs[2], uavs[23], uavs[24], uavs[25]), ((1, 0), RADIANCE, (1, 23 * 8), (0, 60 * 8), (0, 61 * 8)));
+        assert!(uavs.contains(&LIGHT) && uavs.contains(&AIR) && !uavs.contains(&DEPTH));
+        l.tables = vec![64, u32::MAX, 0];
+        let all = table_places(&l);
+        assert_eq!(all.len(), 64 + 1024, "a table without a known end: its first 1024 slots");
+        assert!(all.contains(&DEPTH) && all.contains(&LIGHT) && all.iter().all(|p| p.0 < 2));
+        l.tables = vec![u32::MAX, u32::MAX, 0];
+        assert_eq!(table_places(&l).len(), 2048);
+        let wide = Layout { uavs: vec![UavBinding::Table { param: 1, at: 4, first: 0, count: u32::MAX }], ..layout() };
+        assert_eq!(uav_places(&wide).len(), SCAN_SLOTS, "a search reads at most SCAN_SLOTS");
+    }
+
+    #[test]
+    fn a_search_takes_the_one_view_and_guesses_only_where_the_pass_reads() {
+        let (uint, float) = (DXGI_FORMAT_R32_UINT.0, DXGI_FORMAT_R11G11B10_FLOAT.0);
+        let flat = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+        let small = ((1, 8), Viewed { index: 50, ..viewed(float, 640, 360, 1, flat) });
+        let large = ((1, 40), Viewed { index: 52, ..viewed(float, 1280, 720, 1, flat) });
+        assert!(choose(Role::Radiance, &[]).unwrap_err().contains("no view"));
+        assert_eq!(choose(Role::Resolve, &[small]), Ok(small));
+        assert_eq!(choose(Role::Radiance, &[small, large]), Ok(large), "the light of visible surfaces is only read: the largest");
+        let two = choose(Role::Resolve, &[small, large]).unwrap_err();
+        assert!(two.contains("2 views") && two.contains("root parameter 1, dword 8") && two.contains("root parameter 1, dword 40"), "{two}");
+        assert!(choose(Role::Air, &[small, large]).is_err(), "nor the air's");
+        let depth = ((0, 464), Viewed { index: 60, ..viewed(DXGI_FORMAT_R32_TYPELESS.0, 1280, 720, 1, flat) });
+        let r32f = ((0, 8), Viewed { index: 62, ..viewed(DXGI_FORMAT_R32_FLOAT.0, 1280, 720, 1, flat) });
+        let other = ((0, 16), Viewed { index: 64, ..viewed(uint, 1280, 720, 1, flat) });
+        assert_eq!(choose_depth(&[r32f, depth, other]), Ok(depth), "a depth format first");
+        assert_eq!(choose_depth(&[r32f, other]), Ok(r32f), "else the one 32-bit float image");
+        assert!(choose_depth(&[other]).unwrap_err().contains("no 2D view"));
+        assert!(choose_depth(&[depth, ((0, 24), Viewed { index: 66, ..depth.1 })]).unwrap_err().contains("2 depths"));
+        assert!(choose_depth(&[r32f, ((0, 32), Viewed { index: 68, ..r32f.1 })]).unwrap_err().contains("2 32-bit float"));
+        assert!(depth_like(DXGI_FORMAT_R24G8_TYPELESS.0) && depth_like(DXGI_FORMAT_D32_FLOAT.0) && !depth_like(DXGI_FORMAT_R32_FLOAT.0) && !depth_like(uint));
+    }
+
     fn view(format: i32, ty: ImageType, width: u32, height: u32, depth: u32) -> desc::Image {
         let format = desc::gfx10_format(windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT(format)).unwrap();
         desc::image(&desc::xcl_image_for_view(40, format, ty, width, height, depth, 1)).unwrap()
@@ -1020,27 +1314,40 @@ mod tests {
     }
 
     #[test]
+    fn the_light_kept_drops_nan_and_infinity_by_their_bits() {
+        assert!(!SOURCE.contains("isnan") && !SOURCE.contains("isinf"));
+        assert!(SOURCE.contains("any((bits & 0x7f800000u) == 0x7f800000u) ? 0.0"));
+        let dropped = |v: f32| v.to_bits() & 0x7f80_0000 == 0x7f80_0000;
+        assert!([f32::NAN, -f32::NAN, f32::INFINITY, f32::NEG_INFINITY, f32::from_bits(0x7f80_0001)].into_iter().all(dropped));
+        assert!(![0.0, -0.0, 1.0, f32::MAX, f32::MIN_POSITIVE, 1e-40].into_iter().any(dropped));
+    }
+
+    #[test]
     fn the_passes_cover_the_cells_the_points_and_the_image() {
         // the cells in groups of 8x4 threads, the points in groups of 8x2, the image in 8x8
         assert_eq!(schedule(Role::Radiance, false, [1280, 720], 1), [(KEEP, [8, 9, 1]), (MEAN, [1, 1, 1])]);
-        assert_eq!(schedule(Role::Resolve, false, [1280, 720], 1), [(PLACE, [8, 9, 1]), (GATHER, [20, 45, 1]), (RAISE, [160, 90, 1])]);
-        assert_eq!(schedule(Role::Resolve, false, [1281, 721], 1)[2], (RAISE, [161, 91, 1]));
+        assert_eq!(schedule(Role::Resolve, false, [1280, 720], 1), [(PLACE, [8, 9, 1]), (GATHER, [20, 45, 1]), (OWN, [1, 1, 1]), (RAISE, [160, 90, 1])]);
+        assert_eq!(schedule(Role::Resolve, false, [1281, 721], 1)[3], (RAISE, [161, 91, 1]));
         assert_eq!(schedule(Role::Resolve, true, [1280, 720], 1), [(RAISE, [160, 90, 1])]);
         assert_eq!(schedule(Role::Air, false, [160, 90], 65), [(CLEAR_AIR, [20, 12, 33])]);
-        assert_eq!((CELL_BYTES, POINT_BYTES), ((2 * 2304 + 1) * 16, 160 * 90 * 48));
+        assert_eq!((CELL_BYTES, POINT_BYTES), ((2 * 2304 + 2) * 16, 160 * 90 * 48));
+        assert!(SOURCE.contains("#define OWN_AT (2 * CELLS + 1)
+"), "the title's own light sits after the cells' places");
         assert_eq!(PARTS[KEEP], "KEEP");
         assert_eq!(PARTS[MEAN], "MEAN");
         assert_eq!(PARTS[PLACE], "PLACE");
         assert_eq!(PARTS[GATHER], "GATHER");
         assert_eq!(PARTS[RAISE], "RAISE");
         assert_eq!(PARTS[CLEAR_AIR], "AIR");
-        let words = constants(0.8, 0.0, [1.0, 0.6], 1.5, [1280, 720]);
-        assert_eq!(words, [0.8f32.to_bits(), 0, 1.0f32.to_bits(), 0.6f32.to_bits(), 0.1f32.to_bits(), 0.45f32.to_bits(), 1280, 720, 0.04f32.to_bits(), 4.0f32.to_bits(), 1.5f32.to_bits(), 0]);
+        assert_eq!(PARTS[OWN], "OWN");
+        let s = Settings { light: Set::Estimate(0.8), air: 1.5, shade: [1.0, 0.6], cap: 4.0, lowest: 0.5, fall: 0.04, bound: 1.0 };
+        let words = constants(0.8, 0.0, &s, [1280, 720]);
+        assert_eq!(words, [0.8f32.to_bits(), 0, 1.0f32.to_bits(), 0.6f32.to_bits(), 0.1f32.to_bits(), 0.45f32.to_bits(), 1280, 720, 0.04f32.to_bits(), 4.0f32.to_bits(), 1.5f32.to_bits(), 0.5f32.to_bits(), 0.04f32.to_bits(), 1.0f32.to_bits(), 0, 0]);
         // the sizes the programs are written for are the ones the buffers and the groups are
         for (name, value) in [("CX", CELLS[0]), ("CY", CELLS[1]), ("PX", POINTS[0]), ("PY", POINTS[1])] {
             assert!(SOURCE.contains(&format!("#define {name} {value}\n")), "{name}");
         }
-        assert!(SOURCE.contains("num32BitConstants=12"));
+        assert!(SOURCE.contains("num32BitConstants=16"));
     }
 
     /// The raise pass's unpack and pack (`SOURCE`), step for step in Rust, so that the packing

@@ -331,6 +331,7 @@ fn clear_dynamic_depth_bias(d: &mut [u8; GFX_DESC]) {
 static LINEAGE_DEPTH_WRITE_PSOS: Mutex<Option<std::collections::HashSet<usize>>> = Mutex::new(None);
 
 pub(super) fn note_lineage_depth_pso(pso: usize, enabled: bool, mask: D3D12_DEPTH_WRITE_MASK, func: D3D12_COMPARISON_FUNC) {
+    super::dsv_trace::pso(pso, enabled && mask == D3D12_DEPTH_WRITE_MASK_ALL && func != D3D12_COMPARISON_FUNC_NEVER);
     if super::depth_lineage::enabled() && pso != 0 && enabled
         && mask == D3D12_DEPTH_WRITE_MASK_ALL && func != D3D12_COMPARISON_FUNC_NEVER
     {
@@ -699,6 +700,12 @@ pub(super) unsafe extern "system" fn create_sampler_x(this: *mut c_void, x: *con
 /// the console resource desc (0x38 bytes, D3D12_RESOURCE_DESC) as a PC one: its tile layouts
 /// and console flag bits mean nothing to a PC driver
 pub fn pc_resource_desc(x: &[u8; 0x38]) -> [u8; 0x38] {
+    pc_resource_desc_for(x, super::castable::on())
+}
+
+/// `pc_resource_desc` with console R9G9B9E5 render targets and UAV textures made castable
+/// R11G11B10_FLOAT (`castable`, `super::castable`) or R16G16B16A16_FLOAT.
+pub fn pc_resource_desc_for(x: &[u8; 0x38], castable: bool) -> [u8; 0x38] {
     let mut d = *x;
     let dim = u32::from_le_bytes(d[0..4].try_into().unwrap());
     let mut flags = u32::from_le_bytes(d[0x30..0x34].try_into().unwrap());
@@ -727,9 +734,11 @@ pub fn pc_resource_desc(x: &[u8; 0x38]) -> [u8; 0x38] {
     }
     // R9G9B9E5_SHAREDEXP targets / UAV textures: the PC renders to and writes neither (a retail
     // game's Series S 1920x1080 one, flags 0x5: E_INVALIDARG, and the title threw) –
-    // R16G16B16A16_FLOAT holds the same values; the GPU's own, as above
-    if format == 67 && flags & 5 != 0 {
-        d[0x20..0x24].copy_from_slice(&10u32.to_le_bytes());
+    // R16G16B16A16_FLOAT holds the same values; the GPU's own, as above. `castable`:
+    // R11G11B10_FLOAT, 4 bytes a texel as on the console, castable to the title's R32_UINT and
+    // R9G9B9E5 views (`super::castable`)
+    if super::castable::rgb9e5_target(format, flags) {
+        d[0x20..0x24].copy_from_slice(&(if castable { 26u32 } else { 10 }).to_le_bytes());
     }
     // a depth buffer the console also lets shaders write (a retail game's: ALLOW_DEPTH_STENCIL |
     // ALLOW_UNORDERED_ACCESS): the PC refuses the pair – the depth buffer stays
@@ -768,12 +777,17 @@ fn depth_typeless(f: u32) -> Option<u32> {
 }
 
 /// The format of a render target / depth view or pipeline on the PC: `pc_view_format`, a
-/// B5G5R5A1 / B4G4R4A4 target is R8G8B8A8 and an R9G9B9E5 one R16G16B16A16_FLOAT
-/// (`pc_resource_desc`).
+/// B5G5R5A1 / B4G4R4A4 target is R8G8B8A8 and an R9G9B9E5 one R16G16B16A16_FLOAT, or
+/// R11G11B10_FLOAT when castable (`pc_resource_desc`).
 pub fn pc_target_format(f: u32) -> u32 {
+    pc_target_format_for(f, super::castable::on())
+}
+
+/// `pc_target_format` with R9G9B9E5 targets castable R11G11B10_FLOAT (`castable`) or not.
+pub fn pc_target_format_for(f: u32, castable: bool) -> u32 {
     match f {
         86 | 115 => 28,
-        67 => 10,
+        67 => if castable { 26 } else { 10 },
         f => pc_view_format(f),
     }
 }
@@ -798,6 +812,17 @@ pub fn pc_shader_view_format(resource: u32, view: u32) -> u32 {
         (28, 86 | 115) => 28,
         // a target made R16G16B16A16_FLOAT
         (10, 67) => 10,
+        (_, v) => v,
+    }
+}
+
+/// The format of a render target or UAV view (`view`) of a resource whose PC format is
+/// `resource`: `pc_shader_view_format`, and with castable R9G9B9E5 targets (`castable`,
+/// `super::castable`) R9G9B9E5 - which the PC writes in neither way - the R11G11B10_FLOAT of
+/// the resource.
+pub fn pc_written_view_format(resource: u32, view: u32, castable: bool) -> u32 {
+    match (resource, pc_shader_view_format(resource, view)) {
+        (26, 67) if castable => 26,
         (_, v) => v,
     }
 }
@@ -1020,6 +1045,7 @@ pub(super) unsafe extern "system" fn create_placed_resource_layout_x(
         return E_NOTIMPL;
     }
     let x = desc.cast::<[u8; 0x38]>().read_unaligned();
+    let _castable = super::castable::Scope::enter(Some(&x));
     let d = pc_resource_desc(&x);
     let pc = d.as_ptr().cast::<D3D12_RESOURCE_DESC>().read_unaligned();
     if matches!(pc.Dimension, D3D12_RESOURCE_DIMENSION_TEXTURE1D | D3D12_RESOURCE_DIMENSION_TEXTURE2D | D3D12_RESOURCE_DIMENSION_TEXTURE3D) {
@@ -1110,6 +1136,7 @@ pub(super) unsafe extern "system" fn create_placed_resource_x(this: *mut c_void,
         return E_INVALIDARG;
     }
     let x: [u8; 0x38] = (desc as *const [u8; 0x38]).read_unaligned();
+    let _castable = super::castable::Scope::enter(Some(&x));
     let d = pc_resource_desc(&x);
     let buffer = u32::from_le_bytes(d[0..4].try_into().unwrap()) == D3D12_RESOURCE_DIMENSION_BUFFER.0 as u32;
     note_alias(va as usize, &x);
@@ -1452,6 +1479,28 @@ mod tests {
         assert_eq!(pc_shader_view_format(86, 86), 86, "a B5G5R5A1 texture that stayed one");
         assert_eq!((pc_shader_view_format(10, 67), pc_shader_view_format(67, 67), pc_target_format(67)), (10, 67, 10));
         assert_eq!((pc_target_format(86), pc_target_format(118), pc_view_format(117)), (28, 45, 10));
+    }
+
+    /// XCL_RGB9E5_CASTABLE: a console R9G9B9E5 render target or UAV texture is R11G11B10_FLOAT,
+    /// 4 bytes a texel; its shader views keep the title's R32_UINT and R9G9B9E5, its render target
+    /// and UAV views in R9G9B9E5 are R11G11B10_FLOAT. Off (and in tests): as before.
+    #[test]
+    fn castable_rgb9e5_targets_are_r11g11b10() {
+        let mut x = [0u8; 0x38];
+        x[0] = 3;
+        x[0x20] = 67;
+        let format = |x: &[u8; 0x38], castable| u32::from_le_bytes(pc_resource_desc_for(x, castable)[0x20..0x24].try_into().unwrap());
+        for flags in [0x1u32, 0x4, 0x5, 0x30_0005] {
+            x[0x30..0x34].copy_from_slice(&flags.to_le_bytes());
+            assert_eq!((format(&x, false), format(&x, true)), (10, 26), "{flags:#x}");
+            assert_eq!(pc_resource_desc(&x), pc_resource_desc_for(&x, false));
+        }
+        x[0x30..0x34].copy_from_slice(&0u32.to_le_bytes());
+        assert_eq!((format(&x, false), format(&x, true)), (67, 67));
+        assert_eq!((pc_target_format_for(67, false), pc_target_format_for(67, true), pc_target_format_for(86, true)), (10, 26, 28));
+        assert_eq!((pc_shader_view_format(26, 42), pc_shader_view_format(26, 67), pc_shader_view_format(26, 26)), (42, 67, 26));
+        assert_eq!((pc_written_view_format(26, 67, true), pc_written_view_format(26, 42, true), pc_written_view_format(26, 26, true)), (26, 42, 26));
+        assert_eq!((pc_written_view_format(26, 67, false), pc_written_view_format(10, 67, true), pc_written_view_format(44, 45, true)), (67, 10, 46));
     }
 
     #[test]

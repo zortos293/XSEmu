@@ -281,6 +281,28 @@ pub(super) struct Plan {
     pub strict_pool: bool,
     /// keys go to the pool children as the memory allows (`with_env`, `Follow`)
     pub follow: Option<Follow>,
+    /// the giants get their children only once every pool key is done (`with_env`;
+    /// `XCL_WARM_GIANTS_LAST=0`: beside the pool). play-102w's hour: its one giant child finished
+    /// no giant (one ran past the 1,800 s timeout), took the RAM available from 22 GB to 2 to 4 GB
+    /// and held the pool back – no pool compile ran for 66% of the hour, and its 8 threads were
+    /// busy 25% of it – so 7,172 small keys took 3,572 s (2.0 keys/s) that its try1 checked at 14
+    /// to 34 keys/s with no giant running.
+    pub giants_last: bool,
+    /// the giants are left out of the pass, for the game's background builds (`with_env`;
+    /// `XCL_WARM_SKIP_GIANTS=1`; off by default): a pass that ends once the rest is ready
+    pub skip_giants: bool,
+    /// the pass stops itself when the RAM available stays under `URGENT_FLOOR` and this for
+    /// `LOW_GRACE` (`with_env`; `XCL_WARM_LOW_MB`, 512 by default; 0: off): its single-key
+    /// children are killed first, then, still under it, its pool children; their keys are left for
+    /// the next pass, neither suspect nor bad. The 102m test at 8 pool children ended at 168 MB
+    /// available in the run's own guard, which kills the whole process tree.
+    pub low_memory: Option<u64>,
+    /// at most this many children started and not yet ready (no hello) at once (`with_env`;
+    /// `XCL_WARM_STARTS`, 2 by default; 0: no limit). A child's device creation maps NVIDIA's
+    /// shader cache (58 GB of DXCache on the PC) and holds ~20 GB of it until it is trimmed:
+    /// play-102o's 8 pool children starting together took the RAM available from 24.6 to 8.7 GB,
+    /// and one giant child starting took it from 21.6 to 1.8 GB, where the pass stopped itself.
+    pub starts: Option<usize>,
 }
 
 /// The pool children are fed as the memory allows (`XCL_WARM_FOLLOW_MEMORY=0`: as their workers
@@ -307,6 +329,9 @@ pub(super) fn governor_margin() -> u64 {
 /// How long a key's memory is taken not to show in the memory available yet (`Follow`).
 pub(super) const FRESH: Duration = Duration::from_secs(10);
 
+/// How long the RAM available stays low before the pass sheds children (`Plan::low_memory`).
+const LOW_GRACE: Duration = Duration::from_secs(2);
+
 impl Plan {
     pub(super) fn new(options: &ChildOptions, cores: usize) -> Plan {
         let cores = cores.max(1);
@@ -323,6 +348,10 @@ impl Plan {
             dxc_set: None,
             strict_pool: false,
             follow: None,
+            giants_last: false,
+            skip_giants: false,
+            low_memory: None,
+            starts: None,
         }
     }
 
@@ -339,6 +368,10 @@ impl Plan {
         let threads = number("XCL_WARM_POOL_THREADS").map(|n| n.clamp(1, 64) as usize).or(self.dxc_set);
         self.pool_threads = threads.map_or(self.pool_threads, |n| self.pool_threads.min(n));
         self.strict_pool = on("XCL_WARM_STRICT_POOL");
+        self.giants_last = on("XCL_WARM_GIANTS_LAST");
+        self.skip_giants = number("XCL_WARM_SKIP_GIANTS").is_some_and(|n| n != 0);
+        self.low_memory = Some(number("XCL_WARM_LOW_MB").unwrap_or(512).min(64 << 10) << 20).filter(|&b| b != 0);
+        self.starts = Some(number("XCL_WARM_STARTS").unwrap_or(2).min(64) as usize).filter(|&n| n != 0);
         self.follow = on("XCL_WARM_FOLLOW_MEMORY").then(|| Follow {
             margin: number("XCL_WARM_MARGIN_MB").unwrap_or(2048).min(64 << 10) << 20,
             per_key: number("XCL_WARM_KEY_MB").unwrap_or(512).clamp(64, 16 << 10) << 20,
@@ -458,6 +491,12 @@ pub(super) struct Stats {
     pub mismatched: usize,
     /// keys pool children handed back as giants
     pub handed: usize,
+    /// giants left out of the pass (`Plan::skip_giants`)
+    pub giants_left: usize,
+    /// times the pass killed children for the RAM available (`Plan::low_memory`), and the RAM
+    /// available the last time
+    pub memory_sheds: usize,
+    pub shed_at: u64,
     /// steps in which the pool children were given fewer keys than their workers had room for,
     /// for the memory (`Follow`)
     pub memory_holds: usize,
@@ -472,6 +511,8 @@ enum Killed {
     Aborted,
     /// its hello named another translation or driver than the first child's
     Mismatch,
+    /// the RAM available stayed low (`Plan::low_memory`)
+    Memory,
 }
 
 /// A key's time in flight, its waits for memory left out (`Msg::Wait`, `Msg::Go`).
@@ -566,6 +607,8 @@ pub(super) struct Coordinator {
     aborted: Option<String>,
     /// since when the next giant has waited for memory with no giant compiling in the table
     giant_waiting: Option<Instant>,
+    /// since when the RAM available has been under `Plan::low_memory`
+    low_since: Option<Instant>,
     pub(super) stats: Stats,
 }
 
@@ -586,6 +629,7 @@ impl Coordinator {
             identity: None,
             aborted: None,
             giant_waiting: None,
+            low_since: None,
             stats: Stats::default(),
         }
     }
@@ -607,7 +651,11 @@ impl Coordinator {
     pub(super) fn set_jobs(&mut self, jobs: Vec<Job>) {
         for job in jobs {
             if self.jobs.insert(job.key, job).is_none() {
-                if job.giant { &mut self.giants } else { &mut self.pool }.push_back(job.key);
+                if job.giant && self.plan.skip_giants {
+                    self.stats.giants_left += 1;
+                } else {
+                    if job.giant { &mut self.giants } else { &mut self.pool }.push_back(job.key);
+                }
             }
         }
         self.known = true;
@@ -639,6 +687,11 @@ impl Coordinator {
     pub(super) fn children(&self) -> (usize, usize) {
         let pool = self.children.values().filter(|c| c.lane == Lane::Pool).count();
         (pool, self.children.len() - pool)
+    }
+
+    /// Another child may be started: fewer than `Plan::starts` are starting (not said hello).
+    fn may_start(&self) -> bool {
+        self.plan.starts.is_none_or(|most| self.children.values().filter(|c| c.killed.is_none() && !c.hello).count() < most)
     }
 
     fn requeue(&mut self, key: u64, retry: bool) {
@@ -739,7 +792,7 @@ impl Coordinator {
             }
             return Vec::new();
         }
-        if matches!(c.killed, Some(Killed::Aborted | Killed::Mismatch)) || !c.hello {
+        if matches!(c.killed, Some(Killed::Aborted | Killed::Mismatch | Killed::Memory)) || !c.hello {
             for &key in running.iter().rev() {
                 self.requeue(key, c.retry);
             }
@@ -802,6 +855,7 @@ impl Coordinator {
                 c.killed = Some(Killed::Hung { key: hung });
             }
         }
+        self.shed_for_memory(now, room);
         if self.aborted.is_some() {
             for c in self.children.values_mut().filter(|c| c.killed.is_none()) {
                 c.killed = Some(Killed::Aborted);
@@ -831,6 +885,31 @@ impl Coordinator {
         let gate = self.start_singles(now, room, &mut actions);
         self.feed_pool(now, gate, room, &mut actions);
         actions
+    }
+
+    /// The RAM available under `Plan::low_memory` for `LOW_GRACE`: the pass stops, its single-key
+    /// children are killed, and if it stays low for another `LOW_GRACE` its pool children too.
+    fn shed_for_memory(&mut self, now: Instant, room: &Room) {
+        let Some(low) = self.plan.low_memory else { return };
+        if room.available >= super::real::URGENT_FLOOR.saturating_add(low) {
+            self.low_since = None;
+            return;
+        }
+        if now.duration_since(*self.low_since.get_or_insert(now)) < LOW_GRACE {
+            return;
+        }
+        let singles = self.children.values().any(|c| c.lane == Lane::Single && c.killed.is_none());
+        let shed: Vec<&mut Child> = self.children.values_mut().filter(|c| c.killed.is_none() && (c.lane == Lane::Single || !singles)).collect();
+        if shed.is_empty() {
+            return;
+        }
+        for c in shed {
+            c.killed = Some(Killed::Memory);
+        }
+        self.stopping = true;
+        self.low_since = Some(now);
+        self.stats.memory_sheds += 1;
+        self.stats.shed_at = room.available;
     }
 
     /// Keys the pool children may be given now (`Follow`; unlimited without it).
@@ -893,6 +972,11 @@ impl Coordinator {
                 }
             };
             let job = self.jobs.get(&key).copied().unwrap_or(Job { key, guest: 0, giant: false, dxil: None });
+            let pool_busy = || !self.pool.is_empty() || self.children.values().any(|c| c.lane == Lane::Pool && c.killed.is_none() && c.outstanding() > 0);
+            if !retry && self.plan.giants_last && pool_busy() {
+                self.giant_waiting = None;
+                return false;
+            }
             if job.giant && !giant_fits(job.peak().saturating_add(self.plan.margin()), &room) {
                 if room.usage.giants != 0 {
                     self.giant_waiting = None;
@@ -903,6 +987,9 @@ impl Coordinator {
                 let published = room.usage.reserved.saturating_sub(pending);
                 let drained = room.available.saturating_add(published).saturating_add(held).saturating_sub(pending);
                 return waited >= GIANT_PATIENCE || drained >= job.peak().saturating_add(super::real::URGENT_FLOOR);
+            }
+            if !self.may_start() {
+                return false;
             }
             if job.giant {
                 self.giant_waiting = None;
@@ -958,7 +1045,7 @@ impl Coordinator {
         }
         // (strict: a pool child told to end still counts until it has exited)
         let counted = |c: &Child| c.lane == Lane::Pool && if plan.strict_pool { c.killed.is_none() } else { c.live() };
-        while !gate && !self.pool.is_empty() && self.children.values().filter(|c| counted(c)).count() < plan.pool_children {
+        while !gate && !self.pool.is_empty() && self.children.values().filter(|c| counted(c)).count() < plan.pool_children && self.may_start() {
             let spawn = self.spawn(Lane::Pool, now);
             let Action::Spawn { child, .. } = spawn else { unreachable!() };
             actions.push(spawn);
@@ -1058,7 +1145,16 @@ pub(super) fn run(plan: Plan, spawner: &mut dyn Spawner, pass: &mut dyn Pass) ->
             coordinator.stop();
         }
         pass.tick(&coordinator);
+        let sheds = coordinator.stats.memory_sheds;
         actions = coordinator.step(Instant::now(), &pass.room());
+        if coordinator.stats.memory_sheds > sheds {
+            eprintln!(
+                "warm-up --blocking: stopping: {} MiB RAM available, under the floor and XCL_WARM_LOW_MB for {} s; {} children killed, their keys left for the next pass",
+                coordinator.stats.shed_at >> 20,
+                LOW_GRACE.as_secs(),
+                actions.iter().filter(|a| matches!(a, Action::Kill { .. })).count()
+            );
+        }
     }
     match coordinator.aborted() {
         Some(why) => Err(why.to_string()),
@@ -1490,6 +1586,22 @@ mod tests {
         assert_eq!(p.follow, Some(Follow { margin: 3 << 30, per_key: 1 << 30 }));
     }
 
+    /// play-102o: 8 pool children starting together took the RAM available from 24.6 to 8.7 GB.
+    #[test]
+    fn at_most_starts_children_start_before_their_hello() {
+        let env = |pairs: &'static [(&'static str, &'static str)]| move |name: &str| pairs.iter().find(|(k, _)| *k == name).map(|(_, v)| v.to_string());
+        assert_eq!(Plan::new(&ChildOptions::default(), 24).with_env(env(&[])).starts, Some(2));
+        assert_eq!(Plan::new(&ChildOptions::default(), 24).with_env(env(&[("XCL_WARM_STARTS", "0")])).starts, None);
+        let now = Instant::now();
+        let mut c = started(Plan { pool_children: 4, starts: Some(1), ..plan() }, small(0..40), now);
+        assert_eq!(spawned(&c.step(now, &ROOMY)), [(1, Lane::Pool)]);
+        assert_eq!(spawned(&c.step(now, &ROOMY)), [], "the next waits for its hello");
+        c.on_msg(1, hello(), now);
+        assert_eq!(spawned(&c.step(now, &ROOMY)), [(2, Lane::Pool)]);
+        let mut c = started(Plan { pool_children: 4, ..plan() }, small(0..40), now);
+        assert_eq!(spawned(&c.step(now, &ROOMY)), [(1, Lane::Pool), (2, Lane::Pool), (3, Lane::Pool)], "no limit: all at once");
+    }
+
     /// play-102: each pass hit the RAM stop as a replacement pool child started beside the one it
     /// replaced (3 pool children with 2 asked for, 2 to 3 with 1). Strict, the replacement starts
     /// once the old one has exited.
@@ -1609,6 +1721,53 @@ mod tests {
         let a = c.step(now, &ROOMY);
         assert_eq!(spawned(&a), [(3, Lane::Single)], "the slow one next");
         assert_eq!(keys_sent(&a, 3), [4]);
+    }
+
+    /// The giants wait until every pool key is done (`Plan::giants_last`), then get their children.
+    #[test]
+    fn giants_wait_for_the_pool_s_keys_when_last() {
+        let now = Instant::now();
+        let jobs = vec![Job::new(1, 50_000, None), Job::new(2, 1000, None), Job::new(3, 1000, None)];
+        let mut c = started(Plan { giants_last: true, ..plan() }, jobs, now);
+        let a = c.step(now, &ROOMY);
+        assert!(spawned(&a).is_empty(), "no giant child while pool keys wait");
+        assert_eq!(keys_sent(&a, 0), [2, 3]);
+        c.on_msg(0, Msg::Start { key: 2 }, now);
+        c.on_msg(0, Msg::Done(done(2)), now);
+        assert!(spawned(&c.step(now, &ROOMY)).is_empty(), "nor while one is in flight");
+        c.on_msg(0, Msg::Start { key: 3 }, now);
+        c.on_msg(0, Msg::Done(done(3)), now);
+        let a = c.step(now, &ROOMY);
+        assert_eq!(spawned(&a), [(1, Lane::Single)], "then the giant");
+        assert_eq!(keys_sent(&a, 1), [1]);
+        let jobs = vec![Job::new(1, 50_000, None), Job::new(2, 1000, None)];
+        let mut c = started(Plan { skip_giants: true, ..plan() }, jobs, now);
+        assert_eq!(keys_sent(&c.step(now, &ROOMY), 0), [2]);
+        assert_eq!((c.not_started(), c.stats.giants_left), (0, 1), "XCL_WARM_SKIP_GIANTS=1: the giant is left out");
+    }
+
+    /// RAM available under the floor and `Plan::low_memory` for `LOW_GRACE`: the giant child is
+    /// killed and the pass stops; still low, the pool child too; the keys are left, not suspects.
+    #[test]
+    fn low_memory_sheds_the_giant_then_the_pool_and_stops() {
+        let now = Instant::now();
+        let jobs = vec![Job::new(1, 50_000, None), Job::new(2, 1000, None), Job::new(3, 1000, None)];
+        let mut c = started(Plan { low_memory: Some(512 << 20), ..plan() }, jobs, now);
+        let a = c.step(now, &ROOMY);
+        assert_eq!(spawned(&a), [(1, Lane::Single)]);
+        c.on_msg(1, hello(), now);
+        c.on_msg(0, Msg::Start { key: 2 }, now);
+        let low = Room { available: super::super::real::URGENT_FLOOR + (100 << 20), usage: Usage::default() };
+        assert!(!c.step(now, &low).iter().any(|a| matches!(a, Action::Kill { .. })), "not before LOW_GRACE");
+        let a = c.step(now + LOW_GRACE, &low);
+        assert!(a.contains(&Action::Kill { child: 1 }) && !a.contains(&Action::Kill { child: 0 }), "the giant child first");
+        assert_eq!(c.stats.memory_sheds, 1);
+        assert!(c.on_exit(1, false, "killed").is_empty(), "its key is neither suspect nor bad");
+        let a = c.step(now + 2 * LOW_GRACE, &low);
+        assert!(a.contains(&Action::Kill { child: 0 }), "then the pool child");
+        assert!(c.on_exit(0, false, "killed").is_empty());
+        assert!(c.finished(), "the pass stops");
+        assert_eq!((c.stats.bad, c.stats.retried), (0, 0));
     }
 
     /// A giant child started holds its peak and `CHILD_BASELINE` until its compile shows in the

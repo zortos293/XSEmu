@@ -54,6 +54,7 @@
 pub mod dxc;
 pub(crate) mod emit;
 pub mod mesh_dispatch;
+mod kept_pages;
 mod wave_pack;
 pub mod mesh_wave;
 pub mod x64_masks;
@@ -73,6 +74,8 @@ mod quad_read_tests;
 #[cfg(test)]
 mod page_split_tests;
 #[cfg(test)]
+mod compact_access_tests;
+#[cfg(test)]
 mod page_group_tests;
 #[cfg(test)]
 mod rt_miss_tests;
@@ -84,10 +87,17 @@ mod permute_tests;
 mod rect_corner_tests;
 #[cfg(test)]
 mod thread_limit_tests;
+#[cfg(test)]
+mod loop_guard_tests;
+#[cfg(test)]
+mod lane_independent_tests;
 pub mod upper_lanes;
 mod loop_profile;
 mod structure;
 mod lane_guards;
+mod lane_independent;
+#[cfg(test)]
+mod lane_independent_form_tests;
 pub use loop_profile::{loop_profile_enabled, LOOP_PROFILE_SITES, LOOP_PROFILE_WORDS};
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -228,6 +238,16 @@ pub const IO_PHYSICAL_TABLE: usize = 118;
 /// a3e820d8 (PR #2610, the dispatch) and 12758ed0 (nvidia-dev, the prologue).
 pub const IO_THREAD_LIMIT: [usize; 3] = [119, 120, 121];
 const _: () = assert!(IO_THREAD_LIMIT[1] == IO_THREAD_LIMIT[0] + 1 && IO_THREAD_LIMIT[2] == IO_THREAD_LIMIT[0] + 2);
+/// io slots (trap-temp range) of a compute dispatch spread past D3D12's 65,535 groups on an axis
+/// (`dispatch_spread`): the console's x and y group counts (0: not spread). Such a dispatch
+/// launches `GROUP_SPREAD_WIDTH` x ceil(x * y / `GROUP_SPREAD_WIDTH`) x z groups. Every compute
+/// prologue reads the two at once (one 8-byte load: they must stay consecutive), numbers its group
+/// n = gid.x + `GROUP_SPREAD_WIDTH` * gid.y on the console's x-y plane, leaves (the whole group)
+/// when n is at or past x * y, and runs as console group (n % x, n / x, gid.z).
+pub const IO_GROUP_SPREAD: [usize; 2] = [122, 123];
+const _: () = assert!(IO_GROUP_SPREAD[1] == IO_GROUP_SPREAD[0] + 1 && IO_GROUP_SPREAD[0] > IO_THREAD_LIMIT[2]);
+/// groups along x of a spread dispatch (`IO_GROUP_SPREAD`): D3D12_CS_DISPATCH_MAX_THREAD_GROUPS_PER_DIMENSION
+pub const GROUP_SPREAD_WIDTH: u32 = 65535;
 
 /// Shader and native gather/scatter ABI. `va` is the normalized guest byte address (low, high).
 /// The result is the absolute raw UAV index and its byte offset, including on direct UMA.
@@ -578,6 +598,11 @@ pub struct Options {
     /// them (`upper_lanes`). No effect on wave32 programs.
     pub split_wave64: bool,
     pub legacy_compute_wave64: bool,
+    /// a wave64 compute program every lane of which computes on its own (`lane_independent`),
+    /// for a GPU with 32-lane waves: one console lane per host thread, without `WaveSize`,
+    /// ballots and lane reads. `emit_program` decides it from the program; what a caller sets
+    /// is not read
+    pub lane_independent: bool,
     pub compute_per_access_coherence: bool,
     pub bvh_node_fix: bool,
     /// ray tracing off as "every ray misses" (`rt_all_miss`): an `image_bvh(64)_intersect_ray` reads no
@@ -587,6 +612,9 @@ pub struct Options {
     /// compute: the launch EXEC leaves out the lanes past a `DispatchX` with thread dimensions'
     /// per-axis thread counts (io[`IO_THREAD_LIMIT`]; `dispatch_thread_dimensions`)
     pub thread_limits: bool,
+    /// compute: the prologue runs a dispatch spread past 65,535 groups on an axis as the console's
+    /// groups (io[`IO_GROUP_SPREAD`]; `dispatch_spread`)
+    pub group_spread: bool,
     pub loop_profile: bool,
     pub guard_trip_counters: bool,
     /// first register (space 1) of the program's static samplers (another stage of the same
@@ -596,6 +624,10 @@ pub struct Options {
     /// then exactly the single-window form); 2..4 add `mem1`.. (u3..) and pick the window of
     /// every access from the high address bits
     pub mem_windows: u32,
+    /// a compute program's memory functions stay inline whatever its size (`emit::outline_from`):
+    /// the form without calls, whose DXIL size decides whether the program is outlined
+    /// (`pso::outline_budget`)
+    pub no_outline: bool,
     /// structured control flow when the program allows it (false, or `XCL_RECOMP_NO_STRUCTURED`:
     /// always the guarded block chain)
     pub structured: bool,
@@ -642,13 +674,39 @@ pub fn code_data(f: &super::xbox::Fssm, p: &super::xbox::Program) -> Option<Code
 
 impl Default for Options {
     fn default() -> Self {
-        Options { mode: Mode::Kernel, wave64: true, hw_wave: 0, split_wave64: false, legacy_compute_wave64: legacy_compute_wave64(), compute_per_access_coherence: compute_per_access_coherence(), bvh_node_fix: bvh_node_fix(), rt_all_miss: rt_all_miss(), thread_limits: dispatch_thread_dimensions(), loop_profile: false, guard_trip_counters: true, static_sampler_base: 0, mem_windows: 1, structured: true, exec_proof: true, nan_guards: true, mesh_native: None, code_data: None }
+        Options { mode: Mode::Kernel, wave64: true, hw_wave: 0, split_wave64: false, legacy_compute_wave64: legacy_compute_wave64(), lane_independent: false, compute_per_access_coherence: compute_per_access_coherence(), bvh_node_fix: bvh_node_fix(), rt_all_miss: rt_all_miss(), thread_limits: dispatch_thread_dimensions(), group_spread: dispatch_spread(), loop_profile: false, guard_trip_counters: true, static_sampler_base: 0, mem_windows: 1, no_outline: false, structured: true, exec_proof: true, nan_guards: true, mesh_native: None, code_data: None }
     }
 }
 
 pub(super) fn legacy_compute_wave64() -> bool {
     static LEGACY: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *LEGACY.get_or_init(|| std::env::var("XCL_COMPUTE_WAVE64_LEGACY").is_ok_and(|v| v.trim() == "1"))
+}
+
+#[cfg(test)]
+thread_local! {
+    /// tests: the lane-independent form is taken on this thread. The tests of the packed and
+    /// the split form translate programs that qualify for it, and keep getting those forms.
+    pub(super) static LANE_INDEPENDENT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(test)]
+thread_local! {
+    /// tests: translations on this thread spread their groups (`dispatch_spread`). Off, the
+    /// interpreter's generated io words would hold a spread nothing launched, and every group
+    /// past the first would leave.
+    pub(super) static GROUP_SPREAD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// `XCL_RECOMP_NO_LANE_INDEPENDENT`: every wave64 compute program keeps the packed or the split
+/// form, with the HLSL it had before there was a lane-independent one. A translation-time
+/// setting, in the translated cache's identity (`pso::translated::identity`).
+pub(super) fn lane_independent_enabled() -> bool {
+    #[cfg(test)]
+    if !LANE_INDEPENDENT.get() {
+        return false;
+    }
+    std::env::var_os("XCL_RECOMP_NO_LANE_INDEPENDENT").is_none()
 }
 
 pub(super) fn compute_per_access_coherence() -> bool {
@@ -739,6 +797,19 @@ pub fn dispatch_thread_dimensions() -> bool {
     *ENABLED.get_or_init(|| std::env::var("XCL_DISPATCH_THREAD_DIMENSIONS").map_or(true, |v| v.trim() != "0"))
 }
 
+/// `XCL_DISPATCH_SPREAD` (default on; 0: off): a compute dispatch with more than 65,535 groups on
+/// an axis (D3D12's limit; the console has none) runs spread over x and y (io[`IO_GROUP_SPREAD`])
+/// instead of capped or passed on. Part of the translation cache's identity (the compute prologue
+/// differs).
+pub fn dispatch_spread() -> bool {
+    #[cfg(test)]
+    if !GROUP_SPREAD.get() {
+        return false;
+    }
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var("XCL_DISPATCH_SPREAD").map_or(true, |v| v.trim() != "0"))
+}
+
 pub(super) fn compute_wave64_pack_max_insts() -> usize {
     static LIMIT: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *LIMIT.get_or_init(|| std::env::var("XCL_COMPUTE_WAVE64_PACK_MAX_INSTS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(32_768))
@@ -764,6 +835,11 @@ pub struct MeshNative {
 pub struct Translation {
     pub hlsl: String,
     packed_compute: bool,
+    /// a compute program `emit::outline_from` names: its memory functions are outlined unless
+    /// `Options::no_outline` keeps them inline
+    pub outline_candidate: bool,
+    /// the program got the lane-independent form (`Options::lane_independent`)
+    pub lane_independent: bool,
     /// instructions we cannot translate yet (mnemonic → count); the HLSL still compiles,
     /// these become comments
     pub unsupported: BTreeMap<String, usize>,
@@ -777,8 +853,10 @@ pub struct Translation {
     /// console root signature's static samplers): (S#, comparison), register
     /// `static_sampler_base + i` in space 1
     pub static_samplers: Vec<([u32; 4], bool)>,
-    /// loops that may run longer than `loop_guard` in a working program (`long_loops`)
+    /// loops that may run longer than `loop_budget` gives one in a working program (`long_loops`)
     pub long_loops: Vec<String>,
+    /// the program's loop budget (`loop_budget`; None only in a default value)
+    pub loop_budget: Option<LoopBudget>,
 }
 
 impl Translation {
@@ -795,6 +873,8 @@ struct Ctx<'a> {
     terms: &'a [Term],
     loops: &'a [(u64, u64)],
     loop_profile: loop_profile::Sites,
+    /// loops being emitted around the code being written (`Ctx::loop_enter`)
+    loop_nest: std::cell::Cell<usize>,
     /// every branch: (address of the branch, target)
     edges: &'a [(u64, u64)],
     /// `structurable_to` results: (lo, hi, exit) → targets leaving the range
@@ -847,25 +927,179 @@ fn why(_at: u64, msg: &str) {
     }
 }
 
+impl Ctx<'_> {
+    /// Before an emitted loop. One in no other loop is a loop region (upstream's are the
+    /// outermost of `loop_ranges`; the same loops in the `pc` chain, the outermost natural loops
+    /// in the structured form): control only moves forward between regions, so each is entered
+    /// once, here, where a program with region budgets gives it its own (`LOOP_REGION_ENTER`).
+    fn loop_enter(&self, em: &emit::Em, body: &mut String, pad: &str) {
+        let outermost = self.loop_nest.replace(self.loop_nest.get() + 1) == 0;
+        if outermost && matches!(em.loop_budget, LoopBudget::Regions { .. }) {
+            body.push_str(&format!("{pad}{LOOP_REGION_ENTER}\n"));
+        }
+    }
+
+    /// After the loop `loop_enter` opened.
+    fn loop_leave(&self, em: &emit::Em, body: &mut String, pad: &str) {
+        self.loop_nest.set(self.loop_nest.get() - 1);
+        if self.loop_nest.get() == 0 && matches!(em.loop_budget, LoopBudget::Regions { .. }) {
+            body.push_str(&format!("{pad}{LOOP_REGION_LEAVE}\n"));
+        }
+    }
+}
+
 /// (lo, hi, exit, nest, loop head of `continue`, targets entering the range)
 type MemoKey = (u64, u64, Option<u64>, usize, Option<u64>, Vec<u64>);
 
 /// At the top of every emitted loop: a lane's loop iterations are capped (`xcl_budget`, in
-/// the prelude: `loop_guard`) – console code that loops on what XCL passed it wrong (an address, a
+/// the prelude: `loop_budget`) – console code that loops on what XCL passed it wrong (an address, a
 /// count) must not keep the PC GPU busy for minutes (a process with such work in flight cannot
-/// even be terminated). If any active lane has spent its budget, the whole
-/// hardware wave leaves before the next iteration.
-const LOOP_GUARD: &str = "if (WaveActiveAnyTrue(xcl_budget == 0u)) { xcl_trip(0u); break; } xcl_budget -= min(xcl_budget, 1u);";
+/// even be terminated). A lane that has spent its budget leaves before the next iteration.
+///
+/// The test is the lane's own. Every branch of console code is scalar, so the lanes of a console
+/// wave take the same path and count the same guards: their budgets are equal, the lane's own
+/// test is the wave's, and the wave leaves together where the liveness passes expect it to
+/// (`x64_masks::GuardExits`). That holds in every form: a native or packed wave is one
+/// hardware wave; the halves of a split wave64 are two, which a wave operation never spanned
+/// anyway; and a mesh group's lanes are one console wave however the host cuts it into waves.
+/// Budgets differ only between console waves: the two wave32 halves of a 64-lane hardware wave
+/// (`xcl_w32`) each leave by their own count, and a pixel shader's helper lane – which wave
+/// operations leave out, and give undefined results in – is stopped by its own count too, where
+/// `LOOP_GUARD_WAVE` could leave it looping after the live lanes had gone.
+const LOOP_GUARD: &str = "if (xcl_budget == 0u) { xcl_trip(0u); break; } xcl_budget--;";
 
-/// `LOOP_GUARD` as a program has it: one that waits for other hardware waves by polling
-/// (`emit::Em::waits`) also reports the iteration as progress (`xcl_tick`).
+/// The guard of the base form (`XCL_RECOMP_NO_LOOP_REGIONS`, `LoopBudget::Wave`): if any active lane
+/// has spent its budget, the whole hardware wave leaves before the next iteration.
+const LOOP_GUARD_WAVE: &str = "if (WaveActiveAnyTrue(xcl_budget == 0u)) { xcl_trip(0u); break; } xcl_budget -= min(xcl_budget, 1u);";
+
+/// Before a loop region of a program with region budgets (`LoopBudget::Regions`): the region
+/// takes its budget out of what the lane has left for all its regions ...
+const LOOP_REGION_ENTER: &str = "xcl_budget = min(XCL_LOOP_REGION, xcl_btotal); xcl_btotal -= xcl_budget;";
+/// ... and after it gives back what it did not spend. So the loops themselves count one value,
+/// as with a single budget.
+const LOOP_REGION_LEAVE: &str = "xcl_btotal += xcl_budget;";
+
+/// A program with region budgets (`loop_regions`) gives each loop region this many times `loop_guard`: a
+/// title's own spin capped at one (0x10000 tries) must fit, also when it sits in an outer loop
+/// whose head spends from the same count (upstream ivall/xcl 287a931b).
+pub(super) const LOOP_BUDGETS_PER_REGION: u32 = 2;
+/// ... and all of its regions together at most this many: what stops a program that runs away.
+pub(super) const LOOP_BUDGETS_IN_ALL: u32 = 4;
+
+/// The loop iterations a lane of one program may run (`loop_budget`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LoopBudget {
+    /// The base form (`XCL_RECOMP_NO_LOOP_REGIONS`): this many in all its loops together, and the
+    /// hardware wave leaves a loop when any of its lanes has spent them (`LOOP_GUARD_WAVE`).
+    Wave(u32),
+    /// This many in all its loops together, each lane by its own count (`LOOP_GUARD`): what a
+    /// program has unless a switch says otherwise.
+    Lane(u32),
+    /// `XCL_LOOP_GUARD_REGIONS`, compute and kernel programs: `region` in each loop region – an
+    /// outermost loop with the loops in it, counted anew when it is entered – and `total` in all
+    /// regions together.
+    Regions { region: u32, total: u32 },
+}
+
+impl LoopBudget {
+    /// The most iterations one loop can get: a loop with a longer static bound is cut short
+    /// (`long_loops`).
+    pub fn of_a_loop(self) -> u32 {
+        match self {
+            LoopBudget::Wave(n) | LoopBudget::Lane(n) => n,
+            LoopBudget::Regions { region, .. } => region,
+        }
+    }
+
+    /// The `#define`s the prelude's counters start from.
+    pub(super) fn defines(self) -> String {
+        match self {
+            LoopBudget::Wave(n) | LoopBudget::Lane(n) => format!("#define XCL_LOOP_GUARD {n}u\n"),
+            LoopBudget::Regions { region, total } => format!("#define XCL_LOOP_REGION {region}u\n#define XCL_LOOP_TOTAL {total}u\n"),
+        }
+    }
+}
+
+/// `LOOP_GUARD` of the lane-independent form: a thread is alone, and leaves alone.
+const LOOP_GUARD_LANE: &str = "if (xcl_budget == 0u) { xcl_trip(0u); break; } xcl_budget -= 1u;";
+
+#[cfg(test)]
+thread_local! {
+    /// tests: the base form's loop guard (`XCL_RECOMP_NO_LOOP_REGIONS`) on this thread
+    pub(super) static NO_LOOP_REGIONS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// tests: region budgets (`XCL_LOOP_GUARD_REGIONS`) on this thread
+    pub(super) static LOOP_REGIONS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// `XCL_RECOMP_NO_LOOP_REGIONS` set: every program has the wave-wide guard it had before
+/// (`LoopBudget::Wave`), the same HLSL byte for byte, whatever `XCL_LOOP_GUARD_REGIONS` says.
+/// Unset: loops are guarded by the lane's own test (`LOOP_GUARD`).
+fn wave_wide_loop_guard() -> bool {
+    #[cfg(test)]
+    if NO_LOOP_REGIONS.get() {
+        return true;
+    }
+    std::env::var_os("XCL_RECOMP_NO_LOOP_REGIONS").is_some()
+}
+
+/// `XCL_LOOP_GUARD_REGIONS` set (and not 0): a compute or kernel program spends its budget by
+/// loop region (`LoopBudget::Regions`). Only where asked for: a lane may then run
+/// `LOOP_BUDGETS_IN_ALL` times the iterations `loop_guard` gives it, and a title with loops that
+/// run to whatever budget they get is slower for every iteration more (a retail run with a guard
+/// of 65 536 instead of 1 024: 5 s a frame).
+fn loop_regions() -> bool {
+    #[cfg(test)]
+    if LOOP_REGIONS.get() {
+        return true;
+    }
+    std::env::var("XCL_LOOP_GUARD_REGIONS").is_ok_and(|v| v.trim() != "0")
+}
+
+/// The loop budget of a program (its instructions, the stage it is translated for): the one
+/// place a translation's budget comes from – the prelude's counters, the guards, the named long
+/// loops (`long_loops`) and the log all take it from here, so a class of programs that must not
+/// loop for long can be given less by returning its budget here (e.g. ray-tracing programs,
+/// those with an `image_bvh_intersect_ray` / `image_bvh64_intersect_ray`, whose traversal
+/// loops only end on a hit: upstream's 512 where every ray is made to miss).
+///
+/// Every program takes `loop_guard` (`XCL_LOOP_GUARD`) for all its loops together, each lane by
+/// its own count (`LoopBudget::Lane`): no lane runs more iterations than that, as before.
+///
+/// With `XCL_LOOP_GUARD_REGIONS` a compute or kernel program spends it by loop region instead
+/// (upstream ivall/xcl 287a931b, scoped by 22c5f68c): `LOOP_BUDGETS_PER_REGION` of it in each,
+/// `LOOP_BUDGETS_IN_ALL` in all, so that a spin of the title's own that gives up after 0x10000
+/// tries leaves the loops after it their iterations (a retail FSR pass otherwise published a
+/// flag made from a register its main loop never set). Graphics, geometry and mesh programs keep
+/// one budget then too: upstream's run with region budgets in every stage hung an NVIDIA GPU
+/// 580 s into a title's world, where a pixel shader loop that ran away had four budgets to spend
+/// instead of one, and ran to the end with this scope. (Its other reason, an AMD compiler crash
+/// on the loop-carried values the regions added to mesh loop headers, does not apply here:
+/// `LOOP_REGION_ENTER` keeps them out of the loops.)
+pub(super) fn loop_budget(_insts: &[Decoded], mode: &Mode) -> LoopBudget {
+    let guard = loop_guard();
+    if wave_wide_loop_guard() {
+        return LoopBudget::Wave(guard);
+    }
+    match mode {
+        Mode::Compute(_) | Mode::Kernel if loop_regions() => LoopBudget::Regions { region: guard.saturating_mul(LOOP_BUDGETS_PER_REGION), total: guard.saturating_mul(LOOP_BUDGETS_IN_ALL) },
+        _ => LoopBudget::Lane(guard),
+    }
+}
+
+/// The guard (`LOOP_GUARD`) as a program has it: one that waits for other hardware waves by
+/// polling (`emit::Em::waits`) also reports the iteration as progress (`xcl_tick`).
 fn loop_guard_line(em: &emit::Em) -> String {
-    format!("{LOOP_GUARD}{}", if em.waits() { " xcl_tick();" } else { "" })
+    if em.lane_independent() {
+        return LOOP_GUARD_LANE.into();
+    }
+    let guard = if matches!(em.loop_budget, LoopBudget::Wave(_)) { LOOP_GUARD_WAVE } else { LOOP_GUARD };
+    format!("{guard}{}", if em.waits() { " xcl_tick();" } else { "" })
 }
 
 /// `XCL_LOOP_GUARD`: the loop iterations a lane may run, all its loops together (65 536 unless
-/// set). A translation-time setting: it is in the HLSL (`#define XCL_LOOP_GUARD`, so in the
-/// DXIL cache's key) and in the translated cache's identity (`pso::translated::identity`).
+/// set; `loop_budget` makes a program's budget of it). A translation-time
+/// setting: it is in the HLSL (`LoopBudget::defines`, so in the DXIL cache's key) and in the
+/// translated cache's identity (`pso::translated::identity`).
 pub fn loop_guard() -> u32 {
     static GUARD: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
     *GUARD.get_or_init(|| std::env::var("XCL_LOOP_GUARD").ok().and_then(|v| v.trim().parse().ok()).filter(|&n| n > 0).unwrap_or(1 << 16))
@@ -873,8 +1107,8 @@ pub fn loop_guard() -> u32 {
 
 /// The loops that may run more than `guard` iterations in a working program, as text: every
 /// loop but those whose latch compares a counter (set to a constant before the loop, stepped
-/// by a constant once in it) with a constant no more than `guard` steps away. A loop the
-/// guard cuts short leaves its results unfinished.
+/// by a constant once in it) with a constant no more than `guard` steps away (`LoopBudget::of_a_loop`).
+/// A loop the guard cuts short leaves its results unfinished.
 pub(super) fn long_loops(insts: &[Decoded], guard: u32) -> Vec<String> {
     loop_bounds(insts).filter_map(|(a, b, cmp, bound)| match bound {
         Some(n) if n <= guard as u64 => None,
@@ -1285,6 +1519,7 @@ fn emit_structured(
         }
         let raised: BTreeSet<u64> = match it {
             Item::Loop { a, b, latch, entry } => {
+                c.loop_enter(em, body, &ipad);
                 let probe = c.loop_profile.probe(a, b);
                 probe.before(body, &ipad);
                 body.push_str(&format!("{ipad}[loop] for (;;) {{\n"));
@@ -1313,6 +1548,7 @@ fn emit_structured(
                 }
                 body.push_str(&format!("{ipad}}}\n"));
                 probe.after(body, &ipad);
+                c.loop_leave(em, body, &ipad);
                 r
             }
             Item::If { start, end, t, u } => {
@@ -1415,6 +1651,7 @@ fn emit_nodes(c: &Ctx, cfg: &structure::Cfg, em: &mut emit::Em, body: &mut Strin
                 body.push_str(&format!("{pad}}}\n"));
             }
             Node::Loop { header, body: inner } => {
+                c.loop_enter(em, body, pad);
                 let probe = c.loop_profile.probe(cfg.start[*header], cfg.loop_end(*header));
                 probe.before(body, pad);
                 body.push_str(&format!("{pad}[loop] for (;;) {{\n"));
@@ -1422,6 +1659,7 @@ fn emit_nodes(c: &Ctx, cfg: &structure::Cfg, em: &mut emit::Em, body: &mut Strin
                 emit_nodes(c, cfg, em, body, inner, depth + 1, blocks);
                 body.push_str(&format!("{pad}}}\n"));
                 probe.after(body, pad);
+                c.loop_leave(em, body, pad);
             }
             Node::Set(f) => body.push_str(&format!("{pad}{} = true;\n", flag_name(cfg, *f))),
             Node::Clear(f) => body.push_str(&format!("{pad}{} = false;\n", flag_name(cfg, *f))),
@@ -1476,6 +1714,7 @@ fn emit_range(c: &Ctx, em: &mut emit::Em, body: &mut String, lo: u64, hi: u64, d
         let start = c.leaders[i];
         let inner = c.loops.iter().filter(|&&(a, b)| a == start && b <= hi && (a, b) != (lo, hi)).max_by_key(|x| x.1).copied();
         if let Some((a, b)) = inner {
+            c.loop_enter(em, body, &pad);
             let probe = c.loop_profile.probe(a, b);
             probe.before(body, &pad);
             body.push_str(&format!("{pad}[loop] while (pc >= {a}u && pc < {b}u) {{\n"));
@@ -1483,6 +1722,7 @@ fn emit_range(c: &Ctx, em: &mut emit::Em, body: &mut String, lo: u64, hi: u64, d
             emit_range(c, em, body, a, b, depth + 1, blocks, flags);
             body.push_str(&format!("{pad}}}\n"));
             probe.after(body, &pad);
+            c.loop_leave(em, body, &pad);
             i = c.leaders.partition_point(|&l| l < b);
             continue;
         }
@@ -1803,6 +2043,7 @@ struct DecodedProgram<'a> {
     static_samplers: BTreeMap<u64, [u32; 4]>,
     fmt_regs: BTreeSet<u64>,
     max_vgpr: u64,
+    loop_budget: LoopBudget,
     long_loops: Vec<String>,
 }
 
@@ -1858,8 +2099,40 @@ fn decode_program<'a>(code: &'a [u8], opt: &Options) -> Result<DecodedProgram<'a
         let (r, w) = rdna2::vgpr_uses(d);
         r.into_iter().chain(w)
     }).max().unwrap_or(0);
-    let long_loops = long_loops(&insts, loop_guard());
-    Ok(DecodedProgram { code, insts, starts, leaders, branches, gs_jump, static_samplers, fmt_regs, max_vgpr, long_loops })
+    let loop_budget = loop_budget(&insts, &opt.mode);
+    let long_loops = long_loops(&insts, loop_budget.of_a_loop());
+    Ok(DecodedProgram { code, insts, starts, leaders, branches, gs_jump, static_samplers, fmt_regs, max_vgpr, loop_budget, long_loops })
+}
+
+/// The census of the lane-independent form (`lane_independent`): one line per wave64 compute
+/// program translated for a GPU with 32-lane waves, saying whether every lane of it computes on
+/// its own, or the first instruction that keeps it on the wave form and why; counted in
+/// `dxc::stage_summary`. An instrumented translation of a program is not a second program.
+fn lane_census(code: &[u8], insts: &[Decoded], opt: &Options) -> Option<lane_independent::Proof> {
+    let verdict = lane_independent::classify(insts, opt);
+    if matches!(&verdict, Err(r) if r.rule == lane_independent::Rule::Instrumented) {
+        // what is profiled or gated is a wave form of the program, not the form it runs in
+        if !opt.legacy_compute_wave64 && lane_independent_enabled() && lane_independent::prove(insts).is_ok() {
+            crate::xlog_info!("[SHADER] compute code {:016x}: instrumented translation (loop profile, material gate) in a wave form; without the instrument the program runs lane-independent", super::shader::fnv64(code));
+        }
+        return None;
+    }
+    // the legacy form translated again for a program that was already counted (`pso`'s packed
+    // or legacy choice, the overrides)
+    if !opt.legacy_compute_wave64 {
+        dxc::note_lane_census(verdict.is_ok());
+    }
+    let hash = super::shader::fnv64(code);
+    match verdict {
+        Ok(proof) => {
+            crate::xlog_info!("[SHADER] compute code {hash:016x}: lane-independent census: qualifies ({} mask branches, {} first-lane reads proved)", proof.mask_branches, proof.first_lane_reads);
+            Some(proof)
+        }
+        Err(reject) => {
+            crate::xlog_info!("[SHADER] compute code {hash:016x}: lane-independent census: keeps the wave form: {reject}");
+            None
+        }
+    }
 }
 
 pub fn translate(code: &[u8], opt: &Options) -> Result<Translation, String> {
@@ -1867,13 +2140,46 @@ pub fn translate(code: &[u8], opt: &Options) -> Result<Translation, String> {
 }
 
 fn emit_program(program: &DecodedProgram<'_>, opt: &Options) -> Result<Translation, String> {
+    // resolutions kept across blocks (`kept_pages`): a first translation notes the scalar loads,
+    // the second follows the plan made from them
+    if !(matches!(opt.mode, Mode::Compute(_)) && opt.mem_windows > 1 && emit::keep_pages()) {
+        return emit_program_with(program, opt, Default::default(), &mut None, true);
+    }
+    let mut first = Some(kept_pages::Record::default());
+    emit_program_with(program, opt, Default::default(), &mut first, false)?;
+    let mut record = first.unwrap_or_default();
+    loop {
+        let kept = kept_pages::plan(&program.insts, &record);
+        // the text that follows the plan answers for itself: a write of the plan that this text
+        // lets nothing follow is closed for the next plan, until a plan holds in its own text
+        let writes: Vec<u64> = kept.after.keys().copied().collect();
+        let mut second = Some(kept_pages::Record::default());
+        let translation = emit_program_with(program, opt, kept, &mut second, true)?;
+        let closed = second.unwrap_or_default().closed;
+        let unfollowed: Vec<u64> = writes.into_iter().filter(|pc| closed.contains(pc)).collect();
+        if unfollowed.is_empty() {
+            return Ok(translation);
+        }
+        record.closed.extend(unfollowed);
+    }
+}
+
+/// `emit_program` with the kept resolutions of `kept`, taking the notes for them in `record` (the
+/// loads matter of a translation without a plan, the closed writes of any). `log`: the one
+/// translation of a program that says which form it has.
+fn emit_program_with(program: &DecodedProgram<'_>, opt: &Options, kept: kept_pages::Plan, record: &mut Option<kept_pages::Record>, log: bool) -> Result<Translation, String> {
     let DecodedProgram { code, insts, starts, leaders, branches, gs_jump, .. } = program;
     let (branches, gs_jump) = (*branches, *gs_jump);
     let mut em_options = opt.clone();
     if matches!(opt.mode, Mode::Compute(_)) {
+        // the lane-independent form before the packed and the split one: it needs no wave of
+        // the host at all. The legacy override is a request for the split form.
+        let proved = opt.wave64 && opt.split_wave64 && lane_census(code, insts, opt).is_some();
+        em_options.lane_independent = proved && !opt.legacy_compute_wave64 && lane_independent_enabled();
         let path = match (opt.wave64, opt.split_wave64) {
             (false, _) => "native-wave32",
             (true, false) => "native-wave64",
+            (true, true) if em_options.lane_independent => "lane-independent",
             (true, true) if opt.legacy_compute_wave64 => "legacy-wave64 override",
             (true, true) if insts.len() > compute_wave64_pack_max_insts() => {
                 em_options.legacy_compute_wave64 = true;
@@ -1881,11 +2187,21 @@ fn emit_program(program: &DecodedProgram<'_>, opt: &Options) -> Result<Translati
             }
             (true, true) => "packed-wave64 candidate",
         };
-        crate::xlog_info!("[SHADER] compute code {:016x}: {path}, {} guest instructions (pack limit {})", super::shader::fnv64(code), insts.len(), compute_wave64_pack_max_insts());
+        if log {
+            crate::xlog_info!("[SHADER] compute code {:016x}: {path}, {} guest instructions (pack limit {})", super::shader::fnv64(code), insts.len(), compute_wave64_pack_max_insts());
+        }
+    } else {
+        em_options.lane_independent = false;
     }
+    let lane_independent = em_options.lane_independent;
     let mut em = emit::Em::new(em_options);
+    em.kept = kept;
+    em.kept_record = record.take();
     em.configure_round_modes(insts, branches == 0);
+    // xsemu: from xcl-dev/xcl nvidia-dev 9b455a1a,67a08dbe crates/xcl/src/gpu/recomp/mod.rs
+    em.writes_lds = emit::lds_order_wanted() && emit::writes_lds(insts);
     em.static_ss = program.static_samplers.clone();
+    em.loop_budget = program.loop_budget;
     em.code_loads = opt.code_data.as_ref().is_some_and(|data| !data.words.is_empty())
         && insts.iter().any(|d| d.inst.name == "S_GETPC_B64");
     // the program's blocks and, when the graph is reducible, its structured form
@@ -1921,9 +2237,12 @@ fn emit_program(program: &DecodedProgram<'_>, opt: &Options) -> Result<Translati
             .collect(),
         None => x64_masks::range_exits(insts),
     };
+    if let Some(record) = &mut em.kept_record {
+        record.guard = guard.clone();
+    }
     // split wave64: masks only read lane by lane skip the halves' exchange (geometry mode
     // continues from the ES into the GS through s_setpc: left as it is)
-    if opt.wave64 && opt.split_wave64 && !em.packed_compute() && matches!(opt.mode, Mode::Kernel | Mode::Compute(_) | Mode::Mesh(_)) && std::env::var_os("XCL_X64_ALL_MASKS").is_none() {
+    if opt.wave64 && opt.split_wave64 && !em.packed_compute() && !lane_independent && matches!(opt.mode, Mode::Kernel | Mode::Compute(_) | Mode::Mesh(_)) && std::env::var_os("XCL_X64_ALL_MASKS").is_none() {
         em.x64_whole_live = x64_masks::by_pc(insts, matches!(opt.mode, Mode::Kernel), &guard);
     }
     em.fmt_regs = program.fmt_regs.clone();
@@ -1951,8 +2270,10 @@ fn emit_program(program: &DecodedProgram<'_>, opt: &Options) -> Result<Translati
     }
     let mut body = String::new();
     let mut blocks = 0usize;
+    let kept_at_entry = em.keep_pages_at_entry();
     if branches == 0 {
         // straight line: stop at the first s_endpgm (the rest is unreachable)
+        body.push_str(&kept_at_entry);
         em.indent = 1;
         for (i, d) in insts.iter().enumerate() {
             let next = insts.get(i + 1).map(|n| n.pc).unwrap_or(u64::MAX);
@@ -1966,7 +2287,7 @@ fn emit_program(program: &DecodedProgram<'_>, opt: &Options) -> Result<Translati
         let loop_profile = loop_profile::Sites::new(insts, opt.loop_profile && matches!(opt.mode, Mode::Compute(_)));
         let edges: Vec<(u64, u64)> = insts.iter().filter_map(|d| rdna2::branch_target(d).map(|t| (d.pc, t))).collect();
         let loops = if structured.is_some() { Vec::new() } else { loop_ranges(insts) };
-        let ctx = Ctx { insts, starts, leaders: &leaders, terms: &terms, loops: &loops, loop_profile, edges: &edges, memo: Default::default() };
+        let ctx = Ctx { insts, starts, leaders: &leaders, terms: &terms, loops: &loops, loop_profile, loop_nest: Default::default(), edges: &edges, memo: Default::default() };
         let mut code = String::new();
         if let Some((cfg, nodes)) = &structured {
             emit_nodes(&ctx, cfg, &mut em, &mut code, nodes, 1, &mut blocks);
@@ -1997,14 +2318,16 @@ fn emit_program(program: &DecodedProgram<'_>, opt: &Options) -> Result<Translati
                 body.push_str(&format!("    bool {} = false;\n", skip_flag(t)));
             }
         }
+        body.push_str(&kept_at_entry);
         body.push_str(&code);
     }
+    *record = em.kept_record.take();
     if let Some(why) = em.mesh_native_blocker() {
         return Err(format!("not a host mesh shader: {why}"));
     }
     let hlsl = em.finish(&body);
     let static_samplers = em.static_used.clone();
-    Ok(Translation { hlsl, packed_compute: em.packed_compute(), unsupported: em.unsupported, unsupported_why: em.unsupported_why, ignored: em.ignored, instructions: insts.len(), blocks, static_samplers, long_loops: program.long_loops.clone() })
+    Ok(Translation { hlsl, packed_compute: em.packed_compute(), lane_independent, outline_candidate: em.outline_candidate, unsupported: em.unsupported, unsupported_why: em.unsupported_why, ignored: em.ignored, instructions: insts.len(), blocks, static_samplers, long_loops: program.long_loops.clone(), loop_budget: Some(program.loop_budget) })
 }
 
 #[cfg(test)]

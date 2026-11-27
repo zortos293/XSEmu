@@ -314,6 +314,7 @@ pub(super) unsafe extern "system" fn pc_copy_simple(this:*mut c_void,n:u32,dst:u
     copied(this,ty,1,&dst,&n,1,&src,&n);
 }
 unsafe fn record_dsv_clear(this:*mut c_void,h:usize,flags:u32,d:f32,s:u8,n:u32,p:*const RECT){
+    super::super::dsv_trace::clear(h,flags);
     record(this,||{
         if flags & !3 != 0 {return Err("unknown DSV clear flags")}
         clear(h,Clear::DepthStencil{depth:(flags&1!=0).then_some(d),stencil:(flags&2!=0).then_some(s)},n,p)

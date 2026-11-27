@@ -356,6 +356,21 @@ struct PacketIndirect {
 }
 
 static LISTS: Mutex<Option<HashMap<usize, ListState>>> = Mutex::new(None);
+/// The descriptor tables each list's last translation bound (`close`): its PC list holds their
+/// pages' places until the list is closed again or is gone (`tables_live`).
+static TABLES: Mutex<Option<HashMap<usize, super::console_heap::Tables>>> = Mutex::new(None);
+
+/// The tables of every console list that has a translation, and how many of them bound any.
+pub fn tables_live() -> (super::console_heap::Tables, usize) {
+    let (mut all, mut lists) = (super::console_heap::Tables::default(), 0);
+    if let Some(m) = TABLES.lock().unwrap().as_ref() {
+        for t in m.values().filter(|t| !t.is_empty()) {
+            all.join(t);
+            lists += 1;
+        }
+    }
+    (all, lists)
+}
 /// unified-memory blocks of finished recordings, freed when their allocator is reset
 static PENDING: Mutex<Option<HashMap<usize, Vec<usize>>>> = Mutex::new(None);
 
@@ -447,6 +462,9 @@ unsafe extern "system" fn cl_release(this: *mut c_void) -> u32 {
     })
     .unwrap_or(0);
     if left == 0 {
+        if let Some(m) = TABLES.lock().unwrap().as_mut() {
+            m.remove(&obj);
+        }
         if let Some(st) = LISTS.lock().unwrap().as_mut().and_then(|m| m.remove(&obj)) {
             free_uma(&st.uma);
             super::markers::recording_ended(st.pc);
@@ -814,6 +832,9 @@ pub unsafe fn close(obj: *mut c_void) -> Result<Translation, String> {
     // the first dispatch when the title binds none
     let mut heaps_bound = false;
     let mut bound_heaps = Vec::new();
+    if super::console_heap::keeping() {
+        TABLES.lock().unwrap().get_or_insert_with(HashMap::new).entry(obj).or_default().clear();
+    }
     let texture_operations = std::mem::take(&mut st.texture_operations);
     let chunks: Vec<Vec<u32>> = st.chunks.iter().map(|(c, used)| c[..*used].chunks(4).map(|b| u32::from_le_bytes(b.try_into().unwrap())).collect()).collect();
     'chunks: for (chunk, words) in chunks.iter().enumerate() {
@@ -1053,7 +1074,11 @@ pub unsafe fn close(obj: *mut c_void) -> Result<Translation, String> {
                     }
                     Some(Param::Table { at: o }) => {
                         let o = o as usize;
-                        super::console_heap::table_bound(get(1), layout.as_ref().and_then(|l| l.tables.get(i).copied()).unwrap_or(u32::MAX));
+                        let slots = layout.as_ref().and_then(|l| l.tables.get(i).copied()).unwrap_or(u32::MAX);
+                        if let Some(kept) = TABLES.lock().unwrap().as_mut().and_then(|m| m.get_mut(&obj)) {
+                            kept.note(get(1), slots);
+                        }
+                        super::console_heap::table_bound(get(1), slots);
                         if let Some(t) = table.get_mut(o..o + 4) {
                             t.copy_from_slice(&get(1).to_le_bytes());
                         }

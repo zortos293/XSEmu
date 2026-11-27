@@ -44,6 +44,10 @@ pub(super) struct Em {
     ps_done: bool,
     /// LDS used (compute): declare the groupshared array
     uses_lds: bool,
+    // xsemu: from xcl-dev/xcl nvidia-dev 9b455a1a,67a08dbe crates/xcl/src/gpu/recomp/emit.rs
+    /// the program writes LDS (`writes_lds`) and keeps the split wave64 LDS order
+    /// (`XCL_X_LDS_ORDER`): in that form its LDS accesses keep the console wave's order (`xcl_x_lw`)
+    pub writes_lds: bool,
     /// scratch_* used: declare the per-lane private memory
     uses_scratch: bool,
     /// split wave64 (`x64`): words one exchange carries (1: masks and lane reads, up to 16:
@@ -109,8 +113,19 @@ pub(super) struct Em {
     page_groups: bool,
     /// the page groups of the block being written
     groups: Vec<PageGroup>,
+    /// the resolutions kept across blocks (`kept_pages`; none: every group ends with its block)
+    pub kept: super::kept_pages::Plan,
+    /// the notes a first translation takes for that plan
+    pub kept_record: Option<super::kept_pages::Record>,
+    /// blocks of the text that have ended so far
+    blocks_ended: usize,
     /// the program's memory functions are kept out of line (`outlined`)
     outline: bool,
+    /// `outline_from` names the program: outlined unless `Options::no_outline`
+    pub(super) outline_candidate: bool,
+    /// the program's loop budget (`super::loop_budget`): the prelude's counters and the form
+    /// of the loop guards
+    pub(super) loop_budget: super::LoopBudget,
 }
 
 /// Loads whose addresses are one base (unchanged registers `sgprs` / `vgprs`, `key`) plus a
@@ -126,15 +141,22 @@ struct PageGroup {
     /// declared
     name: Option<String>,
     /// until then: where the declaration goes (before the first load's calls), its indent, the
-    /// anchor address, and the first load's calls (method, address) to give the group to
+    /// anchor address, and the first load's calls to give the group to: each call's text, and
+    /// the text it becomes through the group's pages and through the folded ones (`{G}`: the
+    /// group's name)
     at: usize,
     indent: usize,
     anchor_addr: String,
-    calls: Vec<(String, String)>,
+    calls: Vec<(String, String, String)>,
+    /// the constant offset of the load being written from the anchor
+    delta: i64,
+    /// the loads read through the folded pages (`group_fold`): `{name}_s` is the anchor's offset
+    /// in its page, `{name}_z` the page of its low word
+    fold: bool,
 }
 
 /// Instructions without an effect in this execution model.
-const NOOPS: &[&str] = &[
+pub(super) const NOOPS: &[&str] = &[
     "s_nop", "s_waitcnt", "s_waitcnt_vscnt", "s_waitcnt_vmcnt", "s_waitcnt_expcnt", "s_waitcnt_lgkmcnt", "s_waitcnt_depctr",
     "s_inst_prefetch", "s_clause", "s_code_end", "s_setprio", "s_sleep", "s_icache_inv", "s_dcache_inv", "s_gl1_inv", "s_ttracedata",
     "s_ttracedata_imm", "v_nop", "s_denorm_mode", "s_sendmsg", "s_sendmsghalt",
@@ -854,7 +876,7 @@ thread_local! {
     pub(super) static OUTLINE_FLAT: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
 }
 
-const OUTLINE_STATICS_DEFAULT: bool = false;
+const OUTLINE_STATICS_DEFAULT: bool = true;
 const OUTLINE_FLAT_DEFAULT: bool = false;
 const OUTLINE_ATOMICS_DEFAULT: OutlineAtomics = OutlineAtomics::All;
 
@@ -863,7 +885,7 @@ const OUTLINE_ATOMICS_DEFAULT: OutlineAtomics = OutlineAtomics::All;
 pub(super) const OUTLINE_RESULT_STATICS: &str = "static uint xcl_ret_uint_0;\nstatic uint xcl_ret_uint_1;\nstatic uint xcl_ret_uint_2;\nstatic uint xcl_ret_uint_3;\nstatic uint64_t xcl_ret_uint64_t_0;\nstatic int xcl_ret_int_0;\nstatic int64_t xcl_ret_int64_t_0;\n";
 
 /// `XCL_RECOMP_OUTLINE_RESULTS=static|out`: an outlined function hands its results back through
-/// statics (`OUTLINE_RESULT_STATICS`) or through `out` parameters. An `out` parameter of a function
+/// statics (`OUTLINE_RESULT_STATICS`, the default) or through `out` parameters. An `out` parameter of a function
 /// DXIL keeps is a pointer, so its caller keeps a stack slot for every result of every call (1,342
 /// in one title program of 866 calls); a static is one per-thread word however many calls there are.
 pub(super) fn outline_statics() -> bool {
@@ -907,7 +929,9 @@ pub(super) fn outline_atomics() -> OutlineAtomics {
 }
 
 /// Guest instructions from which a compute program gets its memory functions outlined
-/// (`outlined`): 1024, or `XCL_RECOMP_OUTLINE_MIN_INSTS`; never with `XCL_RECOMP_NO_OUTLINE`.
+/// (`outlined`): 1024, or `XCL_RECOMP_OUTLINE_MIN_INSTS`; never with `XCL_RECOMP_NO_OUTLINE`. A
+/// run's build of a console program outlines such a program only when it is over the outline
+/// budget without calls (`pso::outline_budget`).
 fn outline_from(insts: usize) -> bool {
     #[cfg(test)]
     if let Some(on) = OUTLINE.get() {
@@ -1073,6 +1097,139 @@ fn accessor_shrink() -> bool {
 
 #[cfg(test)]
 thread_local! {
+    /// tests: the page resolution and the accessors of the earlier form
+    /// (`XCL_RECOMP_NO_COMPACT_ACCESS`) on this thread
+    pub(super) static NO_COMPACT_ACCESS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// The accessors of several windows in their compact form (`compact_accessors`). The direct
+/// backend inlines an accessor at every access, so the world's compute programs carried the page
+/// walk and both load paths some thousands of times each: megabytes of DXIL the driver did not
+/// finish compiling. The compact form computes the same views and offsets with one resolution
+/// and one load site per accessor. `XCL_RECOMP_NO_COMPACT_ACCESS`: the earlier text, byte for
+/// byte. The four-address group load of the compact form is that of `accessor_shrink`, so
+/// without the shrink the earlier form stays too.
+fn compact_access() -> bool {
+    #[cfg(test)]
+    if NO_COMPACT_ACCESS.get() {
+        return false;
+    }
+    accessor_shrink() && std::env::var_os("XCL_RECOMP_NO_COMPACT_ACCESS").is_none()
+}
+
+#[cfg(test)]
+thread_local! {
+    /// tests: a load of 8 or 16 dwords as a call for every four (`XCL_RECOMP_NO_LOAD_LOOP`) on
+    /// this thread
+    pub(super) static NO_LOAD_LOOP: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// A load of 8 or 16 dwords (`s_buffer_load_dwordx8` / `x16`, `s_load_dwordx8` / `x16`) reads
+/// four dwords a call, and the direct backend inlines every call: one program of the world is 236
+/// loads of 16 dwords, 944 copies of the four-address load. With several windows the calls of a
+/// load are one call in a loop of 2 or 4 turns, with the addresses and the results they had.
+/// `XCL_RECOMP_NO_LOAD_LOOP`: a call for every four dwords, as before. It is a part of the
+/// compact form, so `XCL_RECOMP_NO_COMPACT_ACCESS` turns it off too. A program with outlined
+/// accessors (`Em::outline`) keeps its calls: there a call is all a load costs at its place,
+/// and the loop around it only adds to that.
+fn load_loop() -> bool {
+    #[cfg(test)]
+    if NO_LOAD_LOOP.get() {
+        return false;
+    }
+    compact_access() && std::env::var_os("XCL_RECOMP_NO_LOAD_LOOP").is_none()
+}
+
+#[cfg(test)]
+thread_local! {
+    /// tests: a group's loads through `xcl_group_at` (`XCL_RECOMP_NO_GROUP_FOLD`) on this thread
+    pub(super) static NO_GROUP_FOLD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// A load of a page group lies at a constant offset from the group's anchor, so its page is the
+/// anchor's or the next by one add, and whether a page is read through the window's own view
+/// (the direct test) is the same for every load of the group. With the fold a group's
+/// declaration settles both for its two pages (`Fold`), and a load is a select between them and
+/// its read (`LoadS`, `Load4S`, `Load4X`): no address arithmetic in 64 bits, no direct test and
+/// no `xcl_group_at` at the load. One program of the world has 1,035 such loads at 79 to 134
+/// instructions each. `XCL_RECOMP_NO_GROUP_FOLD`: the loads of the compact form before the fold.
+/// It is a part of the compact form, so `XCL_RECOMP_NO_COMPACT_ACCESS` turns it off too. A
+/// program with outlined accessors (`Em::outline`) is left as it was: its loads are calls, and
+/// the fold would only add its own code to each group.
+pub(super) fn group_fold() -> bool {
+    #[cfg(test)]
+    if NO_GROUP_FOLD.get() {
+        return false;
+    }
+    compact_access() && std::env::var_os("XCL_RECOMP_NO_GROUP_FOLD").is_none()
+}
+
+#[cfg(test)]
+thread_local! {
+    /// tests: a four-address load opens its group at once (`XCL_RECOMP_NO_LONE_LOADS`) on this
+    /// thread
+    pub(super) static NO_LONE_LOADS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// A four-address load (`xcl_loadx4`: two to four dwords of a buffer load) that is alone on its
+/// base keeps its accessor, and its group is declared when a second load joins it, like any other
+/// load's. It used to declare its group at once, from when the load was a call for each address;
+/// since the compact form it is one call with one resolution, and a group for it alone is a second
+/// one: 482 of the 567 groups a world shader still declares had this one load, each about 130
+/// instructions more than the load alone, or a call more where the accessors are outlined.
+/// `XCL_RECOMP_NO_LONE_LOADS`: such a load opens its group at once, as before. It is a part of the
+/// compact form, so `XCL_RECOMP_NO_COMPACT_ACCESS` turns it off too.
+pub(super) fn lone_loads() -> bool {
+    #[cfg(test)]
+    if NO_LONE_LOADS.get() {
+        return false;
+    }
+    compact_access() && std::env::var_os("XCL_RECOMP_NO_LONE_LOADS").is_none()
+}
+
+#[cfg(test)]
+thread_local! {
+    /// tests: every page group ends with its block (`XCL_RECOMP_NO_KEPT_PAGES`) on this thread
+    pub(super) static NO_KEPT_PAGES: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// The page resolution of a scalar load's base is kept across the blocks of a compute program
+/// with several windows while the base's registers are unwritten (`kept_pages`), where a group
+/// resolved it again in every block: a world shader reads its descriptor table through two
+/// registers it writes a dozen times, in several hundred blocks. `XCL_RECOMP_NO_KEPT_PAGES`: every
+/// group ends with its block, as before. It is a part of the compact form, so
+/// `XCL_RECOMP_NO_COMPACT_ACCESS` turns it off too.
+pub(super) fn keep_pages() -> bool {
+    #[cfg(test)]
+    if NO_KEPT_PAGES.get() {
+        return false;
+    }
+    compact_access() && std::env::var_os("XCL_RECOMP_NO_KEPT_PAGES").is_none()
+}
+
+/// A program with outlined accessors (`Em::outline`) keeps pages as well: a kept load is one call
+/// that walks no page, and the groups' resolutions in each block go, but its call passes the
+/// pages, which made the world shaders 1 % larger for 3 % fewer calls.
+/// `XCL_RECOMP_NO_KEPT_PAGES_OUTLINED`: such a program keeps none.
+fn keep_pages_outlined() -> bool {
+    std::env::var_os("XCL_RECOMP_NO_KEPT_PAGES_OUTLINED").is_none()
+}
+
+#[cfg(test)]
+thread_local! {
+    /// tests: the translation that follows a plan finds that no text can follow any of the
+    /// plan's writes (`kept_pages::Record::closed`), on this thread
+    pub(super) static KEPT_WRITES_CLOSE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(test)]
+thread_local! {
+    /// tests: the split wave64 form without its LDS order (`XCL_X_LDS_ORDER=0`) on this thread
+    pub(super) static NO_LDS_ORDER: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(test)]
+thread_local! {
     /// tests: the earlier 10-bit primitive index fields (`XCL_RECOMP_NO_PRIM9`) on this thread
     pub(super) static NO_PRIM9: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
@@ -1115,6 +1272,8 @@ impl Em {
     pub fn new(opt: Options) -> Self {
         let carry_check = opt.mem_windows > 1 && std::env::var("XCL_DS_VALIDATE").is_ok_and(|v| v != "0");
         let force_spin = opt.split_wave64 && std::env::var("XCL_WAVE64_SPIN").is_ok_and(|v| v.trim() != "0");
+        // (the mode's, until `emit_program` gives the program's)
+        let loop_budget = super::loop_budget(&[], &opt.mode);
         Em {
             opt,
             material_gate: super::pso::material_gate::current(),
@@ -1133,6 +1292,8 @@ impl Em {
             ps_modes: BTreeMap::new(),
             ps_done: false,
             uses_lds: false,
+            // xsemu: from xcl-dev/xcl nvidia-dev 9b455a1a,67a08dbe crates/xcl/src/gpu/recomp/emit.rs
+            writes_lds: false,
             uses_scratch: false,
             x64_words: 1,
             x64_whole_live: BTreeMap::new(),
@@ -1166,7 +1327,12 @@ impl Em {
             since_tick: 0,
             page_groups: page_groups(),
             groups: Vec::new(),
+            kept: Default::default(),
+            kept_record: None,
+            blocks_ended: 0,
             outline: false,
+            outline_candidate: false,
+            loop_budget,
         }
     }
 
@@ -1188,7 +1354,8 @@ impl Em {
         let mut reads_dp = false;
         let mesh = matches!(self.opt.mode, Mode::Mesh(_));
         let compute = matches!(self.opt.mode, Mode::Compute(_));
-        self.outline = compute && self.opt.mem_windows > 1 && outline_from(insts.len());
+        self.outline_candidate = compute && self.opt.mem_windows > 1 && outline_from(insts.len());
+        self.outline = self.outline_candidate && !self.opt.no_outline;
         if let Mode::Compute(cs) = &self.opt.mode {
             let inputs = self.opt.compute_per_access_coherence.then_some(cs.user_sgprs);
             self.mem_coherence = mem_coherence(insts, inputs);
@@ -1285,12 +1452,14 @@ impl Em {
 
     pub fn take(&mut self) -> String {
         self.groups.clear();
+        self.blocks_ended += 1;
         std::mem::take(&mut self.out)
     }
 
     fn line(&mut self, s: &str) {
-        if !self.groups.is_empty() && (s.matches('{').count() != s.matches('}').count() || s.trim_start().starts_with('}')) {
+        if (!self.groups.is_empty() || self.kept_record.is_some()) && (s.matches('{').count() != s.matches('}').count() || s.trim_start().starts_with('}')) {
             self.groups.clear();
+            self.blocks_ended += 1;
         }
         self.out.push_str(pad(self.indent));
         let packed_test;
@@ -1318,7 +1487,16 @@ impl Em {
     /// hardware wave32 halves that exchange masks and lane values (`PRELUDE_X64`,
     /// docs/wave64-on-wave32.md).
     fn x64(&self) -> bool {
-        self.opt.mesh_native.is_none() && !self.packed_compute() && self.opt.wave64 && self.opt.split_wave64 && matches!(self.opt.mode, Mode::Kernel | Mode::Compute(_) | Mode::Mesh(_) | Mode::Geometry(_))
+        self.opt.mesh_native.is_none() && !self.packed_compute() && !self.opt.lane_independent && self.opt.wave64 && self.opt.split_wave64 && matches!(self.opt.mode, Mode::Kernel | Mode::Compute(_) | Mode::Mesh(_) | Mode::Geometry(_))
+    }
+
+    /// A wave64 compute program as one console lane per host thread (`lane_independent`): the
+    /// program as a wave of 64 copies of the thread runs it. A ballot is the thread's own vote
+    /// for every lane, so a mask is all lanes or none and its tests (EXEC / VCC zero, the SCC of
+    /// a mask operation, a compare with 0 or -1) are the thread's own; everything else is the
+    /// 64-lane form's HLSL. No `WaveSize`, no wave intrinsic, no groupshared word.
+    pub(super) fn lane_independent(&self) -> bool {
+        self.opt.lane_independent
     }
 
     /// A compute program whose launch EXEC leaves out the lanes past a dispatch's thread limits
@@ -1327,12 +1505,18 @@ impl Em {
         self.opt.thread_limits && matches!(self.opt.mode, Mode::Compute(_))
     }
 
+    /// A compute program that runs a dispatch spread over x and y as the console's groups
+    /// (`Options::group_spread`, io[`IO_GROUP_SPREAD`]).
+    fn group_spread(&self) -> bool {
+        self.opt.group_spread && matches!(self.opt.mode, Mode::Compute(_))
+    }
+
     fn mesh_packed(&self) -> bool {
         self.opt.mesh_native.is_some() && self.opt.wave64 && self.x64_threads() > 32
     }
 
     pub(super) fn packed_compute(&self) -> bool {
-        self.opt.wave64 && self.opt.split_wave64 && !self.opt.legacy_compute_wave64 && matches!(self.opt.mode, Mode::Compute(_))
+        self.opt.wave64 && self.opt.split_wave64 && !self.opt.legacy_compute_wave64 && !self.opt.lane_independent && matches!(self.opt.mode, Mode::Compute(_))
     }
 
     fn packed_wave(&self) -> bool {
@@ -1409,16 +1593,30 @@ impl Em {
     /// `sgprs`, `vgprs`), whose `calls` accessor calls read the bytes `[imm, imm + span)`, the
     /// first of them at `anchor_addr`. A load joins the group of its base when its bytes lie in
     /// the 64 KiB from the group's anchor on: at most that page and the next, both resolved once.
-    /// A group is declared when a second load joins it (or a load of three calls opens it), so a
-    /// lone load keeps its accessor. Before this load's calls.
+    /// A group is declared when a second load joins it (or a load of three calls opens it: a
+    /// four-address load counted as three before `lone_loads`), so a lone load keeps its accessor.
+    /// Before this load's calls.
     #[allow(clippy::too_many_arguments)]
     fn page_group(&mut self, key: String, sgprs: u128, vgprs: Vec<u64>, imm: i64, span: i64, anchor_addr: String, calls: usize) -> Option<usize> {
         if !self.page_groups || self.opt.mem_windows <= 1 || self.packed_wave() || self.code_loads {
             return None;
         }
+        let keeps = !self.outline || keep_pages_outlined();
+        if let Some(record) = self.kept_record.as_mut().filter(|_| keeps && vgprs.is_empty() && !self.lane_window && (key.starts_with("smem|") || key.starts_with("sbuf|"))) {
+            record.sites.push(super::kept_pages::Site { pc: self.cur_pc, key: key.clone(), regs: sgprs, imm, span, block: self.blocks_ended });
+        }
+        if self.groups.iter().all(|g| g.key != key) {
+            if let Some(&n) = self.kept.sites.get(&(self.cur_pc, key.clone())) {
+                // a kept resolution: the group is declared for the whole program
+                let anchor = self.kept.keys[n].1;
+                self.groups.push(PageGroup { key, sgprs, vgprs, anchor, name: Some(format!("xcl_k{n}")), at: self.out.len(), indent: self.indent, anchor_addr, calls: Vec::new(), delta: imm - anchor, fold: group_fold() && !self.outline });
+                return Some(self.groups.len() - 1);
+            }
+        }
         if let Some(i) = self.groups.iter().position(|g| g.key == key) {
             let delta = imm - self.groups[i].anchor;
             if delta >= 0 && delta % 4 == 0 && delta + span <= 65536 {
+                self.groups[i].delta = delta;
                 self.declare_group(i);
                 return Some(i);
             }
@@ -1427,7 +1625,7 @@ impl Em {
         if span > 65536 {
             return None;
         }
-        self.groups.push(PageGroup { key, sgprs, vgprs, anchor: imm, name: None, at: self.out.len(), indent: self.indent, anchor_addr, calls: Vec::new() });
+        self.groups.push(PageGroup { key, sgprs, vgprs, anchor: imm, name: None, at: self.out.len(), indent: self.indent, anchor_addr, calls: Vec::new(), delta: 0, fold: group_fold() && !self.outline });
         let i = self.groups.len() - 1;
         if calls >= 3 {
             self.declare_group(i);
@@ -1444,14 +1642,22 @@ impl Em {
         let g = self.t();
         let at = self.groups[i].at;
         let mut from = at;
-        for (method, addr) in std::mem::take(&mut self.groups[i].calls) {
-            let call = format!("{method}({addr})");
+        let fold = self.groups[i].fold;
+        for (call, grouped, folded) in std::mem::take(&mut self.groups[i].calls) {
             let Some(k) = self.out[from..].find(&call) else { continue };
-            let new = format!("{method}G({addr}, {g}_g, {g}_r)");
+            // (the calls kept until now are those of the load that opened the group, at the anchor)
+            let new = if fold { folded } else { grouped }.replace("{G}", &g);
             self.splice_out(from + k..from + k + call.len(), &new);
             from += k + new.len();
         }
-        let decl = format!("{}uint64_t {g}_g = xcl_operand_va({}); uint4 {g}_r = xcl_group_pages({g}_g);\n", pad(self.groups[i].indent), self.groups[i].anchor_addr);
+        let pages = if fold {
+            // the loads of a group are one instruction's kind, so the window is that of this one
+            let family = if self.lane_window { "xcl_v" } else { "xcl_m" };
+            format!("uint {g}_s = (uint){g}_g & 65535u, {g}_z = (uint){g}_g >> 16; uint4 {g}_r = {family}Fold({g}_g, xcl_group_pages({g}_g));")
+        } else {
+            format!("uint4 {g}_r = xcl_group_pages({g}_g);")
+        };
+        let decl = format!("{}uint64_t {g}_g = xcl_operand_va({}); {pages}\n", pad(self.groups[i].indent), self.groups[i].anchor_addr);
         self.splice_out(at..at, &decl);
         self.groups[i].name = Some(g);
     }
@@ -1467,14 +1673,16 @@ impl Em {
         }
     }
 
-    /// The accessor call `mem.{method}(addr)` of a load in group `g` (None: no group).
-    fn group_call(&mut self, g: Option<usize>, method: &str, addr: &str) -> String {
+    /// The accessor call `mem.{method}(addr)` of a load in group `g` (None: no group), whose
+    /// first byte is `within` bytes from the first of its instruction's.
+    fn group_call(&mut self, g: Option<usize>, method: &str, addr: &str, within: &str) -> String {
         let mem = if self.plain_load { "memc" } else { "mem" };
         let Some(group) = g.and_then(|i| self.groups.get_mut(i)) else { return format!("{mem}.{method}({addr})") };
         match &group.name {
+            Some(n) if group.fold => format!("{mem}.{method}S({n}_s + {}u + {within}, {n}_r)", group.delta),
             Some(n) => format!("{mem}.{method}G({addr}, {n}_g, {n}_r)"),
             None => {
-                group.calls.push((method.to_string(), addr.to_string()));
+                group.calls.push((format!("{method}({addr})"), format!("{method}G({addr}, {{G}}_g, {{G}}_r)"), format!("{method}S({{G}}_s + {within}, {{G}}_r)")));
                 format!("{mem}.{method}({addr})")
             }
         }
@@ -1482,12 +1690,63 @@ impl Em {
 
     /// A four-address load (`xcl_loadx4`) whose addresses are each a constant offset below 16
     /// from the start of the bytes of group `g`'s load, or 0: through the group's pages.
-    fn loadx4(&mut self, g: Option<usize>, addrs: &str) -> String {
-        let cached = if self.plain_load { "_cached" } else { "" };
-        match g.and_then(|i| self.groups.get(i)).and_then(|g| g.name.as_ref()) {
+    /// With the fold (`group_fold`) the addresses are the `dwords` dwords from `within` bytes
+    /// after the first of the instruction's on, those of `taken` (a `bool4`) the ones whose
+    /// result is taken (the others have address 0).
+    fn loadx4(&mut self, g: Option<usize>, addrs: &str, dwords: usize, within: &str, taken: &str) -> String {
+        let (cached, mem) = if self.plain_load { ("_cached", "memc") } else { ("", "mem") };
+        let call = format!("xcl_loadx4{cached}({addrs})");
+        let Some(group) = g.and_then(|i| self.groups.get_mut(i)) else { return call };
+        match &group.name {
+            Some(n) if group.fold => format!("{mem}.Load{dwords}X({n}_s + {}u + {within}, {n}_z, {n}_r, {taken})", group.delta),
             Some(n) => format!("xcl_loadx4G{cached}({addrs}, {n}_g, {n}_r)"),
-            None => format!("xcl_loadx4{cached}({addrs})"),
+            // alone on its base so far (`lone_loads`): the accessor, until a second load joins
+            None => {
+                group.calls.push((call.clone(), format!("xcl_loadx4G{cached}({addrs}, {{G}}_g, {{G}}_r)"), format!("{mem}.Load{dwords}X({{G}}_s + {within}, {{G}}_z, {{G}}_r, {taken})")));
+                call
+            }
         }
+    }
+
+    /// Resolve the kept group `n` (`kept_pages`) from its base registers as they are now: the
+    /// lines of a load at the group's anchor up to its address, then the group's declaration.
+    /// The address state of the accesses (`xcl_ea`, `xcl_origin`, `xcl_w`) is left as it was.
+    fn keep_pages(&mut self, n: usize) {
+        let (key, anchor) = self.kept.keys[n].clone();
+        let part: Vec<&str> = key.splitn(4, '|').collect();
+        let (t, k) = (self.t(), format!("xcl_k{n}"));
+        let lane_window = std::mem::replace(&mut self.lane_window, false);
+        self.line(&format!("uint64_t {t}_e = xcl_ea; uint {t}_o = xcl_origin, {t}_k = xcl_w;"));
+        let addr = if part[0] == "smem" {
+            let (hi, b, soff) = (part[1], part[2], part[3]);
+            self.window_read(hi);
+            self.line(&format!("xcl_ea = ((((uint64_t){hi}) << 32) | (uint64_t){b}) + (uint64_t)(int64_t)(int){} + (uint64_t){soff};", hex(anchor as u32)));
+            format!("({b} + {} + {soff}) & ~3u", hex(anchor as u32))
+        } else {
+            let (d0, d1, soff) = (part[1], part[2], part[3]);
+            self.line(&format!("uint64_t {t}_off = (uint64_t){} + {soff};", hex(anchor as u32)));
+            self.window_read(&format!("({d1} & 0xFFFFu)"));
+            self.line(&format!("xcl_ea = ((((uint64_t)({d1} & 0xFFFFu)) << 32) | (uint64_t){d0}) + (uint64_t){t}_off;"));
+            format!("({d0} + (uint){t}_off) & ~3u")
+        };
+        let pages = if group_fold() && !self.outline {
+            format!("{k}_s = (uint){k}_g & 65535u; {k}_z = (uint){k}_g >> 16; {k}_r = xcl_mFold({k}_g, xcl_group_pages({k}_g));")
+        } else {
+            format!("{k}_r = xcl_group_pages({k}_g);")
+        };
+        self.line(&format!("{k}_g = xcl_operand_va({addr}); {pages}"));
+        self.line(&format!("xcl_ea = {t}_e; xcl_origin = {t}_o; xcl_w = {t}_k;"));
+        self.lane_window = lane_window;
+    }
+
+    /// The kept groups a load may read with the registers the program starts with, resolved
+    /// before its first instruction.
+    pub fn keep_pages_at_entry(&mut self) -> String {
+        self.indent = 1;
+        for n in self.kept.entry.clone() {
+            self.keep_pages(n);
+        }
+        std::mem::take(&mut self.out)
     }
 
     /// After an instruction: the groups whose base registers it may write end. A memory write
@@ -1793,8 +2052,24 @@ impl Em {
         let packed = self.packed_wave();
         self.full = !packed && self.exec_full.contains(&d.pc);
         self.cur_loose = if packed { Vec::new() } else { self.loose.get(&d.pc).cloned().unwrap_or_default() };
+        self.cur_pc = d.pc;
+        let (start, indent, ended) = (self.out.len(), self.indent, self.blocks_ended);
         let flow = self.inst_body(d, next);
         self.drop_page_groups(d);
+        if let Some(record) = &mut self.kept_record {
+            // text after the instruction's runs whenever the instruction did: not after a branch,
+            // nor where its own text may leave the block. Asked of the text of each translation:
+            // a load reads differently where it follows a plan
+            let own = self.out.get(start..).unwrap_or("break");
+            #[cfg(test)]
+            let own = if KEPT_WRITES_CLOSE.get() && self.kept.after.contains_key(&d.pc) { "break" } else { own };
+            if !matches!(flow, Flow::Next) || self.indent != indent || self.blocks_ended != ended || ["break", "continue", "return", "discard"].iter().any(|w| own.contains(w)) {
+                record.closed.insert(d.pc);
+            }
+        }
+        for n in self.kept.after.get(&d.pc).cloned().unwrap_or_default() {
+            self.keep_pages(n);
+        }
         self.plain_load = false;
         self.full = false;
         self.cur_loose.clear();
@@ -1947,6 +2222,12 @@ impl Em {
                     }
                 } else if matches!(self.opt.mode, Mode::Kernel | Mode::Geometry(_)) {
                     self.line("GroupMemoryBarrierWithGroupSync();");
+                }
+                // xsemu: from xcl-dev/xcl nvidia-dev 9b455a1a,67a08dbe crates/xcl/src/gpu/recomp/emit.rs
+                // split wave64: both halves made their LDS accesses before the barrier (a half
+                // without a partner has nothing to wait for)
+                if self.x64() && self.writes_lds {
+                    self.line("xcl_x_lw = 0u;");
                 }
                 Flow::Next
             }
@@ -2594,16 +2875,31 @@ impl Em {
             if count == 1 {
                 self.line(&format!("bool {t}_in = {t}_off < {t}_lim;"));
                 let group = self.page_group(format!("sbuf|{d0}|{d1}|{soff}"), 3u128 << sbase | soff_regs, Vec::new(), imm as i64, 4, format!("{t}_a"), 1);
-                let load = self.group_call(group, "Load", &format!("select({t}_in, {t}_a, 0u)"));
+                let load = self.group_call(group, "Load", &format!("select({t}_in, {t}_a, 0u)"), "0u");
                 self.line(&format!("uint {t}_0 = select({t}_in, {load}, 0u);"));
                 vals.push(format!("{t}_0"));
             } else {
-                let group = self.page_group(format!("sbuf|{d0}|{d1}|{soff}"), 3u128 << sbase | soff_regs, Vec::new(), imm as i64, 4 * count as i64, format!("{t}_a"), 3);
-                for g in 0..count.div_ceil(4) {
+                let group = self.page_group(format!("sbuf|{d0}|{d1}|{soff}"), 3u128 << sbase | soff_regs, Vec::new(), imm as i64, 4 * count as i64, format!("{t}_a"), if count <= 4 && lone_loads() { 1 } else { 3 });
+                let turns = if count >= 8 && self.opt.mem_windows > 1 && !self.outline && load_loop() { count / 4 } else { 0 };
+                if turns != 0 {
+                    // one call for the load (`load_loop`): turn j has the addresses, the test and the
+                    // result of the call for dwords 4j to 4j + 3
+                    let names: Vec<String> = (0..turns).map(|g| format!("{t}_g{g}")).collect();
+                    self.line(&format!("uint4 {};", names.iter().map(|n| format!("{n} = uint4(0u, 0u, 0u, 0u)")).collect::<Vec<_>>().join(", ")));
+                    let load = self.loadx4(group, &format!("select({t}_in, {t}_a + {t}_o, 0u)"), 4, &format!("16u * {t}_j"), &format!("{t}_in"));
+                    let keep: Vec<String> = names.iter().enumerate().map(|(g, n)| format!("{n} = select({t}_j == {g}u, {t}_q, {n});")).collect();
+                    self.line(&format!(
+                        "[loop] for (uint {t}_j = 0u; {t}_j < {turns}u; {t}_j++) {{ uint4 {t}_o = 16u * {t}_j + uint4(0u, 4u, 8u, 12u); \
+                         bool4 {t}_in = {t}_off + vector<{uint}, 4>({t}_o.x, {t}_o.y, {t}_o.z, {t}_o.w) < {t}_lim; uint4 {t}_q = select({t}_in, {load}, 0u); {} }}",
+                        keep.join(" ")
+                    ));
+                    vals.extend(names.iter().flat_map(|n| ["x", "y", "z", "w"].map(|c| format!("{n}.{c}"))));
+                }
+                for g in 0..if turns != 0 { 0 } else { count.div_ceil(4) } {
                     let n = (count - 4 * g).min(4);
                     let o = (0..4).map(|k| format!("{}u", 16 * g + 4 * k.min(n - 1))).collect::<Vec<_>>().join(", ");
                     self.line(&format!("bool4 {t}_in{g} = {t}_off + vector<{uint}, 4>({o}) < {t}_lim;"));
-                    let load = self.loadx4(group, &format!("select({t}_in{g}, {t}_a + uint4({o}), 0u)"));
+                    let load = self.loadx4(group, &format!("select({t}_in{g}, {t}_a + uint4({o}), 0u)"), n, &format!("{}u", 16 * g), &format!("{t}_in{g}"));
                     self.line(&format!("uint4 {t}_g{g} = select({t}_in{g}, {load}, 0u);"));
                     vals.extend(["x", "y", "z", "w"][..n].iter().map(|c| format!("{t}_g{g}.{c}")));
                 }
@@ -2638,15 +2934,29 @@ impl Em {
             } else {
                 None
             };
+            let turns = if count >= 8 && self.opt.mem_windows > 1 && !self.code_loads && !self.outline && load_loop() { count / 4 } else { 0 };
+            if turns != 0 {
+                // one call for the load (`load_loop`): turn j reads dwords 4j to 4j + 3
+                let names: Vec<String> = (0..turns).map(|g| format!("{t}_g{g}")).collect();
+                self.line(&format!("uint4 {};", names.iter().map(|n| format!("{n} = uint4(0u, 0u, 0u, 0u)")).collect::<Vec<_>>().join(", ")));
+                let addr = format!("{t}_a + 16u * {t}_j");
+                let call = match group {
+                    Some(_) => self.group_call(group, "Load4", &addr, &format!("16u * {t}_j")),
+                    None => format!("{load}4({addr})"),
+                };
+                let keep: Vec<String> = names.iter().enumerate().map(|(g, n)| format!("{n} = select({t}_j == {g}u, {t}_q, {n});")).collect();
+                self.line(&format!("[loop] for (uint {t}_j = 0u; {t}_j < {turns}u; {t}_j++) {{ uint4 {t}_q = {call}; {} }}", keep.join(" ")));
+                vals.extend(names.iter().flat_map(|n| ["x", "y", "z", "w"].map(|c| format!("{n}.{c}"))));
+            }
             let mut calls = Vec::new();
-            for g in 0..count.div_ceil(4) {
+            for g in 0..if turns != 0 { 0 } else { count.div_ceil(4) } {
                 let (method, addr) = match count {
                     1 => ("Load", format!("{t}_a")),
                     2 => ("Load2", format!("{t}_a")),
                     _ => ("Load4", format!("{t}_a + {}u", 16 * g)),
                 };
                 calls.push(match group {
-                    Some(_) => self.group_call(group, method, &addr),
+                    Some(_) => self.group_call(group, method, &addr, &format!("{}u", 16 * g)),
                     None => format!("{load}{}({addr})", &method[4..]),
                 });
             }
@@ -2662,6 +2972,7 @@ impl Em {
                 format!("{ty} {name}; if ({t}_pc) {{ {name} = {table}; }} else {{ {name} = {mem}; }}")
             };
             match count {
+                _ if turns != 0 => {}
                 1 => {
                     self.line(&dwords(1, &format!("{t}_0"), 0, calls[0].clone()));
                     vals.push(format!("{t}_0"));
@@ -2920,7 +3231,7 @@ impl Em {
                     let vgprs = (0..(idxen as u64 + offen as u64)).map(|k| vaddr + k).collect();
                     let key = format!("mubuf|{d0}|{d1}|{soff}|{voff}|{index}");
                     let group = self.page_group(key, sgprs, vgprs, f("OFFSET") as i64, 4, format!("{t}_a & ~3u"), 1);
-                    let load = self.group_call(group, "Load", &format!("select(and({t}_act, {t}_ok), {t}_a & ~3u, 0u)"));
+                    let load = self.group_call(group, "Load", &format!("select(and({t}_act, {t}_ok), {t}_a & ~3u, 0u)"), "0u");
                     self.line(&format!("uint {t}_v = {load};"));
                     self.line(&format!("{v} = select({t}_act, select({t}_ok, {t}_v, 0u), {v});"));
                 } else {
@@ -2931,8 +3242,8 @@ impl Em {
                     let sgprs = 3u128 << srsrc | if soff_code < 128 { 1u128 << soff_code } else { 0 };
                     let vgprs = (0..(idxen as u64 + offen as u64)).map(|k| vaddr + k).collect();
                     let key = format!("mubuf|{d0}|{d1}|{soff}|{voff}|{index}");
-                    let group = self.page_group(key, sgprs, vgprs, f("OFFSET") as i64, 4 * count as i64, format!("{t}_a & ~3u"), 3);
-                    let load = self.loadx4(group, &format!("select(and({t}_act, {t}_ok), ({t}_a & ~3u) + uint4({o}), 0u)"));
+                    let group = self.page_group(key, sgprs, vgprs, f("OFFSET") as i64, 4 * count as i64, format!("{t}_a & ~3u"), if lone_loads() { 1 } else { 3 });
+                    let load = self.loadx4(group, &format!("select(and({t}_act, {t}_ok), ({t}_a & ~3u) + uint4({o}), 0u)"), count as usize, "0u", &format!("and({t}_act, {t}_ok)"));
                     self.line(&format!("uint4 {t}_v = {load};"));
                     for i in 0..count {
                         let v = self.vreg(vdata + i);
@@ -4964,6 +5275,13 @@ impl Em {
                     format!("select({t}_ok, {t}, {cur})")
                 }
             }
+            // every lane holds the value (`lane_independent`'s proof), so the thread does
+            "v_readfirstlane_b32" if self.lane_independent() => {
+                let t = self.t();
+                self.line(&format!("uint {t} = {a};"));
+                self.write32(&dst, &t);
+                return Ok(());
+            }
             "v_readfirstlane_b32" => {
                 let (el, eh) = (self.sreg(126), self.sreg(127));
                 let eh = if self.opt.wave64 { eh } else { "0u".into() };
@@ -5335,7 +5653,7 @@ impl Em {
             } else {
                 let v = self.vreg(f("VDST") + i);
                 let a = format!("({t}_a + {}u) & ~3u", 4 * i);
-                let mem = self.group_call(group, "Load", &a);
+                let mem = self.group_call(group, "Load", &a, &format!("{}u", 4 * i));
                 let word = if self.code_loads { format!("{t}_pc ? xcl_code({a}) : {mem}") } else { mem };
                 st.push(format!("{v} = {word};"));
             }
@@ -5553,6 +5871,20 @@ impl Em {
             Mode::Geometry(g) => g.gs_start.is_some_and(|s| d.pc >= s),
             _ => false,
         };
+        // xsemu: from xcl-dev/xcl nvidia-dev 9b455a1a,67a08dbe crates/xcl/src/gpu/recomp/emit.rs
+        // split wave64: the console runs a wave's LDS accesses in order for all 64 lanes, the
+        // halves do not – an access first meets the other half when that half may have made an
+        // access since they last met that this one must follow (`xcl_x_lw`, the same in both:
+        // they run the same instructions; every meet clears it)
+        if self.x64() && self.writes_lds {
+            let (wait, set) = x64_lds_order(name);
+            if wait != 0 {
+                self.line(&format!("if ((xcl_x_lw & {wait}u) != 0u) xcl_x_meet();"));
+            }
+            if set != 0 {
+                self.line(&format!("xcl_x_lw |= {set}u;"));
+            }
+        }
         // ADDTID forms have no ADDR VGPR: byte address = M0[15:0] + offset16 + 4 * lane_id.
         if matches!(name, "ds_write_addtid_b32" | "ds_read_addtid_b32") {
             if f("GDS") != 0 {
@@ -5851,7 +6183,18 @@ impl Em {
         h.push_str(PRELUDE_X64);
         // the pair form's text is what it was (its programs' cached DXIL and driver blobs stay
         // valid); programs with counted meets get the meet that gives up by the group's progress
-        h.push_str(if self.x64_spin() { PRELUDE_X64_MEET_COUNTED } else { PRELUDE_X64_MEET });
+        let meet = if self.x64_spin() { PRELUDE_X64_MEET_COUNTED } else { PRELUDE_X64_MEET };
+        // xsemu: from xcl-dev/xcl nvidia-dev 9b455a1a,67a08dbe crates/xcl/src/gpu/recomp/emit.rs
+        // the LDS order's flag and its clear in every meet (`x64_lds_order`); upstream puts both
+        // in every split program's prelude, here only programs that keep the order get them, so
+        // every other program's text (and `XCL_X_LDS_ORDER=0`'s) is what it was
+        if self.writes_lds {
+            note_lds_order();
+            h.push_str(PRELUDE_X64_LDS_ORDER);
+            h.push_str(&meet.replacen(X64_MEET_STEP, &format!("{X64_MEET_STEP}    xcl_x_lw = 0u;\n"), 1));
+        } else {
+            h.push_str(meet);
+        }
         h.push_str(PRELUDE_X64_LANES);
     }
 
@@ -5907,6 +6250,9 @@ impl Em {
         if windows > 1 {
             h.push_str("static uint xcl_w = 0u;\nstatic uint xcl_wv = 0u;\nstatic uint xcl_uma_base = 0u;\n");
         }
+        for n in 0..self.kept.keys.len() {
+            let _ = writeln!(h, "static uint64_t xcl_k{n}_g = 0; static uint xcl_k{n}_s = 0u, xcl_k{n}_z = 0u; static uint4 xcl_k{n}_r = uint4(0u, 0u, 0u, 0u);");
+        }
         h.push_str(MEM_ACCESSORS_HERE);
         if let Some(data) = self.opt.code_data.as_ref().filter(|_| self.code_loads) {
             let n = data.words.len();
@@ -5927,8 +6273,8 @@ impl Em {
             let ty = if *cmp { "SamplerComparisonState" } else { "SamplerState" };
             let _ = writeln!(h, "{ty} xcl_ss{k} : register(s{k}, space1);");
         }
-        let _ = writeln!(h, "#define XCL_LOOP_GUARD {}u", super::loop_guard());
-        h.push_str(PRELUDE_START);
+        h.push_str(&self.loop_budget.defines());
+        h.push_str(if matches!(self.loop_budget, super::LoopBudget::Regions { .. }) { PRELUDE_START_REGIONS } else { PRELUDE_START });
         if self.packed_compute() {
             h.push_str("static uint xcl_valid_lanes;\n");
         }
@@ -5942,7 +6288,15 @@ impl Em {
         } else {
             h.push_str(PRELUDE_TRIP_COUNTERS);
         }
-        h.push_str(PRELUDE);
+        if self.lane_independent() {
+            // the thread's vote for every lane, and no lane read
+            let (ballot, after) = (PRELUDE.find("uint2 ballot(bool b) {").unwrap(), PRELUDE.find("bool lanebit_at(").unwrap());
+            h.push_str(&PRELUDE[..ballot]);
+            h.push_str("uint2 ballot(bool b) { uint m = select(b, 0xFFFFFFFFu, 0u); return uint2(m, m); }\n");
+            h.push_str(&PRELUDE[after..]);
+        } else {
+            h.push_str(PRELUDE);
+        }
         if self.x64() {
             self.x64_prelude(&mut h);
         }
@@ -5981,7 +6335,7 @@ uint4 ld_raw(").unwrap();
         };
         let grouped_ld_raw;
         let mem_access = if windows > 1 && self.page_groups && !self.packed_wave() && !self.code_loads && body.contains("ld_raw") && accessor_shrink() {
-            grouped_ld_raw = mem_access.replacen(LD_RAW_LOADS, LD_RAW_GROUPED, 1);
+            grouped_ld_raw = mem_access.replacen(LD_RAW_LOADS, if group_fold() && !self.outline { LD_RAW_FOLDED } else { LD_RAW_GROUPED }, 1);
             grouped_ld_raw.as_str()
         } else {
             mem_access
@@ -6135,7 +6489,10 @@ uint4 ld_raw(").unwrap();
                 // thread indices (AMD RDNA4 lays them out in 2 x 2 quads: lanes 0, 1, 4, 5, 8 …
                 // of an 8 x 8 group; NVIDIA differs too), the console does – a hardware wave
                 // takes the next `lanes` console threads as it arrives, lane l the l-th of them
-                let reorder = !packed && !self.x64() && y * z > 1;
+                // (the lane-independent form reads no wave: a thread is the console thread
+                // D3D12 says it is)
+                let lone = self.lane_independent();
+                let reorder = !packed && !self.x64() && !lone && y * z > 1;
                 if reorder {
                     // console threads handed to waves so far: the program's top LDS word while
                     // the waves take their threads (the console's LDS starts undefined; D3D12's
@@ -6150,8 +6507,17 @@ uint4 ld_raw(").unwrap();
                 let [hx, hy, hz] = host;
                 let _ = writeln!(
                     h,
-                    "[WaveSize({hw_lanes})]\n[numthreads({hx}, {hy}, {hz})]\nvoid main(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID, uint gi : SV_GroupIndex)\n{{"
+                    "{}[numthreads({hx}, {hy}, {hz})]\nvoid main(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID, uint gi : SV_GroupIndex)\n{{",
+                    if lone { String::new() } else { format!("[WaveSize({hw_lanes})]\n") }
                 );
+                if self.group_spread() {
+                    let _ = writeln!(
+                        h,
+                        "    {{\n        uint2 xcl_sp = io.Load2({}u);\n        if (xcl_sp.x != 0u) {{\n            uint xcl_g = gid.x + {}u * gid.y;\n            if (xcl_g >= xcl_sp.x * xcl_sp.y) return;\n            gid = uint3(xcl_g % xcl_sp.x, xcl_g / xcl_sp.x, gid.z);\n        }}\n    }}",
+                        super::IO_GROUP_SPREAD[0] * 4,
+                        super::GROUP_SPREAD_WIDTH
+                    );
+                }
                 if self.material_gate.is_some() { h.push_str(super::pso::material_gate::ENTRY); }
                 if self.safe_barrier {
                     h.push_str("    xcl_s_barrier_init(gi);\n");
@@ -6180,6 +6546,10 @@ uint4 ld_raw(").unwrap();
                         t & !(lanes - 1),
                         x * y
                     );
+                } else if lone {
+                    // the thread's lane of its console wave: a wave takes the next 64 threads
+                    // of the group (what ADDTID addresses by; TG_SIZE below has the wave)
+                    let _ = writeln!(h, "    lane_id = gi % {lanes}u;");
                 } else {
                     h.push_str("    lane_id = WaveGetLaneIndex();\n");
                 }
@@ -7061,7 +7431,7 @@ fn windowed(h: &str, windows: u32, coherence: MemCoherence, outline: bool) -> St
     }
     out.push_str(rest);
     let groups = out.contains("xcl_group_pages(");
-    let accessors = mem_accessors(windows, coherence, groups);
+    let accessors = mem_accessors(windows, coherence, groups, out.contains("Fold("));
     let accessors = match (outline, outline_statics()) {
         (false, _) => accessors,
         (true, false) => outlined(&accessors, &outlined_accessor),
@@ -7080,10 +7450,32 @@ fn windowed(h: &str, windows: u32, coherence: MemCoherence, outline: bool) -> St
 /// index), `xcl_v` ones with a lane's (`xcl_wv`, `NonUniformResourceIndex`).
 #[cfg(test)]
 pub(super) fn plain_mem_accessors(windows: u32, groups: bool) -> String {
-    mem_accessors(windows, MemCoherence::Plain, groups)
+    mem_accessors_in(windows, groups, false, 0)
 }
 
-fn mem_accessors(windows: u32, coherence: MemCoherence, groups: bool) -> String {
+/// (tests) The accessors in one form (`compact`: `compact_access`; else the earlier text, which
+/// `plain_mem_accessors` and the tests of that text keep reading) and one coherence: 0 plain
+/// views, 1 coherent ones, 2 coherent with the cached loads (`MemCoherence::CachedBefore`),
+/// 3 coherent with the plain copies (`MemCoherence::PlainBefore`); and 4 more than one of
+/// these: with the folded loads of a group as well (`group_fold`).
+#[cfg(test)]
+pub(super) fn mem_accessors_in(windows: u32, groups: bool, compact: bool, coherence: u8) -> String {
+    let was = NO_COMPACT_ACCESS.replace(!compact);
+    let fold = coherence >= 4;
+    let coherence = match coherence & 3 {
+        0 => MemCoherence::Plain,
+        1 => MemCoherence::Coherent,
+        2 => MemCoherence::CachedBefore(0),
+        _ => MemCoherence::PlainBefore(0),
+    };
+    let s = mem_accessors(windows, coherence, groups, fold);
+    NO_COMPACT_ACCESS.set(was);
+    s
+}
+
+/// `fold`: with the folded loads of a group (`group_fold`), which a program that has such
+/// loads asks for.
+fn mem_accessors(windows: u32, coherence: MemCoherence, groups: bool, fold: bool) -> String {
     let mut sigs: Vec<(&str, String, &str, &str)> = vec![
         ("uint", "Load".into(), "uint a", "a"),
         ("uint2", "Load2".into(), "uint a", "a"),
@@ -7115,16 +7507,24 @@ fn mem_accessors(windows: u32, coherence: MemCoherence, groups: bool) -> String 
     let mut s = String::new();
     let shrink = groups && accessor_shrink();
     let coherent = if matches!(coherence, MemCoherence::Plain) { "" } else { "globallycoherent " };
+    let compact = windows > 1 && compact_access();
     if windows > 1 {
         let _ = writeln!(s, "static const uint xcl_windows = {windows}u;");
-        s.push_str(super::GPU_PAGE_DIRECTORY_HLSL);
-        s.push_str(PHYSICAL_ACCESS);
+        if compact {
+            s.push_str(&compact_physical_access());
+        } else {
+            s.push_str(super::GPU_PAGE_DIRECTORY_HLSL);
+            s.push_str(PHYSICAL_ACCESS);
+        }
         if groups {
             let pages = PAGE_GROUPS.replace("XCL_NULL_VIEW", &super::MEM_NULL_VIEW.to_string());
             s.push_str(&if shrink { pages.replacen(GROUP_PAGES_TWICE, GROUP_PAGES_LOOP, 1) } else { pages });
         }
     }
-    for &(prefix, view) in families {
+    if compact {
+        compact_accessors(&mut s, &sigs, families, coherence, groups, fold);
+    }
+    for &(prefix, view) in families.iter().filter(|_| !compact) {
         let w = if prefix == "xcl_m" { "xcl_w" } else { "xcl_wv" };
         for cached in [false, true] {
             if cached && (prefix != "xcl_m" || !matches!(coherence, MemCoherence::CachedBefore(_) | MemCoherence::PlainBefore(_))) {
@@ -7199,34 +7599,38 @@ fn mem_accessors(windows: u32, coherence: MemCoherence, groups: bool) -> String 
         }
     }
     let view = families[0].1;
-    let _ = writeln!(s, "uint4 xcl_loadx4(uint4 a) {{ {coherent}RWByteAddressBuffer b = ResourceDescriptorHeap[{view}];");
-    if windows > 1 {
-        s.push_str("if (all((a >> 16) == (a.x >> 16))) { uint64_t va = xcl_operand_va(a.x); if (or(xcl_page_table != 0u, !xcl_direct(va, xcl_w, 4u))) { uint2 p = xcl_resolve_va(va); ");
-        let _ = writeln!(s, "{coherent}RWByteAddressBuffer x = ResourceDescriptorHeap[NonUniformResourceIndex(p.x)]; a = (p.y & 0xffff0000u) | (a & 65535u); return uint4(x.Load(a.x), x.Load(a.y), x.Load(a.z), x.Load(a.w)); }} }} else {{ return uint4(xcl_mLoad(a.x), xcl_mLoad(a.y), xcl_mLoad(a.z), xcl_mLoad(a.w)); }}");
-    }
-    s.push_str("return uint4(b.Load(a.x), b.Load(a.y), b.Load(a.z), b.Load(a.w)); }\n");
-    if windows > 1 && groups {
-        let _ = write!(s, "uint4 xcl_loadx4G(uint4 a, uint64_t g, uint4 r) {{ {coherent}RWByteAddressBuffer b = ResourceDescriptorHeap[{view}]; ");
-        if !shrink {
-            s.push_str("uint2 z = xcl_resolve_va(xcl_operand_va(0u)); ");
+    if !compact {
+        let _ = writeln!(s, "uint4 xcl_loadx4(uint4 a) {{ {coherent}RWByteAddressBuffer b = ResourceDescriptorHeap[{view}];");
+        if windows > 1 {
+            s.push_str("if (all((a >> 16) == (a.x >> 16))) { uint64_t va = xcl_operand_va(a.x); if (or(xcl_page_table != 0u, !xcl_direct(va, xcl_w, 4u))) { uint2 p = xcl_resolve_va(va); ");
+            let _ = writeln!(s, "{coherent}RWByteAddressBuffer x = ResourceDescriptorHeap[NonUniformResourceIndex(p.x)]; a = (p.y & 0xffff0000u) | (a & 65535u); return uint4(x.Load(a.x), x.Load(a.y), x.Load(a.z), x.Load(a.w)); }} }} else {{ return uint4(xcl_mLoad(a.x), xcl_mLoad(a.y), xcl_mLoad(a.z), xcl_mLoad(a.w)); }}");
         }
-        for (k, c) in ["x", "y", "z", "w"].iter().enumerate() {
-            if shrink {
-                let _ = write!(s, "uint64_t v{k} = xcl_operand_va(a.{c}); uint2 p{k} = xcl_group_at(v{k}, g, r); ");
-            } else {
-                let _ = write!(s, "uint64_t v{k} = xcl_operand_va(a.{c}); uint2 q{k} = xcl_group_at(v{k}, g, r); uint2 p{k} = uint2(select(a.{c} == 0u, z.x, q{k}.x), select(a.{c} == 0u, z.y, q{k}.y)); ");
+        s.push_str("return uint4(b.Load(a.x), b.Load(a.y), b.Load(a.z), b.Load(a.w)); }\n");
+        if windows > 1 && groups {
+            let _ = write!(s, "uint4 xcl_loadx4G(uint4 a, uint64_t g, uint4 r) {{ {coherent}RWByteAddressBuffer b = ResourceDescriptorHeap[{view}]; ");
+            if !shrink {
+                s.push_str("uint2 z = xcl_resolve_va(xcl_operand_va(0u)); ");
             }
+            for (k, c) in ["x", "y", "z", "w"].iter().enumerate() {
+                if shrink {
+                    let _ = write!(s, "uint64_t v{k} = xcl_operand_va(a.{c}); uint2 p{k} = xcl_group_at(v{k}, g, r); ");
+                } else {
+                    let _ = write!(s, "uint64_t v{k} = xcl_operand_va(a.{c}); uint2 q{k} = xcl_group_at(v{k}, g, r); uint2 p{k} = uint2(select(a.{c} == 0u, z.x, q{k}.x), select(a.{c} == 0u, z.y, q{k}.y)); ");
+                }
+            }
+            let _ = write!(s, "if (all((a >> 16) == (a.x >> 16))) {{ if (or(xcl_page_table != 0u, !xcl_direct(v0, xcl_w, 4u))) {{ {coherent}RWByteAddressBuffer x = ResourceDescriptorHeap[NonUniformResourceIndex(p0.x)]; a = (p0.y & 0xffff0000u) | (a & 65535u); return uint4(x.Load(a.x), x.Load(a.y), x.Load(a.z), x.Load(a.w)); }} }} else {{ ");
+            for (k, c) in ["x", "y", "z", "w"].iter().enumerate() {
+                let _ = write!(s, "bool f{k} = and(xcl_page_table == 0u, xcl_direct(v{k}, xcl_w, 4u)); {coherent}RWByteAddressBuffer b{k} = ResourceDescriptorHeap[NonUniformResourceIndex(select(f{k}, xcl_mem_views + xcl_w, p{k}.x))]; uint o{k} = select(f{k}, a.{c}, p{k}.y); ");
+            }
+            s.push_str("return uint4(b0.Load(o0), b1.Load(o1), b2.Load(o2), b3.Load(o3)); }\nreturn uint4(b.Load(a.x), b.Load(a.y), b.Load(a.z), b.Load(a.w)); }\n");
         }
-        let _ = write!(s, "if (all((a >> 16) == (a.x >> 16))) {{ if (or(xcl_page_table != 0u, !xcl_direct(v0, xcl_w, 4u))) {{ {coherent}RWByteAddressBuffer x = ResourceDescriptorHeap[NonUniformResourceIndex(p0.x)]; a = (p0.y & 0xffff0000u) | (a & 65535u); return uint4(x.Load(a.x), x.Load(a.y), x.Load(a.z), x.Load(a.w)); }} }} else {{ ");
-        for (k, c) in ["x", "y", "z", "w"].iter().enumerate() {
-            let _ = write!(s, "bool f{k} = and(xcl_page_table == 0u, xcl_direct(v{k}, xcl_w, 4u)); {coherent}RWByteAddressBuffer b{k} = ResourceDescriptorHeap[NonUniformResourceIndex(select(f{k}, xcl_mem_views + xcl_w, p{k}.x))]; uint o{k} = select(f{k}, a.{c}, p{k}.y); ");
-        }
-        s.push_str("return uint4(b0.Load(o0), b1.Load(o1), b2.Load(o2), b3.Load(o3)); }\nreturn uint4(b.Load(a.x), b.Load(a.y), b.Load(a.z), b.Load(a.w)); }\n");
     }
     if matches!(coherence, MemCoherence::PlainBefore(_)) {
         // the group and four-address loads once more on the view that is not coherent: their text
         // without the qualifier, the single loads they fall back to with it
-        for (name, cached) in [("xcl_mLoadG", "xcl_m_cachedLoadG"), ("xcl_mLoad2G", "xcl_m_cachedLoad2G"), ("xcl_mLoad4G", "xcl_m_cachedLoad4G"), ("xcl_loadx4", "xcl_loadx4_cached"), ("xcl_loadx4G", "xcl_loadx4G_cached")] {
+        let folded = ["LoadS", "Load2S", "Load3S", "Load4S", "Load2X", "Load3X", "Load4X"].map(|n| (format!("xcl_m{n}"), format!("xcl_m_cached{n}")));
+        let folded = folded.iter().map(|(a, b)| (a.as_str(), b.as_str()));
+        for (name, cached) in [("xcl_mLoadG", "xcl_m_cachedLoadG"), ("xcl_mLoad2G", "xcl_m_cachedLoad2G"), ("xcl_mLoad4G", "xcl_m_cachedLoad4G"), ("xcl_loadx4", "xcl_loadx4_cached"), ("xcl_loadx4G", "xcl_loadx4G_cached")].into_iter().chain(folded) {
             let Some(f) = function_text(&s, name) else { continue };
             let f = f.replacen(&format!(" {name}("), &format!(" {cached}("), 1).replace("globallycoherent ", "").replace("xcl_mLoad(", "xcl_m_cachedLoad(");
             s.push_str(&f);
@@ -7235,6 +7639,205 @@ fn mem_accessors(windows: u32, coherence: MemCoherence, groups: bool) -> String 
     }
     s
 }
+
+/// The accessors of several windows, compact (`compact_access`): what the earlier text computes,
+/// written for a backend that inlines every call.
+/// One dword, or an atomic: its view and offset once (`xcl_at`, the window's when the access is
+/// direct, else the resolved page's), then the one access.
+/// Several dwords: a loop that runs once when the access is direct or stays in its page (the
+/// whole access at the view and offset of its first dword, as before) and once per dword when it
+/// crosses a page, each dword then with its own direct test and the page it lies in: the page of
+/// `a` for a dword of that page, the page after it (`vq`, the address the earlier text resolved
+/// it at) for the others. The loop holds the one resolution and the one load of each kind.
+/// A store that crosses a page so resolves a dword after it has stored the ones before it, where
+/// the earlier text resolved both pages first. That is the same as long as no store reaches the
+/// directory, and none can: its buffers are the host's, and no view of memory covers them.
+/// A group's loads take their pages from the group (`xcl_group_at`) instead.
+/// Four addresses (`xcl_loadx4`): once when they share a page, all four words then from the
+/// first address's view and page; else once per address.
+fn compact_accessors(s: &mut String, sigs: &[(&str, String, &str, &str)], families: &[(&str, &str)], coherence: MemCoherence, groups: bool, fold: bool) {
+    let coherent = if matches!(coherence, MemCoherence::Plain) { "" } else { "globallycoherent " };
+    let buffer = |qual: &str, view: &str| format!("{qual}RWByteAddressBuffer b = ResourceDescriptorHeap[NonUniformResourceIndex({view})];");
+    // the last offset an access of `bytes` bytes may start at and stay in its window
+    let last = |bytes: u32| format!("{:#010x}u", u32::MAX - (bytes - 1));
+    let vector = |n: u32, word: &dyn Fn(u32) -> String| format!("uint{n}({})", (0..n).map(word).collect::<Vec<_>>().join(", "));
+    // an access of `n` dwords, through a group's pages (`group`) or resolved here
+    let words = |ret: &str, func: &str, params: &str, method: &str, n: u32, w: &str, qual: &str, group: bool| {
+        let (bytes, store) = (4 * n, method.starts_with("Store"));
+        let mut f = format!("{ret} {func}({params}) {{ ");
+        if !group {
+            f.push_str("uint64_t va = xcl_operand_va(a), vq = xcl_operand_va((a | 65535u) + 2u); ");
+        }
+        if !store {
+            let _ = write!(f, "{ret} o = {}; ", vector(n, &|_| "0u".into()));
+        }
+        let _ = write!(
+            f,
+            "uint n = 1u; bool x = false; [loop] for (uint k = 0u; k < n; k++) {{ uint ak = a + 4u * k; uint64_t u = xcl_operand_va(ak); bool c = xcl_window(u, {w}); \
+             x = select(k == 0u, and((a & 65535u) > {}u, !and(c, a <= {})), x); n = select(x, {n}u, 1u); ",
+            65536 - bytes,
+            last(bytes)
+        );
+        f.push_str(if group { "uint2 p = xcl_group_at(u, g, r); " } else { "uint2 p = xcl_resolve_va((select((ak >> 16) == (a >> 16), va, vq) & ~0xffffull) | (uint64_t)(ak & 65535u)); " });
+        let _ = write!(f, "bool f = and(c, ak <= select(x, {}, {})); {} uint y = select(f, ak, p.y); ", last(4), last(bytes), buffer(qual, &format!("select(f, xcl_mem_views + {w}, p.x)")));
+        if store {
+            let _ = writeln!(f, "if (x) {{ b.Store(y, v[k]); }} else {{ b.{method}(y, v); }} }} }}");
+        } else {
+            let _ = writeln!(f, "if (x) {{ uint t = b.Load(y); o = select(k == {}, {}, o); }} else {{ o = b.{method}(y); }} }} return o; }}", vector(n, &|k| format!("{k}u")), vector(n, &|_| "t".into()));
+        }
+        f
+    };
+    for &(prefix, _) in families {
+        let w = if prefix == "xcl_m" { "xcl_w" } else { "xcl_wv" };
+        for cached in [false, true] {
+            if cached && (prefix != "xcl_m" || !matches!(coherence, MemCoherence::CachedBefore(_) | MemCoherence::PlainBefore(_))) {
+                continue;
+            }
+            let prefix = if cached { "xcl_m_cached" } else { prefix };
+            let qual = if cached { "" } else { coherent };
+            for (ret, name, params, args) in sigs {
+                if cached && !matches!(name.as_str(), "Load" | "Load2" | "Load4") {
+                    continue;
+                }
+                let n = name.strip_prefix("Load").or_else(|| name.strip_prefix("Store")).and_then(|x| x.parse::<u32>().ok()).unwrap_or(1);
+                if n > 1 {
+                    s.push_str(&words(ret, &format!("{prefix}{name}"), params, name, n, w, qual, false));
+                    continue;
+                }
+                let ret_kw = if *ret == "void" { "" } else { "return " };
+                let bytes = if name.ends_with("64") { 8 } else { 4 };
+                let _ = writeln!(s, "{ret} {prefix}{name}({params}) {{ uint2 p = xcl_at(xcl_operand_va(a), {w}, {}); {} {ret_kw}b.{name}(p.y{}); }}", last(bytes), buffer(qual, "p.x"), &args[1..]);
+            }
+        }
+        if !groups {
+            continue;
+        }
+        let _ = writeln!(
+            s,
+            "uint {prefix}LoadG(uint a, uint64_t g, uint4 r) {{ uint64_t va = xcl_operand_va(a); uint2 p = xcl_group_at(va, g, r); bool d = and(xcl_window(va, {w}), a <= {}); {} return b.Load(select(d, a, p.y)); }}",
+            last(4),
+            buffer(coherent, &format!("select(d, xcl_mem_views + {w}, p.x)"))
+        );
+        for n in 2..=4 {
+            s.push_str(&words(&format!("uint{n}"), &format!("{prefix}Load{n}G"), "uint a, uint64_t g, uint4 r", &format!("Load{n}"), n, w, coherent, true));
+        }
+        if !fold {
+            continue;
+        }
+        // the folded loads (`group_fold`). A page of the group is the window's own view at the
+        // page's own offset when an access in it is direct, else as resolved; `y` is the page's
+        // offset and 1, and 0 for a miss, as `xcl_group_pages` has it.
+        let _ = writeln!(
+            s,
+            "uint4 {prefix}Fold(uint64_t g, uint4 r) {{ uint64_t s = g & ~0xffffull; bool d0 = xcl_window(s, {w}), d1 = xcl_window(s + 0x10000ull, {w}); uint v = xcl_mem_views + {w}; \
+             return uint4(select(d0, v, r.x), select(d0, (uint)s + 1u, r.y), select(d1, v, r.z), select(d1, (uint)s + 0x10001u, r.w)); }}"
+        );
+        // `s`: the offset of the access from the start of the anchor's page, below 128 KiB
+        let page = |s: &str| format!("bool q = {s} > 65535u; uint y = select(q, r.w, r.y); {}", buffer(coherent, "select(q, r.z, r.x)"));
+        let _ = writeln!(s, "uint {prefix}LoadS(uint s, uint4 r) {{ {} return b.Load(select(y == 0u, 0u, y - 1u + (s & 65535u))); }}", page("s"));
+        for n in 2..=4u32 {
+            let each = format!("uint t = b.Load(select(y == 0u, 0u, y - 1u + (sk & 65535u))); o = select(k == {}, {}, o);", vector(n, &|k| format!("{k}u")), vector(n, &|_| "t".into()));
+            // the dwords of one address: all of them in one read when they lie in one page, from
+            // offset 0 on when that page is a miss
+            let _ = writeln!(
+                s,
+                "uint{n} {prefix}Load{n}S(uint s, uint4 r) {{ uint{n} o = {}; bool x = (s & 65535u) > {}u; uint n = select(x, {n}u, 1u); \
+                 [loop] for (uint k = 0u; k < n; k++) {{ uint sk = s + 4u * k; {} if (x) {{ {each} }} else {{ o = b.Load{n}(select(y == 0u, 0u, y - 1u + (sk & 65535u))); }} }} return o; }}",
+                vector(n, &|_| "0u".into()),
+                65536 - 4 * n,
+                page("sk")
+            );
+            if prefix != "xcl_m" {
+                continue;
+            }
+            // the dwords of a four-address load (`xcl_loadx4G`): in one read when they lie in one
+            // page and every result is taken (`m`), else one a dword. A miss is read at offset 0,
+            // or at the dword's own offset in the view when the four addresses were in one page
+            // (`e`): that is the page of the dwords when all are taken, and page 0 of the low
+            // word (the page of address 0, which a dword not taken has) when some are not; `z`
+            // is the low word's page of the anchor.
+            let own = (0..4).map(|k| format!("{}u", 4 * k.min(n - 1))).collect::<Vec<_>>().join(", ");
+            let at = "select(y == 0u, select(e, sk & 65535u, 0u), y - 1u + (sk & 65535u))";
+            let _ = writeln!(
+                s,
+                "uint4 {prefix}Load{n}X(uint s, uint z, uint4 r, bool4 m) {{ uint{n} o = {}; bool c = (s & 65535u) > {}u; bool x = or(c, !all(m)); \
+                 bool e = or(!x, all(or(!m, ((z + ((s + uint4({own})) >> 16)) & 65535u) == 0u))); uint n = select(x, {n}u, 1u); \
+                 [loop] for (uint k = 0u; k < n; k++) {{ uint sk = s + 4u * k; {} if (x) {{ uint t = b.Load({at}); o = select(k == {}, {}, o); }} else {{ o = b.Load{n}({at}); }} }} return uint4(o{}); }}",
+                vector(n, &|_| "0u".into()),
+                65536 - 4 * n,
+                page("sk"),
+                vector(n, &|k| format!("{k}u")),
+                vector(n, &|_| "t".into()),
+                ", 0u".repeat(4 - n as usize)
+            );
+        }
+    }
+    for group in [false, true].into_iter().filter(|g| groups || !g) {
+        let (name, params) = if group { ("xcl_loadx4G", "uint4 a, uint64_t g, uint4 r") } else { ("xcl_loadx4", "uint4 a") };
+        let at = if group {
+            "uint2 p = xcl_group_at(u, g, r); bool f = and(xcl_window(u, xcl_w), ak <= 0xfffffffcu); p = uint2(select(f, xcl_mem_views + xcl_w, p.x), select(f, ak, p.y));"
+        } else {
+            "uint2 p = xcl_at(u, xcl_w, 0xfffffffcu);"
+        };
+        let _ = writeln!(
+            s,
+            "uint4 {name}({params}) {{ bool same = all((a >> 16) == (a.x >> 16)); uint4 o = uint4(0u, 0u, 0u, 0u); uint n = select(same, 1u, 4u); \
+             [loop] for (uint k = 0u; k < n; k++) {{ uint ak = a[k]; uint64_t u = xcl_operand_va(ak); {at} {} \
+             if (same) {{ uint4 q = (p.y & 0xffff0000u) | (a & 65535u); o = uint4(b.Load(q.x), b.Load(q.y), b.Load(q.z), b.Load(q.w)); }} \
+             else {{ uint t = b.Load(p.y); o = select(k == uint4(0u, 1u, 2u, 3u), uint4(t, t, t, t), o); }} }} return o; }}",
+            buffer(coherent, "p.x")
+        );
+    }
+}
+
+/// `PHYSICAL_ACCESS` for the compact accessors: its variables and `xcl_operand_va`, then
+/// `COMPACT_RESOLVE` in the place of its direct test and its resolution.
+fn compact_physical_access() -> String {
+    let shared = PHYSICAL_ACCESS.split_once("bool xcl_direct(").expect("PHYSICAL_ACCESS has its direct test").0;
+    format!("{shared}{COMPACT_RESOLVE}")
+}
+
+/// What `GPU_PAGE_DIRECTORY_HLSL` and `PHYSICAL_ACCESS` resolve, with one exit:
+/// `xcl_resolve_va(va)` is the view and offset of the guest address `va` as before. The tests
+/// that sent an address to the miss view at once (a high half past 16 bits is one whether it is
+/// the address's or the window base's that stands for a null one: `ok`) and the decoding of a
+/// page table entry are selects, and the walk (the directory entry of the address's 4 GiB, then its GPU leaf and,
+/// where that has no entry, its default leaf) is the only code behind a branch. An entry of 0
+/// after the walk, or without a directory, is an absent page: the window of the address, or a
+/// miss past the windows.
+/// `xcl_window(va, w)` is the earlier direct test without its length test, and
+/// `xcl_at(va, w, last)` the view and offset of an access the accessors made in two paths: the
+/// window `w`'s own view at the address when the access is direct (it starts at or before
+/// `last`, the last offset it fits the window at), the resolved page's else.
+const COMPACT_RESOLVE: &str = r#"uint2 xcl_resolve_va(uint64_t va) {
+    uint hi = (uint)(va >> 32), lo = (uint)va;
+    uint h = select(hi == 0u, xcl_uma_base, hi);
+    bool ok = !or(xcl_origin > 65535u, or((xcl_origin == 0u) != (hi == 0u), h > 65535u));
+    uint pte = 0u;
+    if (and(ok, xcl_page_table != 0u)) {
+        ByteAddressBuffer root = ResourceDescriptorHeap[xcl_page_table];
+        uint2 leaves = root.Load2(h * 8u);
+        if (leaves.x != 0u) { ByteAddressBuffer leaf0 = ResourceDescriptorHeap[NonUniformResourceIndex(leaves.x)]; pte = leaf0.Load((lo >> 16) * 4u); }
+        if (and(pte == 0u, leaves.y != 0u)) { ByteAddressBuffer leaf1 = ResourceDescriptorHeap[NonUniformResourceIndex(leaves.y)]; pte = leaf1.Load((lo >> 16) * 4u); }
+    }
+    uint v = pte & 0xfffffu;
+    bool mapped = and((pte & 0xf8000000u) == 0x80000000u, v != 0u);
+    uint w = h - xcl_uma_base;
+    bool hit = and(ok, or(mapped, and(pte == 0u, w < xcl_windows)));
+    return uint2(select(hit, select(mapped, v, xcl_mem_views + w), xcl_mem_views + 4u),
+        select(hit, select(mapped, ((pte >> 20) & 127u) << 16, lo & 0xffff0000u) | (lo & 65535u), 0u));
+}
+uint2 xcl_resolve_read(uint a) { return xcl_resolve_va(xcl_operand_va(a)); }
+bool xcl_window(uint64_t va, uint w) {
+    uint hi = (uint)(va >> 32);
+    return and(and(xcl_page_table == 0u, xcl_origin <= 65535u), and(w < xcl_windows, select(xcl_origin == 0u, and(hi == 0u, w == 0u), hi == xcl_uma_base + w)));
+}
+uint2 xcl_at(uint64_t va, uint w, uint last) {
+    uint2 p = xcl_resolve_va(va);
+    bool d = and(xcl_window(va, w), (uint)va <= last);
+    return uint2(select(d, xcl_mem_views + w, p.x), select(d, (uint)va, p.y));
+}
+"#;
 
 /// The definition of function `name` in `src` (it starts a line), to its closing brace.
 fn function_text<'a>(src: &'a str, name: &str) -> Option<&'a str> {
@@ -7319,6 +7922,8 @@ const GROUP_PAGES_LOOP: &str = "    uint4 r = uint4(0u, 0u, 0u, 0u);\n    [loop]
 /// `b` lie in `b`'s page and the next.
 pub(super) const LD_RAW_LOADS: &str = "uint4 w = mem.Load4(b); uint w4 = mem.Load(b + 16u);";
 pub(super) const LD_RAW_GROUPED: &str = "uint64_t g = xcl_operand_va(b); uint4 r = xcl_group_pages(g); uint4 w = mem.Load4G(b, g, r); uint w4 = mem.LoadG(b + 16u, g, r);";
+/// The same group with its pages folded (`group_fold`).
+pub(super) const LD_RAW_FOLDED: &str = "uint64_t g = xcl_operand_va(b); uint gs = (uint)g & 65535u; uint4 r = mem.Fold(g, xcl_group_pages(g)); uint4 w = mem.Load4S(gs, r); uint w4 = mem.LoadS(gs + 16u, r);";
 
 /// The memory helpers of `src` (`PRELUDE_MEM_ACCESS`, or a line of the program) on the
 /// per-lane window: `memv` and the helpers' `_v` forms.
@@ -7624,6 +8229,70 @@ uint4 bvh_intersect(uint type, uint at, float tmax, float3 o, float3 d, float3 i
 }
 "#;
 
+// xsemu: from xcl-dev/xcl nvidia-dev 9b455a1a,67a08dbe crates/xcl/src/gpu/recomp/emit.rs
+/// `xcl_x_lw` bits: LDS written, LDS read since the halves last met.
+pub(crate) const LDS_WROTE: u32 = 1;
+pub(crate) const LDS_READ: u32 = 2;
+
+/// Split wave64: how the LDS instruction `name` (lower case) keeps the console wave's order of
+/// LDS accesses across its halves (`xcl_x_lw`): (the bits after which it meets the other half
+/// first, the bits it sets). A load waits for the other half's earlier writes, a store for its
+/// earlier reads (on the console every lane reads before any lane of a later instruction
+/// writes), an atomic (and the `src2` forms, which read LDS too) for both; the cross-lane DS
+/// forms touch no LDS. A store does not wait for the other half's earlier stores.
+pub(crate) fn x64_lds_order(name: &str) -> (u32, u32) {
+    if matches!(name, "ds_swizzle_b32" | "ds_bpermute_b32" | "ds_permute_b32" | "ds_nop") || !name.starts_with("ds_") {
+        (0, 0)
+    } else if name.starts_with("ds_read") {
+        (LDS_WROTE, LDS_READ)
+    } else if name.starts_with("ds_write") && !name.contains("src2") {
+        (LDS_READ, LDS_WROTE)
+    } else {
+        (LDS_WROTE | LDS_READ, LDS_WROTE | LDS_READ)
+    }
+}
+
+/// Whether the program writes LDS (`x64_lds_order`): without that its split wave64 form
+/// needs no meet for the order of its LDS accesses.
+pub(crate) fn writes_lds(insts: &[Decoded]) -> bool {
+    insts.iter().any(|d| d.enc.name == "ENC_DS" && x64_lds_order(&d.inst.name.to_ascii_lowercase()).1 & LDS_WROTE != 0)
+}
+
+/// Whether the split wave64 form keeps the console wave's order of LDS accesses
+/// (`x64_lds_order`); `XCL_X_LDS_ORDER=0` leaves it out (the translated cache's identity
+/// tells the two apart).
+pub(crate) fn lds_order_wanted() -> bool {
+    #[cfg(test)]
+    if NO_LDS_ORDER.get() {
+        return false;
+    }
+    lds_order_for(std::env::var("XCL_X_LDS_ORDER").ok().as_deref())
+}
+
+/// `lds_order_wanted` for the value `env` of `XCL_X_LDS_ORDER`: on unless it is `0`.
+pub(super) fn lds_order_for(env: Option<&str>) -> bool {
+    env.map_or(true, |v| v.trim() != "0")
+}
+
+/// Split wave64 translations that kept the LDS order: the first is logged (the switch engaged),
+/// then every power of ten.
+fn note_lds_order() {
+    static PROGRAMS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = PROGRAMS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+    if n == 1 {
+        crate::xlog_info!("[SHADER] XCL_X_LDS_ORDER: split wave64 LDS order engaged (an LDS read meets the other half after its writes, a write after its reads; XCL_X_LDS_ORDER=0 turns it off)");
+    } else if 10u64.pow(n.ilog10()) == n {
+        crate::xlog_info!("[SHADER] XCL_X_LDS_ORDER: {n} split wave64 translations kept the LDS order");
+    }
+}
+
+/// `PRELUDE_X64` continued for a program that keeps the LDS order (`x64_lds_order`).
+const PRELUDE_X64_LDS_ORDER: &str = "static uint xcl_x_lw = 0u; // LDS written (1) / read (2) since the halves last met: a read meets first after a write, a write after a read\n";
+
+/// The step both meets start with, after which the LDS order's flag is cleared (before any
+/// return: a meet without a partner half clears it too).
+const X64_MEET_STEP: &str = "    xcl_xp = xcl_xp ^ XCL_X_SLOT;\n";
+
 /// A console wave64 as two hardware wave32 halves of one thread group (docs/wave64-on-wave32.md):
 /// per-lane code is unchanged, and the halves meet ("exchange") wherever a value has to be
 /// the whole wave's – masks, lane reads, coherent scalar loads – so both hold the same SGPRs
@@ -7895,6 +8564,15 @@ const PRELUDE_START: &str = r#"
 static uint lane_id;
 // loop iterations a lane may run (`LOOP_GUARD`; the translation's `loop_guard`)
 static uint xcl_budget = XCL_LOOP_GUARD;
+"#;
+
+/// `PRELUDE_START` of a program with region budgets (`LoopBudget::Regions`).
+pub(super) const PRELUDE_START_REGIONS: &str = r#"
+static uint lane_id;
+// loop iterations a lane may still run in the loop region it is in (`LOOP_GUARD`), and in all
+// the regions after it (`LOOP_REGION_ENTER`; the translation's `loop_budget`)
+static uint xcl_budget = 0u;
+static uint xcl_btotal = XCL_LOOP_TOTAL;
 "#;
 
 const PRELUDE_TRIP_COUNTERS: &str = r#"// a guard gave up in this lane (0: the loop budget, 1: a wave64 meet, 2: a barrier, 3: a

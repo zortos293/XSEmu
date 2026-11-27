@@ -214,6 +214,20 @@ impl Uses {
         }
     }
 
+    /// Of the pipelines `sizes` (each with the bytes of its code), (how many, their bytes) by when
+    /// a list last took each: within each of `AGES_S`, longer ago, and never noted.
+    fn ages(&self, sizes: &[(usize, usize)], now: u64) -> [(usize, usize); AGES_S.len() + 2] {
+        let mut out = [(0, 0); AGES_S.len() + 2];
+        for &(pso, bytes) in sizes {
+            let at = match self.last.get(&pso) {
+                Some(&last) => AGES_S.iter().position(|&s| now.saturating_sub(last) < s * 1000).unwrap_or(AGES_S.len()),
+                None => AGES_S.len() + 1,
+            };
+            out[at] = (out[at].0 + 1, out[at].1 + bytes);
+        }
+        out
+    }
+
     /// When a list last took `pso`, if it may be taken from its stand-in (no bundle took it).
     fn candidate(&self, pso: usize) -> Option<u64> {
         if self.pinned.contains(&pso) {
@@ -241,6 +255,60 @@ impl Uses {
 }
 
 static USES: Mutex<Option<Uses>> = Mutex::new(None);
+
+/// the ages `by_age` sorts the code in use by, in seconds
+const AGES_S: [u64; 3] = [5, 30, 120];
+/// (when, the frames shown by then), one a second for a little over the longest of `AGES_S`
+static FRAMES: Mutex<std::collections::VecDeque<(u64, u64)>> = Mutex::new(std::collections::VecDeque::new());
+
+/// `frames` were shown so far (told once a second by `pso_async`'s code thread).
+pub(super) fn frame_mark(frames: u64) {
+    let (mut f, now) = (FRAMES.lock().unwrap(), now_ms());
+    f.push_back((now, frames));
+    while f.front().is_some_and(|&(at, _)| now.saturating_sub(at) > (AGES_S[AGES_S.len() - 1] + 10) * 1000) {
+        f.pop_front();
+    }
+}
+
+/// How many frames were shown in the last `secs` seconds, of the marks `marks` (None: the marks
+/// do not go back that far).
+fn frames_in(marks: &std::collections::VecDeque<(u64, u64)>, now: u64, secs: u64) -> Option<u64> {
+    let &(_, newest) = marks.back()?;
+    let &(_, then) = marks.iter().rev().find(|&&(at, _)| now.saturating_sub(at) >= secs * 1000)?;
+    Some(newest.saturating_sub(then))
+}
+
+/// A line for the log: the code in use by when a list last took its pipeline, and the frames
+/// shown meanwhile. What the lists took within a frame or two cannot be taken away, whatever the
+/// idle time, so this says whether a budget can hold at all (`XCL_SHADER_CODE_AGES=0`: no line;
+/// None with no budget too).
+pub(super) fn by_age() -> Option<String> {
+    static ON: OnceLock<bool> = OnceLock::new();
+    if budget() == 0 || !*ON.get_or_init(|| std::env::var("XCL_SHADER_CODE_AGES").map_or(true, |v| v.trim() != "0")) {
+        return None;
+    }
+    let sizes: Vec<(usize, usize)> = METER.lock().unwrap().as_ref()?.seen.iter().map(|(&pso, &(_, bytes))| (pso, bytes.unwrap_or(0))).collect();
+    let now = now_ms();
+    let (ages, parked, pinned) = {
+        let u = USES.lock().unwrap();
+        let u = u.as_ref()?;
+        (u.ages(&sizes, now), u.parked.len(), u.pinned.len())
+    };
+    let frames = {
+        let f = FRAMES.lock().unwrap();
+        AGES_S.map(|s| frames_in(&f, now, s).map_or("?".to_string(), |n| n.to_string()))
+    };
+    Some(format!(
+        "D3D12.X: the compiled code in use by when a list last took its pipeline: {} MB ({}) in the last {} s, {} MB ({}) up to {} s ago, {} MB ({}) up to {} s ago, {} MB ({}) longer ago, {} MB ({}) never noted; frames shown in the last {} / {} / {} s: {} / {} / {}; {parked} taken away are still kept for their lists, {pinned} are held by bundles (XCL_SHADER_CODE_AGES=0: no such line)",
+        ages[0].1 >> 20, ages[0].0, AGES_S[0],
+        ages[1].1 >> 20, ages[1].0, AGES_S[1],
+        ages[2].1 >> 20, ages[2].0, AGES_S[2],
+        ages[3].1 >> 20, ages[3].0,
+        ages[4].1 >> 20, ages[4].0,
+        AGES_S[0], AGES_S[1], AGES_S[2],
+        frames[0], frames[1], frames[2],
+    ))
+}
 
 /// Of the pipelines that may be released, each (when a list last took it, its bytes, which), the
 /// ones to release for `over` bytes to go: the longest unused first.
@@ -434,6 +502,9 @@ pub(super) fn log_removal() {
         None if on() => crate::xlog_error!("shader code in use at the removal: no pipeline was bound"),
         None => (),
     }
+    if let Some(line) = by_age() {
+        crate::xlog_error!("at the removal: {line}");
+    }
 }
 
 #[cfg(test)]
@@ -549,6 +620,22 @@ mod tests {
         // XCL releases it for good (its stand-in went): no longer pinned
         u.pinned.remove(&0x20);
         assert_eq!(u.through(50_100 + HOLD_MAX_MS), [0x20]);
+    }
+
+    #[test]
+    fn the_code_in_use_is_sorted_by_when_a_list_last_took_it() {
+        let mut u = Uses::default();
+        let now = 500_000;
+        u.take(0xA, 0x10, now - 1_000);
+        u.take(0xA, 0x20, now - 4_999);
+        u.take(0xA, 0x30, now - 5_000);
+        u.take(0xA, 0x40, now - 100_000);
+        u.take(0xA, 0x50, now - 120_000);
+        let sizes = [(0x10, 1 << 20), (0x20, 2 << 20), (0x30, 4 << 20), (0x40, 8 << 20), (0x50, 16 << 20), (0x60, 32 << 20)];
+        assert_eq!(u.ages(&sizes, now), [(2, 3 << 20), (1, 4 << 20), (1, 8 << 20), (1, 16 << 20), (1, 32 << 20)]);
+        let marks: std::collections::VecDeque<(u64, u64)> = [(now - 40_000, 100), (now - 30_000, 101), (now - 6_000, 103), (now - 5_000, 104), (now - 1_000, 104), (now, 106)].into();
+        assert_eq!((frames_in(&marks, now, 5), frames_in(&marks, now, 30), frames_in(&marks, now, 120)), (Some(2), Some(5), None));
+        assert_eq!(frames_in(&Default::default(), now, 5), None);
     }
 
     #[test]

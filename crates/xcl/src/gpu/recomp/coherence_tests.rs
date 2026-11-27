@@ -43,6 +43,9 @@ fn legacy_hlsl(insts: &[Inst], opt: &Options) -> String {
 
 #[test]
 fn compute_per_access_coherence_caches_only_before_first_flagged_read() {
+    // the text this test reads is the earlier one (`XCL_RECOMP_NO_COMPACT_ACCESS`); the compact accessors have
+    // their own tests (`compact_access_tests`)
+    super::emit::NO_COMPACT_ACCESS.set(true);
     let wide = ("S_LOAD_DWORDX4", "ENC_SMEM", &[("SDATA", 12), ("SOFFSET", 125), ("OFFSET", 16)][..]);
     let wait = ("S_WAITCNT", "ENC_SOPP", &[("SIMM16", 0)][..]);
     for windows in [1, 4] {
@@ -138,6 +141,20 @@ fn compute_per_access_coherence_does_not_cache_branching_or_polling() {
 /// invalidates caches itself keeps it everywhere, and a program that is not coherent has neither.
 #[test]
 fn plain_loads_end_at_the_first_write_flag_barrier_or_loop() {
+    // through a group's pages, then with them folded (`emit::group_fold`): the same loads plain
+    // with a base's pages kept across blocks or not (`emit::keep_pages`), and with a four-address
+    // load that is alone on its base in a group of its own or not (`emit::lone_loads`)
+    for (fold, kept, lone) in [(false, false, false), (true, false, false), (false, true, false), (true, true, false), (false, false, true), (true, true, true)] {
+        super::emit::NO_GROUP_FOLD.set(!fold);
+        super::emit::NO_KEPT_PAGES.set(!kept);
+        super::emit::NO_LONE_LOADS.set(!lone);
+        plain_loads_end(fold, kept, lone);
+    }
+    super::emit::NO_KEPT_PAGES.set(false);
+    super::emit::NO_LONE_LOADS.set(false);
+}
+
+fn plain_loads_end(fold: bool, kept: bool, lone: bool) {
     let second = ("S_LOAD_DWORD", "ENC_SMEM", &[("SDATA", 10), ("SOFFSET", 125), ("OFFSET", 8)][..]);
     let wide = ("S_LOAD_DWORDX4", "ENC_SMEM", &[("SDATA", 12), ("SOFFSET", 125), ("OFFSET", 16)][..]);
     let buf = ("S_BUFFER_LOAD_DWORDX4", "ENC_SMEM", &[("SDATA", 16), ("SBASE", 4), ("SOFFSET", 125)][..]);
@@ -166,23 +183,27 @@ fn plain_loads_end_at_the_first_write_flag_barrier_or_loop() {
             (h, calls)
         };
         // the packed form has no page groups
-        let g = if split && !legacy { "" } else { "G" };
+        let g = if split && !legacy { "" } else if fold { "S" } else { "G" };
         let c = |n: &str| format!("xcl_m_cachedLoad{n}{g}");
         let m = |n: &str| format!("xcl_mLoad{n}{g}");
+        // the four-address load of each view
+        let (x4c, x4) = if g == "S" { ("xcl_m_cachedLoad4X".to_string(), "xcl_mLoad4X".to_string()) } else { (format!("xcl_loadx4{g}_cached"), format!("xcl_loadx4{g}")) };
         let cases: [(&[Inst], Vec<String>); 5] = [
-            (&[PLAIN, second, wide, buf, buf1, ATOMIC, PLAIN, buf], vec![c(""), c(""), c("4"), format!("xcl_loadx4{g}_cached"), c(""), m(""), format!("xcl_loadx4{g}")]),
+            // (the last load is alone on its base: its own accessor where a group needs a second load)
+            (&[PLAIN, second, wide, buf, buf1, ATOMIC, PLAIN, buf], vec![c(""), c(""), c("4"), x4c.clone(), c(""), m(""), if lone && !g.is_empty() { "xcl_loadx4".to_string() } else { x4.clone() }]),
             (&[PLAIN, wide, store, PLAIN, ATOMIC], vec![c(""), c("4"), m("")]),
             (&[PLAIN, wide, FLAGGED, PLAIN, ATOMIC], vec![c(""), c("4"), m(""), m("")]),
             (&[PLAIN, wide, barrier, PLAIN, ATOMIC], vec![c(""), c("4"), m("")]),
-            // the loop's head is its second load: the first runs once, before it
-            (&[PLAIN, second, cmp, back, PLAIN, ATOMIC], vec!["xcl_m_cachedLoad".into(), "xcl_mLoad".into(), "xcl_mLoad".into()]),
+            // the loop's head is its second load: the first runs once, before it. The three are
+            // in three blocks: each alone, or through the pages kept for their base
+            (&[PLAIN, second, cmp, back, PLAIN, ATOMIC], if kept { vec![c(""), m(""), m("")] } else { vec!["xcl_m_cachedLoad".into(), "xcl_mLoad".into(), "xcl_mLoad".into()] }),
         ];
         for (code, want) in cases {
             let (h, calls) = loads(code, true);
             assert_eq!(calls, want, "{code:?}");
             assert!(h.contains("globallycoherent "));
             let (off, calls) = loads(code, false);
-            assert!(!off.contains("_cached") && calls.iter().all(|c| c.starts_with("xcl_mLoad") || c == &format!("xcl_loadx4{g}")), "{calls:?}");
+            assert!(!off.contains("_cached") && calls.iter().all(|c| c.starts_with("xcl_mLoad") || c == &x4 || lone && c == "xcl_loadx4"), "{calls:?}");
         }
         for code in [&[PLAIN, wide, inv, ATOMIC][..], &[ATOMIC, PLAIN], &[PLAIN, wide, store]] {
             let (h, _) = loads(code, true);

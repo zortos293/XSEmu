@@ -756,6 +756,7 @@ pub(super) fn init_with_remap(allow_driver_remap: bool) -> Result<String, String
             }
         }
         start_trim();
+        game_trim_device(true);
         let factory: IDXGIFactory6 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).map_err(|e| format!("DXGI: {e}"))?;
         let mut device: Option<ID3D12Device> = None;
         let mut name = String::new();
@@ -787,6 +788,10 @@ pub(super) fn init_with_remap(allow_driver_remap: bool) -> Result<String, String
                 d
             }
         };
+        game_trim_device(false);
+        if !WARM_UP_PROCESS.load(Ordering::Relaxed) {
+            crate::preflight::log_device_checks(&device, &name);
+        }
         if std::env::var_os("XCL_DRED").is_some() {
             let version = if device.cast::<ID3D12DeviceRemovedExtendedData2>().is_ok() { "2" } else if device.cast::<ID3D12DeviceRemovedExtendedData1>().is_ok() { "1" } else if device.cast::<ID3D12DeviceRemovedExtendedData>().is_ok() { "0" } else { "none" };
             crate::xlog_info!("D3D12: the device's DRED interface: version {version}");
@@ -812,6 +817,7 @@ pub(super) fn init_with_remap(allow_driver_remap: bool) -> Result<String, String
         crate::xlog_info!("D3D12.X: physical directory: {directory}");
         super::image_writeback::init();
         super::device_x::probe_dynamic_depth_bias(&device);
+        super::castable::init(&device);
         let raw = device.into_raw(); // one reference kept for the process lifetime
         adopt(raw, Kind::Device);
         DEVICE.store(raw as usize, Ordering::Release);
@@ -831,9 +837,14 @@ fn start_trim() {
     static STARTED: std::sync::Once = std::sync::Once::new();
     STARTED.call_once(|| {
         let _ = std::thread::Builder::new().name("xcl-trim".into()).spawn(|| loop {
-            std::thread::sleep(std::time::Duration::from_secs(1));
-            if available_physical() < TRIM_BELOW {
-                trim_mapped_files();
+            std::thread::sleep(trim_every());
+            let game = game_trimming();
+            if warm_trim() || game || available_physical() < TRIM_BELOW {
+                let took = std::time::Instant::now();
+                let freed = trim_mapped_files();
+                if game {
+                    game_trimmed(freed, took.elapsed());
+                }
             }
         });
     });
@@ -2092,6 +2103,7 @@ pub(super) unsafe extern "system" fn res_release(this: *mut c_void) -> u32 {
             super::title_textures::forget(this as usize);
         }
         super::depth_uav::forget(this as usize);
+        super::e5_copy::forget(this as usize);
         super::depth_state::forget(this as usize);
         let gone = UMA_BUFFERS.lock().unwrap().as_mut().and_then(|m| m.remove(&(this as usize)));
         if let Some((p, n, own)) = gone {
@@ -2292,6 +2304,16 @@ pub fn is_translated_compute(pso: usize) -> bool {
     pso != 0 && TRANSLATED_COMPUTE.lock().unwrap().as_ref().is_some_and(|s| s.contains(&pso))
 }
 
+/// translated compute pipelines whose program runs a dispatch spread over x and y as the
+/// console's groups (XCL's own translation with `recomp::dispatch_spread`, not CGBJ's)
+static SPREAD_COMPUTE: Mutex<Option<HashSet<usize>>> = Mutex::new(None);
+
+/// Whether the translated compute pipeline `pso` runs a dispatch spread past 65,535 groups on an
+/// axis (io[`IO_GROUP_SPREAD`]) as the console's groups.
+pub fn spreads_groups(pso: usize) -> bool {
+    pso != 0 && SPREAD_COMPUTE.lock().unwrap().as_ref().is_some_and(|s| s.contains(&pso))
+}
+
 #[cfg(test)]
 pub(super) fn register_translated_compute_for_test(pso: usize) {
     if pso != 0 {
@@ -2339,6 +2361,9 @@ fn forget_pso(pso: usize) {
         m.remove(&pso);
     }
     if let Some(s) = TRANSLATED_COMPUTE.lock().unwrap().as_mut() {
+        s.remove(&pso);
+    }
+    if let Some(s) = SPREAD_COMPUTE.lock().unwrap().as_mut() {
         s.remove(&pso);
     }
     if let Some(s) = TRANSLATED_GRAPHICS.lock().unwrap().as_mut() {
@@ -2614,8 +2639,12 @@ unsafe extern "system" fn dev_create_dsv_x(this: *mut c_void, res: *mut c_void, 
     }
     f(this, res, copy.as_ref().map_or(desc, |c| c as *const _), cpu);
     image_views::dsv(this as usize, cpu as usize, res, copy.as_ref());
+    super::depth_uav::note_dsv(cpu as usize, res, copy.as_ref());
     if super::depth_capture_views::enabled() {
         super::depth_capture_views::record_view(cpu as usize, res, copy.as_ref());
+    }
+    if super::dsv_trace::on() {
+        super::dsv_trace::created(res, cpu as usize, copy.as_ref().map_or(0, |c| c.Format.0));
     }
 }
 
@@ -2713,14 +2742,21 @@ unsafe fn trace_native_srv(
 unsafe extern "system" fn dev_create_srv_x(this: *mut c_void, res: *mut c_void, desc: *const D3D12_SHADER_RESOURCE_VIEW_DESC, cpu: u64) {
     let f: unsafe extern "system" fn(*mut c_void, *mut c_void, *const D3D12_SHADER_RESOURCE_VIEW_DESC, u64) = std::mem::transmute(orig_fn(this, 18));
     let requested = desc.as_ref();
+    // an R9G9B9E5 view of a texture that does not show the R32_UINT one at its address (`e5_copy`)
+    let res = super::e5_copy::view(res, requested);
     let mut copy = requested.copied();
     if let Some(c) = copy.as_mut() {
         c.Format = windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT(super::device_x::pc_view_format(c.Format.0 as u32) as i32);
     }
     // a depth buffer's view in the formats the PC has for it (a D24S8 format itself, R16_UNORM of
     // a D16S8 buffer …: an invalid call, the device removed)
-    if let Some(v) = ID3D12Resource::from_raw_borrowed(&res).and_then(|r| pc_srv(&r.GetDesc(), copy.as_ref())) {
+    let rd = ID3D12Resource::from_raw_borrowed(&res).map(|r| r.GetDesc());
+    if let Some(v) = rd.as_ref().and_then(|rd| pc_srv(rd, copy.as_ref())) {
         copy = Some(v);
+    }
+    if let (Some(rd), Some(c)) = (rd.as_ref(), copy.as_ref()) {
+        super::castable::check_view("an SRV", res, rd, c.Format.0 as u32);
+        super::castable::note_view("an SRV", res, rd, requested.map_or(0, |r| r.Format.0 as u32), c.Format.0 as u32);
     }
     let desc = copy.as_ref().map_or(desc, |c| c as *const _);
     let Some(slot) = super::console_heap::slot(cpu) else { return f(this, res, desc, cpu) };
@@ -2864,7 +2900,9 @@ unsafe extern "system" fn dev_create_srv_at_x(this: *mut c_void, rdesc: *const u
         let words = buffer_words_at(va, v.Format, b.FirstElement, b.NumElements, b.StructureByteStride, raw);
         return super::console_heap::write_observed(&slot, &words, None,None,super::console_heap::vsharp::Writer::Api { kind: "by-address-srv", input: va, first: b.FirstElement, count: b.NumElements, stride: b.StructureByteStride, raw: raw });
     }
-    dev_create_srv_x(this, resource_at(this, rdesc, va), &v, cpu);
+    let res = resource_at(this, rdesc, va);
+    super::dsv_trace::view_at("SRV", va as usize, res);
+    dev_create_srv_x(this, res, &v, cpu);
 }
 
 /// device #71: the same for an unordered access view ({ the PC's UAV desc; GPU address @0x28;
@@ -2880,9 +2918,19 @@ unsafe extern "system" fn dev_create_uav_at_x(this: *mut c_void, rdesc: *const u
         let b = &v.Anonymous.Buffer;
         let raw = b.Flags.0 & D3D12_BUFFER_UAV_FLAG_RAW.0 != 0;
         let words = buffer_words_at(va, v.Format, b.FirstElement, b.NumElements, b.StructureByteStride, raw);
+        // shaders store through this view at an address no buffer need be placed at: tiles there
+        // that have no video memory yet (`sparse::Lazy`) get it now
+        let element = match (raw, b.StructureByteStride) {
+            (true, _) => 4,
+            (false, 0) => crate::gpu::desc::format_bytes(crate::gpu::desc::gfx10_format(v.Format).unwrap_or(22)) as u64,
+            (false, stride) => stride as u64,
+        };
+        super::sparse::before_shader_write(va.saturating_add(b.FirstElement.saturating_mul(element)) as usize, (b.NumElements as u64).saturating_mul(element) as usize);
         return super::console_heap::write_observed(&slot, &words, None,None,super::console_heap::vsharp::Writer::Api { kind: "by-address-uav", input: va, first: b.FirstElement, count: b.NumElements, stride: b.StructureByteStride, raw: raw });
     }
-    dev_create_uav_x(this, resource_at(this, rdesc, va), std::ptr::null_mut(), &v, cpu);
+    let res = resource_at(this, rdesc, va);
+    super::dsv_trace::view_at("UAV", va as usize, res);
+    dev_create_uav_x(this, res, std::ptr::null_mut(), &v, cpu);
 }
 
 /// V# of `n` elements from element `first` of the buffer at `va`.
@@ -2979,7 +3027,9 @@ pub(super) unsafe extern "system" fn dev_create_uav_x(this: *mut c_void, res: *m
     let requested = desc.as_ref();
     let mut copy = requested.copied();
     if let (Some(c), Some(rd)) = (copy.as_mut(), rd.as_ref()) {
-        c.Format = windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT(super::device_x::pc_shader_view_format(rd.Format.0 as u32, c.Format.0 as u32) as i32);
+        c.Format = windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT(super::device_x::pc_written_view_format(rd.Format.0 as u32, c.Format.0 as u32, super::castable::on()) as i32);
+        super::castable::check_view("a UAV", res, rd, c.Format.0 as u32);
+        super::castable::note_view("a UAV", res, rd, requested.map_or(0, |r| r.Format.0 as u32), c.Format.0 as u32);
     }
     let desc = copy.as_ref().map_or(desc, |c| c as *const _);
     super::present::note_use(res as usize, super::present::USE_UAV);
@@ -2999,6 +3049,11 @@ pub(super) unsafe extern "system" fn dev_create_uav_x(this: *mut c_void, res: *m
         super::device_x::watch_depth_first_view(res as usize, "UAV");
     }
     let shadow = no_uav.and_then(|rd| super::depth_uav::view(res, rd, desc.as_ref()));
+    if shadow.is_none() && super::dsv_trace::on() {
+        if let Some(rd) = no_uav {
+            super::dsv_trace::null_uav(res as usize, rd, desc.as_ref().map(|d| d.Format.0));
+        }
+    }
     if let Some((twin, _, _)) = &shadow { image_views::note_twin(*twin as usize, res as usize); }
     let lineage = if super::depth_lineage::enabled() && super::depth_lineage::interested(res as usize) {
         no_uav.and_then(|rd| super::device_x::lineage_uav(
@@ -3169,6 +3224,8 @@ unsafe extern "system" fn dev_create_committed_resource_x(this: *mut c_void, pro
     // its own (UNKNOWN); the console layout matters only where console code reads the memory
     let mut pc_desc = [0u8; 56];
     let console_desc = desc;
+    let _castable = super::castable::Scope::enter((desc != 0 && crate::gpu::shader::readable(desc, 0x38))
+        .then(|| (desc as *const [u8; 0x38]).read_unaligned()).as_ref());
     let mut desc = desc;
     if desc != 0 {
         std::ptr::copy_nonoverlapping(desc as *const u8, pc_desc.as_mut_ptr(), 56);
@@ -3424,6 +3481,7 @@ macro_rules! as_usize {
 /// subsequent Reset and console calls dispatch through the current native table.
 unsafe extern "system" fn cl_close(this: *mut c_void) -> HRESULT {
     super::list_x::before_close(this);
+    super::depth_uav::before_close(this);
     super::gpu_timing::before_close(this);
     let ext = *(this as *const usize);
     let f: RefFn = std::mem::transmute(orig_fn(this, slot_of(this, "Close")));
@@ -3711,7 +3769,15 @@ macro_rules! committed_creator {
         ) -> HRESULT {
             let session = 0usize $(| $session)?;
             committed_with_residency(this, props, flags, desc, $desc1, session, ppv, ($method, "host_state", initial),
-                |p| $raw(this, p, flags, desc, initial, clear $(, $session)?, riid, ppv))
+                |p| {
+                    // a console R9G9B9E5 target made castable R11G11B10_FLOAT (`castable`)
+                    if !$desc1 && session == 0 {
+                        if let Some(hr) = super::castable::committed(this, p, flags, desc, initial, clear, riid, ppv) {
+                            return hr;
+                        }
+                    }
+                    $raw(this, p, flags, desc, initial, clear $(, $session)?, riid, ppv)
+                })
         }
     };
 }
@@ -3800,7 +3866,9 @@ macro_rules! placed_creator {
             this: *mut c_void, heap: usize, offset: usize, desc: usize, state: usize, clear: usize,
             riid: *const GUID, ppv: *mut *mut c_void,
         ) -> HRESULT {
-            let hr = $raw(this, heap, offset, desc, state, clear, riid, ppv);
+            // a console R9G9B9E5 target made castable R11G11B10_FLOAT (`castable`)
+            let castable = if $method == "CreatePlacedResource" { super::castable::placed(this, heap, offset, desc, state, clear, riid, ppv) } else { None };
+            let hr = castable.unwrap_or_else(|| $raw(this, heap, offset, desc, state, clear, riid, ppv));
             if hr >= 0 && !ppv.is_null() && !(*ppv).is_null() {
                 super::residency::link(*ppv as usize, heap);
                 note_depth_creation(hr, ppv, desc, ($method, "host_state", state));
@@ -3820,6 +3888,8 @@ pub(super) const PC_RESOURCE_STATES: u32 = 0x1 | 0x2 | 0x4 | 0x8 | 0x10 | 0x20 |
 /// buffers-only heap) is made the PC's way (`device_x::pc_resource_desc`, the console's state
 /// bits dropped). Logged with the console's values.
 pub(super) unsafe extern "system" fn dev_create_placed_resource_x(this: *mut c_void, heap: usize, offset: usize, desc: usize, state: usize, clear: usize, riid: *const GUID, ppv: *mut *mut c_void) -> HRESULT {
+    let _castable = super::castable::Scope::enter((desc != 0 && crate::gpu::shader::readable(desc, 0x38))
+        .then(|| (desc as *const [u8; 0x38]).read_unaligned()).as_ref());
     // a buffer in a heap that has unified memory (`note_heap_uma`): that memory at its offset
     if desc != 0 && crate::gpu::shader::readable(desc, 0x38) {
         let x: [u8; 0x38] = (desc as *const [u8; 0x38]).read_unaligned();
@@ -3951,13 +4021,17 @@ unsafe fn pc_allocation_size(device: *mut c_void, d: &[u8; 0x38]) -> u64 {
     r[0]
 }
 placed_creator!(dev_create_placed_resource1, dev_create_placed_resource1_pc, "CreatePlacedResource1");
+creator!(dev_create_placed_resource2_pc, "CreatePlacedResource2", Kind::Resource, [heap, offset, desc, layout, clear, n, formats]);
+creator!(dev_create_reserved_resource2_pc, "CreateReservedResource2", Kind::Resource, [desc, layout, clear, session, n, formats]);
 creator!(dev_create_reserved_resource_raw, "CreateReservedResource", Kind::Resource, [desc, state, clear]);
 creator!(dev_create_reserved_resource1_raw, "CreateReservedResource1", Kind::Resource, [desc, state, clear, session]);
 
 pub(super) unsafe extern "system" fn dev_create_reserved_resource(
     this: *mut c_void, desc: usize, state: usize, clear: usize, riid: *const GUID, ppv: *mut *mut c_void,
 ) -> HRESULT {
-    let hr = dev_create_reserved_resource_raw(this, desc, state, clear, riid, ppv);
+    // a console R9G9B9E5 target made castable R11G11B10_FLOAT (`castable`)
+    let hr = super::castable::reserved(this, desc, state, clear, riid, ppv)
+        .unwrap_or_else(|| dev_create_reserved_resource_raw(this, desc, state, clear, riid, ppv));
     note_depth_creation(hr, ppv, desc, ("CreateReservedResource", "host_state", state));
     hr
 }
@@ -5198,6 +5272,30 @@ thread_local! {
     /// the memory available and the reservations when this thread's compile was refused as one
     /// that never fits (`Refused::NeverFits`)
     static NEVER_FITS: std::cell::Cell<(u64, u64)> = const { std::cell::Cell::new((0, 0)) };
+    /// that compile's estimate, until its build takes it (`take_never_fit`)
+    static NEVER_FIT_COST: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// The estimate of the driver compile this thread was last refused as one that never fits the
+/// memory now (`Refused::NeverFits`), taken (0: none): its pipeline is built again once that fits
+/// (`pso_async::retry_never_fits`, `fits_now`). Only what never fits the whole RAM is refused for
+/// good (`Refused::NoMemory`).
+pub(super) fn take_never_fit() -> u64 {
+    NEVER_FIT_COST.with(|c| c.replace(0))
+}
+
+/// The build on this thread was refused as a driver compile of estimate `cost` that never fits now.
+#[cfg(test)]
+pub(super) fn refuse_as_never_fitting_for_test(cost: u64) {
+    NEVER_FIT_COST.with(|c| c.set(cost));
+}
+
+/// A driver compile of estimate `cost` a bind waits for is no longer one that never fits now
+/// (`pso_sched::never_fits_now`): the memory available and the reservations of the compiles
+/// running hold it and the floor.
+pub(super) fn fits_now(cost: u64) -> bool {
+    let reserved = DRIVER_COMPILES.state.lock().unwrap_or_else(|e| e.into_inner()).reserved;
+    !super::pso_sched::never_fits_now(cost, available_physical(), reserved, URGENT_FLOOR)
 }
 pub(crate) use super::pso_sched::GIANT_DXIL;
 use super::pso_sched::{peak, GIANTS_AT_ONCE};
@@ -5363,6 +5461,128 @@ pub(super) fn background_memory_paused() -> bool {
     return available_physical() < URGENT_FLOOR + peak(0);
 }
 
+/// A warm-up process trims the files mapped into it every `WARM_TRIM_EVERY` whatever the RAM
+/// available (`XCL_WARM_TRIM=0`: below `TRIM_BELOW`, every second, as a game does). Its device
+/// creation holds ~20 GB of NVIDIA's shader cache within ~10 s, and play-102o's pass stopped itself
+/// on low memory as a giant child started at 21.6 GB available, before the 6 GB trim line was
+/// reached for long enough to help.
+fn warm_trim() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    WARM_UP_PROCESS.load(Ordering::Relaxed) && *ON.get_or_init(|| std::env::var("XCL_WARM_TRIM").map_or(true, |v| v.trim() != "0"))
+}
+
+const WARM_TRIM_EVERY: std::time::Duration = std::time::Duration::from_millis(250);
+
+fn trim_every() -> std::time::Duration {
+    if warm_trim() {
+        return WARM_TRIM_EVERY;
+    }
+    match GAME_TRIM.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
+        Some(g) if g.device => DEVICE_TRIM_EVERY,
+        Some(_) => WARM_TRIM_EVERY,
+        None => std::time::Duration::from_secs(1),
+    }
+}
+
+/// The game's start (`XCL_GAME_START_TRIM=0`: off): from the launcher's and the host's start
+/// (`start_game_trim`) until `GAME_TRIM_AFTER` past the title's first present (`GAME_TRIM_MOST` with none), the files
+/// mapped into XCL are trimmed every `WARM_TRIM_EVERY` (`DEVICE_TRIM_EVERY` while the device is
+/// made) whatever the RAM available, each step logged with it. play-118 (102q, Chrome open) was
+/// stopped by memwatch 22 s after launch: 15.0 GB available to 0.4 GB in 20 s, XCL's working set
+/// 0 to 20.2 GB of clean DXCache views with 120 – 140 MB private (CAPA-80's capture), before the
+/// 6 GB trim line took them out (19.6 GB at 12.4 s in play-117). play-118 on 102q2 then burned
+/// ~1 GB/s from its first second in the launcher, which makes a device of its own for its checks
+/// (`preflight::probe_gpu`) before it starts the host, and had no trim at all.
+static GAME_TRIM: Mutex<Option<GameTrim>> = Mutex::new(None);
+const GAME_TRIM_AFTER: std::time::Duration = std::time::Duration::from_secs(10);
+const GAME_TRIM_MOST: std::time::Duration = std::time::Duration::from_secs(300);
+const DEVICE_TRIM_EVERY: std::time::Duration = std::time::Duration::from_millis(100);
+
+struct GameTrim {
+    /// its notes go to the console as well (the launcher has no log file)
+    console: bool,
+    started: std::time::Instant,
+    device: bool,
+    first_present: Option<std::time::Instant>,
+    trims: u32,
+    freed: u64,
+    lowest: (u64, f64),
+}
+
+impl GameTrim {
+    fn note(&self, step: &str) {
+        crate::log::write(
+            crate::log::Level::Info,
+            "",
+            self.console,
+            format_args!("D3D12.X: game start trim: {step} at {:.1} s; {} MB available; {} trims took out {} MB so far, the lowest {} MB available at {:.1} s (XCL_GAME_START_TRIM=0: off)",
+            self.started.elapsed().as_secs_f64(),
+            available_physical() >> 20,
+            self.trims,
+            self.freed >> 20,
+            self.lowest.0 >> 20,
+            self.lowest.1
+        ));
+    }
+}
+
+/// `who` (the launcher, the host) has started: the game's start trim (`GAME_TRIM`) begins, its
+/// notes on the console as well with `console`.
+pub fn start_game_trim(who: &str, console: bool) {
+    if std::env::var("XCL_GAME_START_TRIM").is_ok_and(|v| v.trim() == "0") {
+        return;
+    }
+    let g = GameTrim { console, started: std::time::Instant::now(), device: false, first_present: None, trims: 0, freed: 0, lowest: (available_physical(), 0.0) };
+    g.note(&format!("{who} started"));
+    *GAME_TRIM.lock().unwrap_or_else(|e| e.into_inner()) = Some(g);
+    start_trim();
+}
+
+/// The device is being made (`making`) or was made: noted, and trimmed more often meanwhile.
+pub(crate) fn game_trim_device(making: bool) {
+    if let Some(g) = GAME_TRIM.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
+        g.device = making;
+        g.note(if making { "making the device" } else { "the device made" });
+    }
+}
+
+/// The game's start trim runs now; its lowest RAM available kept, its first present and its end noted.
+fn game_trimming() -> bool {
+    let mut lock = GAME_TRIM.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(g) = lock.as_mut() else { return false };
+    let available = available_physical();
+    if available < g.lowest.0 {
+        g.lowest = (available, g.started.elapsed().as_secs_f64());
+    }
+    if g.first_present.is_none() && super::present::counters().0 > 0 {
+        g.first_present = Some(std::time::Instant::now());
+        g.note("the first present");
+    }
+    if g.first_present.map_or(g.started + GAME_TRIM_MOST, |at| at + GAME_TRIM_AFTER) > std::time::Instant::now() {
+        return true;
+    }
+    g.note("ended");
+    *lock = None;
+    false
+}
+
+fn game_trimmed(freed: u64, took: std::time::Duration) {
+    let mut lock = GAME_TRIM.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(g) = lock.as_mut() else { return };
+    g.trims += 1;
+    g.freed += freed;
+    if freed >= 512 << 20 || took >= std::time::Duration::from_millis(200) {
+        crate::log::write(crate::log::Level::Info, "", g.console, format_args!(
+            "D3D12.X: game start trim: {} MB taken out at {:.1} s{} in {} ms; {} MB available",
+            freed >> 20,
+            g.started.elapsed().as_secs_f64(),
+            if g.device { " while the device is made" } else { "" },
+            took.as_millis(),
+            available_physical() >> 20
+        ));
+    }
+}
+
 /// Take the pages of files mapped into this process out of its working set (`VirtualUnlock` of a
 /// range not locked). An NVIDIA driver maps its shader cache (DXCache `*.nvph`) and its lookups
 /// leave most of it resident: 8.8 GB of a warm-up's 10 GB working set, with 1 GB private. Windows
@@ -5371,14 +5591,14 @@ pub(super) fn background_memory_paused() -> bool {
 /// pages go to the standby list: available, and read back without a disk read if touched again.
 /// Only file-backed views are trimmed, never the sections that back the title's memory. At most
 /// every second; logged when it frees 1 GB or more (at most once a minute).
-fn trim_mapped_files() {
+pub(crate) fn trim_mapped_files() -> u64 {
     use windows_sys::Win32::System::Memory::{VirtualQuery, VirtualUnlock, MEMORY_BASIC_INFORMATION, MEM_COMMIT, MEM_MAPPED};
     use windows_sys::Win32::System::ProcessStatus::K32GetMappedFileNameW;
     use windows_sys::Win32::System::Threading::GetCurrentProcess;
     static LAST: Mutex<Option<(std::time::Instant, Option<std::time::Instant>)>> = Mutex::new(None);
     let mut last = LAST.lock().unwrap();
-    if last.is_some_and(|(t, _)| t.elapsed() < std::time::Duration::from_secs(1)) {
-        return;
+    if last.is_some_and(|(t, _)| t.elapsed() < trim_every()) {
+        return 0;
     }
     let before = available_physical();
     let (mut at, mut regions) = (0usize, 0usize);
@@ -5409,6 +5629,7 @@ fn trim_mapped_files() {
         );
     }
     *last = Some((std::time::Instant::now(), if log { Some(std::time::Instant::now()) } else { logged }));
+    freed
 }
 
 impl Governor {
@@ -5625,6 +5846,7 @@ impl Governor {
                 s.starving -= starving as usize;
                 s.stop_waiting(waiting_giant, cost);
                 NEVER_FITS.with(|n| n.set((available, s.reserved.saturating_add(others.reserved))));
+                NEVER_FIT_COST.with(|c| c.set(cost));
                 return Err(Refused::NeverFits);
             }
             if !told {
@@ -5887,7 +6109,13 @@ unsafe fn translated_compute_pso(this: *mut c_void, f: PsoFn, desc: *const c_voi
     }
     let translating = crate::progress::TRANSLATIONS.begin();
     let live = crate::live_stall::stage(crate::live_stall::Stage::ShaderCompile, || crate::gpu::shader::fnv64(cs));
-    let compiled = match console_to_dxil_for(cs, Stage::Compute, 0, wave32_only(this)) {
+    let hw_wave = if wave32_only(this) { 32 } else { 64 };
+    let (compiled, by_cgbj) = match crate::gpu::cgbj::compute(cs, 0, hw_wave) {
+        crate::gpu::cgbj::Outcome::Compiled(c) => (Ok(c), true),
+        crate::gpu::cgbj::Outcome::Deferred | crate::gpu::cgbj::Outcome::Skipped => return Some(Err(())),
+        crate::gpu::cgbj::Outcome::Fallback => (console_to_dxil_for(cs, Stage::Compute, 0, hw_wave == 32), false),
+    };
+    let compiled = match compiled {
         Ok(b) => b,
         Err(e) => {
             note_translation_error(format!("CS {:016x}: {e}", crate::gpu::shader::fnv64(cs)));
@@ -6025,6 +6253,9 @@ unsafe fn translated_compute_pso(this: *mut c_void, f: PsoFn, desc: *const c_voi
     }
     super::dispatch_timing::note(*ppv as usize, cs);
     note_translated_compute(hr, ppv);
+    if !by_cgbj && crate::gpu::recomp::dispatch_spread() {
+        SPREAD_COMPUTE.lock().unwrap().get_or_insert_with(HashSet::new).insert(*ppv as usize);
+    }
     if super::material_gate_capture::enabled() && crate::gpu::recomp::pso::material_gate::selected_hash() == Some(crate::gpu::shader::fnv64(cs)) {
         if let (Some(original), Some(root), Some(device)) = (ID3D12PipelineState::from_raw_borrowed(&*ppv), ID3D12RootSignature::from_raw_borrowed(&rs), ID3D12Device::from_raw_borrowed(&this)) {
             let mut recipes = MATERIAL_PIPELINES.lock().unwrap();
@@ -6134,7 +6365,7 @@ fn driver_slot(dxil_len: usize, warm: bool, kept: bool, what: impl FnOnce() -> S
             let n = CANNOT_BUILD.fetch_add(1, Ordering::Relaxed) + 1;
             let (available, reserved) = NEVER_FITS.with(|n| n.get());
             let why = format!(
-                "cannot fit in this run's memory: {} ({}): {dxil_len} B of DXIL, ~{} MiB expected peak; {} MiB available and {} MiB reserved by the compiles running, less the {} MiB floor, cannot hold it even with all of them done (XCL_REFUSE_NEVER_FIT=0: wait)",
+                "cannot fit in this run's memory: {} ({}): {dxil_len} B of DXIL, ~{} MiB expected peak; {} MiB available and {} MiB reserved by the compiles running, less the {} MiB floor, cannot hold it even with all of them done (XCL_REFUSE_NEVER_FIT=0: wait); built again once that much fits",
                 what(),
                 building(),
                 compile_cost(dxil_len).0 >> 20,
@@ -6145,7 +6376,7 @@ fn driver_slot(dxil_len: usize, warm: bool, kept: bool, what: impl FnOnce() -> S
             static SEEN: Mutex<Option<std::collections::HashSet<(u64, u64, usize)>>> = Mutex::new(None);
             let (pipeline, shader) = crate::live_stall::job();
             if SEEN.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(Default::default).insert((pipeline, shader, dxil_len)) {
-                crate::xlog_warn!("D3D12.X: {why} – refused after {} s of not fitting, its binds skip (#{n} cannot build within memory)", super::pso_sched::NEVER_FIT_GRACE.as_secs());
+                crate::xlog_warn!("D3D12.X: {why} – refused after {} s of not fitting, its binds skip until then (#{n} cannot build within memory now)", super::pso_sched::NEVER_FIT_GRACE.as_secs());
             }
             LAST_NOTE.with(|n| *n.borrow_mut() = Some(why));
         }
@@ -6469,6 +6700,10 @@ struct BlockingKeys {
 /// The keys of a blocking warm-up pass in translation `era` with driver `driver`, read from the
 /// manifest: those an earlier pass made ready and those it marked bad left out, at most
 /// `max_keys`. None: nothing to replay (said why).
+/// The first tier of a blocking warm-up without `--targets` (`pso_manifest::blocking_targets`):
+/// the waited-for pipelines and those the last runs bound, built before the rest.
+static FIRST_TIER: OnceLock<std::collections::HashSet<u64>> = OnceLock::new();
+
 fn blocking_keys(targets: Option<&std::path::Path>, mut keys: Vec<u64>, era: u64, driver: &str, fresh: bool, max_keys: Option<usize>, budget: std::time::Duration) -> Result<Option<BlockingKeys>, String> {
     use super::pso_manifest::{self, Store};
     let manifest_dir = pso_manifest::dir();
@@ -6511,8 +6746,9 @@ fn blocking_keys(targets: Option<&std::path::Path>, mut keys: Vec<u64>, era: u64
     let mut found: HashMap<_, _> = Store::load_keys(&manifest_dir, &keys.iter().copied().collect()).records.into_iter().map(|r| (r.key(), r)).collect();
     let unavailable = keys.len() - found.len();
     let mut records: Vec<_> = keys.iter().filter_map(|key| found.remove(key).map(|r| (*key, r))).collect();
-    // (ray passes built with every ray a miss after every other key: `raytracing::miss_pass`)
-    records.sort_by_cached_key(|(_, r)| super::raytracing::miss_pass(r.kind == super::pso_manifest::Kind::Compute, r.shaders.iter().map(|(_, s)| s.as_slice())));
+    // (ray passes built with every ray a miss after every other key of their tier:
+    // `raytracing::miss_pass`; the first tier before the rest, `FIRST_TIER`)
+    records.sort_by_cached_key(|(key, r)| (FIRST_TIER.get().is_some_and(|first| !first.contains(key)), super::raytracing::miss_pass(r.kind == super::pso_manifest::Kind::Compute, r.shaders.iter().map(|(_, s)| s.as_slice()))));
     records.truncate(max_keys.unwrap_or(usize::MAX));
     drop(found);
     let total = records.len();
@@ -6546,9 +6782,13 @@ pub fn warm_up_blocking(targets: Option<&std::path::Path>, budget: std::time::Du
         Some(min_run) => {
             let mut used = super::pso_async::used_earlier();
             used.extend(super::pso_async::skipped_earlier());
-            let t = pso_manifest::blocking_targets(&pso_manifest::dir(), &text, min_run, &used);
-            eprintln!("warm-up --blocking: {} pipelines runs drew with ({} waited for, {} bound or used); {} kept pipelines no run drew with are left for their first bind (xcl warm-up --full builds them)",
-                t.keys.len(), t.waited, t.drawn, t.left);
+            let number = |name: &str| std::env::var(name).ok().and_then(|v| v.trim().parse::<u32>().ok());
+            let runs = number("XCL_WARM_BOUND_RUNS").and_then(std::num::NonZeroU32::new).unwrap_or(std::num::NonZeroU32::new(6).unwrap());
+            let variants = number("XCL_WARM_VARIANTS") != Some(0);
+            let t = pso_manifest::blocking_targets(&pso_manifest::dir(), &text, min_run, &used, runs, variants);
+            eprintln!("warm-up --blocking: first {} pipelines: {} waited for, then {} the last {runs} runs bound, in the order of their first bind (XCL_WARM_BOUND_RUNS); then {} other pipelines of the shaders runs used{}; {} kept pipelines are left for their first bind (xcl warm-up --full builds them)",
+                t.waited + t.drawn, t.waited, t.drawn, t.variants, if variants { " (XCL_WARM_VARIANTS=0: left out)" } else { ", left out (XCL_WARM_VARIANTS=0)" }, t.left);
+            let _ = FIRST_TIER.set(t.keys[..t.waited + t.drawn].iter().copied().collect());
             t.keys
         }
         None => pso_manifest::blocking_order(&text, None),
@@ -6731,6 +6971,12 @@ impl super::warm_children::Pass for ChildPass<'_> {
         let replaced = if plan.strict_pool { "once it has exited (XCL_WARM_STRICT_POOL=0: beside it)" } else { "beside it (XCL_WARM_STRICT_POOL=0)" };
         eprintln!("warm-up --blocking: {} workers on {} logical cores; driver compiles admitted by their estimated peaks within the RAM available less {} MiB (and the commit headroom less as much); {} DXC threads; {follow}; in child processes: {} pool children of {} workers, each replaced after {} keys or {} MiB private commit by another started {replaced}, and up to {} single-key children for the {} predicted giants ({GIANT_GUEST_BYTES} B of console shaders, or built in {} s or more before) and the keys a dead child had in flight; a key running {} s (waits for memory left out) is taken for a hang",
             plan.workers(), self.cores, (URGENT_FLOOR + plan.margin()) >> 20, plan.dxc_threads(Lane::Pool), plan.pool_children, plan.pool_threads, plan.recycle_keys, plan.recycle_commit >> 20, plan.single_children, jobs.iter().filter(|j| j.giant).count(), super::warm_children::GIANT_BUILD_MS / 1000, plan.key_timeout.as_secs());
+        if plan.giants_last {
+            eprintln!("warm-up --blocking: the giants start once every other key is done (XCL_WARM_GIANTS_LAST=0: beside them)");
+        }
+        if plan.skip_giants {
+            eprintln!("warm-up --blocking: the {} predicted giants are left for the game's background builds (XCL_WARM_SKIP_GIANTS=1)", jobs.iter().filter(|j| j.giant).count());
+        }
         let now = std::time::Instant::now();
         self.keyed = Some(KeyedPass {
             progress,
@@ -6828,10 +7074,25 @@ fn warm_up_blocking_in_children(targets: Option<&std::path::Path>, keys: Vec<u64
     let cores = std::thread::available_parallelism().map_or(4, |n| n.get());
     let plan = Plan::new(options, cores).with_env(|name| std::env::var(name).ok());
     let peers = Arc::new(super::warm_peers::Peers::create(std::process::id()).map_err(|e| format!("cannot share the memory governor with warm-up children: {e}"))?);
+    // (the children index the pass's own list, `pso_manifest::write_subset`; XCL_WARM_SUBSET=0:
+    // the whole kept list, read whole by each child)
+    let subset = std::env::var("XCL_WARM_SUBSET").map_or(true, |v| v.trim() != "0").then(|| std::env::temp_dir().join(format!("xcl-warm-list-{}.bin", std::process::id())));
+    if let Some(list) = &subset {
+        match super::pso_manifest::write_subset(&super::pso_manifest::dir(), &keys.iter().copied().collect(), list) {
+            Ok(n) => {
+                std::env::set_var(super::pso_manifest::WARM_LIST, list);
+                eprintln!("warm-up --blocking: the children index a list of the pass's {n} pipelines ({} MiB) instead of the whole kept list (XCL_WARM_SUBSET=0: the whole list)", std::fs::metadata(list).map_or(0, |m| m.len()) >> 20);
+            }
+            Err(e) => eprintln!("warm-up --blocking: could not write the pass's own list ({e}): the children read the whole kept list"),
+        }
+    }
     let mut spawner = ProcessSpawner::new(plan, deadline, peers.clone()).map_err(|e| format!("cannot start warm-up children: {e}"))?;
     let mut pass = ChildPass { targets, keys, fresh, max_keys, budget, deadline, plan, cores, peers, era: 0, driver: String::new(), keyed: None };
     let stats = warm_children::run(plan, &mut spawner, &mut pass);
     drop(spawner);
+    if let Some(list) = &subset {
+        let _ = std::fs::remove_file(list);
+    }
     let stats = stats?;
     let cancelled = BLOCKING_WARM_CANCELLED.load(Ordering::Relaxed);
     let Some(KeyedPass { observed, skipped, unavailable, bad_earlier, total, monitor, tally, min_available, most_running, most_giants, shaders, .. }) = pass.keyed else {
@@ -6875,10 +7136,10 @@ pub fn warm_up_blocking_child(threads: usize, budget: std::time::Duration, leave
     if std::env::var_os("XCL_DXC_THREADS").is_none() {
         std::env::set_var("XCL_DXC_THREADS", threads.to_string());
     }
-    let reply = Reply::stdout();
-    reply.send(&Msg::Hello { era: crate::gpu::recomp::pso::translation_era(), driver: DRIVER.get().map_or("unknown", String::as_str).to_string() });
     let dev = device_raw() as usize;
     trim_mapped_files();
+    let reply = Reply::stdout();
+    reply.send(&Msg::Hello { era: crate::gpu::recomp::pso::translation_era(), driver: DRIVER.get().map_or("unknown", String::as_str).to_string() });
     // the list read once; each worker decodes the keys it takes, so reading orders never waits on it
     let index = Arc::new(Store::index(&pso_manifest::dir()));
     type Queue = (Mutex<(VecDeque<u64>, bool)>, std::sync::Condvar);
@@ -9386,6 +9647,7 @@ unsafe fn go_background(
     let builder = super::raytracing::building_builder();
     let left_out = super::raytracing::left_out(compute, builder, kept.shaders.iter().map(|(_, s)| &s[..]));
     let rt_pass = left_out.is_none() && super::raytracing::miss_pass(compute, kept.shaders.iter().map(|(_, s)| &s[..]));
+    let screen = left_out.is_none() && screen_pass(kind, desc);
     let early = super::title_gta6::early_shader(kept.shaders.iter().map(|(_, s)| &s[..]));
     let record = super::pso_manifest::record(kept);
     let (standin, built_from) = (*ppv as usize, what.clone());
@@ -9437,7 +9699,37 @@ unsafe fn go_background(
     if depth_only {
         super::pso_async::allow_depth_wait(standin);
     }
+    if screen {
+        super::pso_async::mark_screen_pass(standin);
+    }
     Some(hr)
+}
+
+/// Whether a graphics pipeline draws passes over the screen: no vertex input, no depth or
+/// stencil, a target, triangles (`pso_async::mark_screen_pass`). The test of CGBJ/cool_fox
+/// (codec-d/cool_fox f4b48ad, GPL-3) crates/victory-gpu/src/pipeline/host.rs
+/// `GraphicsState::screen_pass`, after Belobug 18e57db8.
+unsafe fn screen_pass(kind: super::pso_manifest::Kind, desc: *const c_void) -> bool {
+    match kind {
+        super::pso_manifest::Kind::Graphics => {
+            let d = &*(desc as *const D3D12_GRAPHICS_PIPELINE_STATE_DESC);
+            d.InputLayout.NumElements == 0
+                && (d.DSVFormat.0 == 0 || !d.DepthStencilState.DepthEnable.as_bool() && !d.DepthStencilState.StencilEnable.as_bool())
+                && d.NumRenderTargets > 0
+                && d.PrimitiveTopologyType == D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE
+        }
+        super::pso_manifest::Kind::VertexStream => {
+            let [size, base] = *desc.cast::<[usize; 2]>();
+            let Some(subs) = stream_subobjects(std::slice::from_raw_parts(base as *const u8, size)) else { return false };
+            let word = |ty: u32, at: usize| subs.iter().find(|(t, _)| *t == ty).and_then(|(_, p)| p.get(at..at + 4)).map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]));
+            let depth = [11, 21, 26].into_iter().find_map(|ty| Some((word(ty, 0)?, word(ty, 12)?)));
+            word(12, 8).unwrap_or(0) == 0
+                && (word(16, 0).unwrap_or(0) == 0 || depth.is_some_and(|(d, s)| d == 0 && s == 0))
+                && word(15, 32).unwrap_or(0) > 0
+                && word(14, 0) == Some(D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE.0 as u32)
+        }
+        _ => false,
+    }
 }
 
 unsafe fn build_graphics(dev: Dev, d: &OwnedDesc, out: *mut *mut c_void) -> bool {
@@ -10991,8 +11283,14 @@ unsafe extern "system" fn dev_create_rtv(this: *mut c_void, res: *mut c_void, de
     // a view in a console-only format, or of a target made R8G8B8A8 (`device_x::pc_resource_desc`)
     let mut copy = (!desc.is_null()).then(|| (desc as *const D3D12_RENDER_TARGET_VIEW_DESC).read_unaligned());
     if let Some(c) = copy.as_mut() {
-        let rf = ID3D12Resource::from_raw_borrowed(&res).map_or(0, |r| r.GetDesc().Format.0 as u32);
-        c.Format = windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT(super::device_x::pc_shader_view_format(rf, c.Format.0 as u32) as i32);
+        let rd = ID3D12Resource::from_raw_borrowed(&res).map(|r| r.GetDesc());
+        let rf = rd.as_ref().map_or(0, |d| d.Format.0 as u32);
+        let title = c.Format.0 as u32;
+        c.Format = windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT(super::device_x::pc_written_view_format(rf, c.Format.0 as u32, super::castable::on()) as i32);
+        if let Some(rd) = rd.as_ref() {
+            super::castable::check_view("an RTV", res, rd, c.Format.0 as u32);
+            super::castable::note_view("an RTV", res, rd, title, c.Format.0 as u32);
+        }
     }
     let desc = copy.as_ref().map_or(desc, |c| c as *const _ as *const c_void);
     f(this, res, desc, handle);
@@ -11040,6 +11338,9 @@ unsafe extern "system" fn cl_om_set_render_targets(this: *mut c_void, n: u32, rt
     image_views::record(this, || image_views::bind(n, rtvs, single, dsv));
     f(this, n, rtvs, single, dsv);
     super::list_x::note_render_targets(this, n, rtvs, single, dsv);
+    if super::dsv_trace::on() {
+        super::dsv_trace::bind(this as usize, dsv.as_ref().copied());
+    }
     if super::present::trace_frame() {
         static N: AtomicU64 = AtomicU64::new(0);
         if N.fetch_add(1, Ordering::Relaxed) < 12 {
@@ -11116,6 +11417,9 @@ unsafe extern "system" fn cl_draw_instanced(this: *mut c_void, vcount: u32, icou
         if skipped { return }
     }
     super::list_x::prepare_draw(this);
+    if super::dsv_trace::on() {
+        super::dsv_trace::draw(this as usize);
+    }
     if vcount != 0 && icount != 0 {
         super::list_x::note_lineage_depth_draw(this, "draw");
     }
@@ -11134,6 +11438,9 @@ unsafe extern "system" fn cl_draw_indexed_instanced(this: *mut c_void, icount: u
         if skipped { return }
     }
     super::list_x::prepare_draw(this);
+    if super::dsv_trace::on() {
+        super::dsv_trace::draw(this as usize);
+    }
     if icount != 0 && inst != 0 {
         super::list_x::note_lineage_depth_draw(this, "draw_indexed");
     }
@@ -11174,6 +11481,9 @@ unsafe extern "system" fn cl_execute_indirect(
             super::bind::capture_selected_depth(this, list, native, visible, event, true);
         }
     }
+    if super::dsv_trace::on() && super::indirect::signature(sig as usize).is_some_and(|(kind, _, _)| matches!(kind, 0 | 1)) {
+        super::dsv_trace::draw(this as usize);
+    }
     super::residency::note_list_resources(this as usize, [arg_buf as usize, cnt_buf as usize]);
     super::depth_uav::note_op(this);
     super::image_writeback::note_work(this);
@@ -11202,6 +11512,9 @@ unsafe extern "system" fn cl_timed_begin_render_pass(
             !flags.contains(D3D12_RENDER_PASS_FLAG_BIND_READ_ONLY_DEPTH)
                 && depth_desc.is_some_and(|d| d.DepthBeginningAccess.Type != D3D12_RENDER_PASS_BEGINNING_ACCESS_TYPE_NO_ACCESS),
         );
+        if super::dsv_trace::on() {
+            super::dsv_trace::bind(this as usize, depth_desc.map(|d| d.cpuDescriptor.ptr));
+        }
         super::depth_state::render_pass(this as usize, Some(flags));
         super::gpu_timing::render_pass(this, Some(flags));
         if super::depth_capture_views::enabled() && flags.0 & D3D12_RENDER_PASS_FLAG_RESUMING_PASS.0 == 0 {
@@ -11300,6 +11613,7 @@ unsafe extern "system" fn alloc_release(this: *mut c_void) -> u32 {
     let n = f(this);
     if n == 0 {
         super::list_x::on_allocator_release(this as usize);
+        super::target_dump::allocator_done(this as usize);
     }
     n
 }
@@ -11312,6 +11626,7 @@ unsafe extern "system" fn alloc_reset(this: *mut c_void) -> HRESULT {
         // the GPU is done with what lists recorded from this allocator used
         super::console_list::allocator_reset(this);
         super::list_x::on_allocator_reset(this as usize);
+        super::target_dump::allocator_done(this as usize);
     }
     hr
 }
@@ -11690,6 +12005,7 @@ unsafe extern "system" fn q_execute_command_lists(this: *mut c_void, n: u32, lis
             }
         }
     }
+    super::bind::recordings_live();
     super::shader_code::submitted(std::slice::from_raw_parts(lists, n as usize).iter().chain(mapped.iter()).map(|&l| l as usize));
     // (`single`) the PC queue of every title queue gets them, when the queue's earlier work
     // and what these lists wait for have been handed over

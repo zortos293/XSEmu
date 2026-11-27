@@ -57,8 +57,8 @@ fn prefixes() -> &'static [String] {
 struct Chains {
     /// each member's chain
     member: HashMap<usize, usize>,
-    /// (prefix, members, last verdict logged)
-    chains: Vec<(String, Vec<(usize, String)>, Option<Verdict>)>,
+    /// (prefix, members, last verdict logged with the members not built then)
+    chains: Vec<(String, Vec<(usize, String)>, Option<(Verdict, Vec<usize>)>)>,
 }
 
 static CHAINS: Mutex<Option<Chains>> = Mutex::new(None);
@@ -116,24 +116,25 @@ fn may_dispatch_with(pso: usize, state: impl Fn(usize) -> Build, frame: impl Fn(
     let (prefix, members, logged) = &mut c.chains[at];
     let states: Vec<Build> = members.iter().map(|(p, _)| state(*p)).collect();
     let now = verdict(states.iter().copied());
-    if *logged != Some(now) && (logged.is_some() || now != Verdict::Hold) {
-        let built = states.iter().filter(|s| **s == Build::Built).count();
+    let waiting: Vec<usize> = members.iter().zip(&states).filter(|(_, s)| **s != Build::Built).map(|((p, _), _)| *p).collect();
+    // (logged again whenever the members it waits for change: a pass built and taken away again
+    // holds the chain again)
+    if logged.as_ref().is_none_or(|(v, w)| *v != now || *w != waiting) {
+        let built = states.len() - waiting.len();
         let total = states.len();
         let frame = frame();
+        let names = |of: Build| members.iter().zip(&states).filter(|(_, s)| **s == of).map(|((_, n), _)| n.as_str()).collect::<Vec<_>>().join(", ");
         match now {
             Verdict::Run => crate::xlog_info!("D3D12.X: pass chain {prefix}*: {built} of {total} built, dispatching from frame {frame} (XCL_CHAIN_HOLD=0: each pass as soon as it is built)"),
-            Verdict::Hold => crate::xlog_info!("D3D12.X: pass chain {prefix}*: held again at frame {frame}: {built} of {total} built"),
-            Verdict::HoldFailed => {
-                let failed: Vec<&str> = members.iter().zip(&states).filter(|(_, s)| **s == Build::Failed).map(|((_, n), _)| n.as_str()).collect();
-                crate::xlog_warn!("D3D12.X: pass chain {prefix}*: held while a member's build has failed ({}); {built} of {total} built, frame {frame}; its dispatches are skipped (XCL_CHAIN_HOLD=0 runs the built ones)", failed.join(", "));
-            }
+            Verdict::Hold if logged.is_none() => crate::xlog_info!("D3D12.X: pass chain {prefix}*: held until every pass is built ({built} of {total} built, frame {frame}; building: {})", names(Build::Building)),
+            Verdict::Hold => crate::xlog_info!("D3D12.X: pass chain {prefix}*: held again at frame {frame}: {built} of {total} built; building: {}", names(Build::Building)),
+            Verdict::HoldFailed => crate::xlog_warn!(
+                "D3D12.X: pass chain {prefix}*: held while a member's build has failed ({}); {built} of {total} built, frame {frame}; its dispatches are skipped (XCL_CHAIN_HOLD=0 runs the built ones)",
+                names(Build::Failed)
+            ),
         }
     }
-    if logged.is_none() && now == Verdict::Hold {
-        let built = states.iter().filter(|s| **s == Build::Built).count();
-        crate::xlog_info!("D3D12.X: pass chain {prefix}*: held until every pass is built ({built} of {} built, frame {})", states.len(), frame());
-    }
-    *logged = Some(now);
+    *logged = Some((now, waiting));
     now == Verdict::Run
 }
 

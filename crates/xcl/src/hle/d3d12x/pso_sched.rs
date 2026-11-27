@@ -3,7 +3,8 @@
 //! left, and which build a background worker takes next. Nothing here asks the system anything,
 //! so its tests run on any host.
 
-use std::collections::{HashMap, VecDeque};
+use std::cmp::Reverse;
+use std::collections::{BinaryHeap, HashMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 /// DXIL from which a program is a giant (a warm-up builds giants in single-key children,
@@ -465,11 +466,12 @@ pub fn refuse_never_fit() -> bool {
 }
 
 /// The memory a compile of `dxil_len` bytes of DXIL keeps free for the compiles running to take
-/// while it runs: their measured rise (`Room::compile_rise`) × its expected duration. play-98's
-/// giant grew the process heap past its overdue estimate: XCL's private memory went from 21.4 to
-/// 23.6 GB and the memory available from 2,623 to 781 MB in ~40 s, and memwatch stopped the run.
+/// while it runs: their measured rise (`Room::compile_rise`) × its expected duration, at most
+/// `GROWTH_CAP` as the title's growth. play-98's giant grew the process heap past its overdue
+/// estimate: XCL's private memory went from 21.4 to 23.6 GB and the memory available from 2,623
+/// to 781 MB in ~40 s, and memwatch stopped the run.
 pub fn compile_rise(room: &Room, dxil_len: usize) -> u64 {
-    room.compile_rise.saturating_mul(compile_secs(dxil_len))
+    room.compile_rise.saturating_mul(compile_secs(dxil_len)).min(GROWTH_CAP)
 }
 
 pub const IDLE_BREAK_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
@@ -566,8 +568,9 @@ pub struct Backlog<T> {
     waiting: HashMap<u64, (T, Lane)>,
     /// (console shader bytes, number), smallest first
     heavy: Vec<(usize, u64)>,
-    /// numbers, oldest first
-    known: Vec<u64>,
+    /// (first use, number): the one an earlier run used first on top, then those with no first
+    /// use (`push_as`); of equals the newest first
+    known: BinaryHeap<(Reverse<u64>, u64)>,
     compute: Vec<u64>,
     graphics: Vec<u64>,
     /// those of `graphics` without colour targets (`depth_only`), taken before the others
@@ -601,7 +604,7 @@ impl<T> Default for Backlog<T> {
             parked: Vec::new(),
             waiting: HashMap::new(),
             heavy: Vec::new(),
-            known: Vec::new(),
+            known: BinaryHeap::new(),
             compute: Vec::new(),
             graphics: Vec::new(),
             depth: Vec::new(),
@@ -631,6 +634,17 @@ fn insert_by_size<T>(list: &mut Vec<(usize, T)>, size: usize, item: T) {
 /// The last number of `list` still in `waiting`; the ones after it, taken through another list, go.
 fn last_waiting<T>(list: &mut Vec<u64>, waiting: &HashMap<u64, (T, Lane)>) -> Option<u64> {
     while let Some(n) = list.pop() {
+        if waiting.contains_key(&n) {
+            return Some(n);
+        }
+    }
+    None
+}
+
+/// The known pipeline still in `waiting` that an earlier run used first (`Backlog::known`); the
+/// ones before it, taken through another list, go.
+fn first_known<T>(known: &mut BinaryHeap<(Reverse<u64>, u64)>, waiting: &HashMap<u64, (T, Lane)>) -> Option<u64> {
+    while let Some((_, n)) = known.pop() {
         if waiting.contains_key(&n) {
             return Some(n);
         }
@@ -670,13 +684,14 @@ impl<T> Backlog<T> {
     /// that long (`pso_manifest::slow_ms`).
     pub fn push(&mut self, shader_bytes: usize, known: bool, compute: bool, group: u64, slow_ms: Option<u64>, item: T) -> u64 {
         let n = self.next;
-        self.push_as(n, shader_bytes, known, compute, group, slow_ms, item);
+        self.push_as(n, shader_bytes, known, compute, group, slow_ms, None, item);
         n
     }
 
-    /// `push` as number `n`, which the caller gave out (from 1, never twice).
+    /// `push` as number `n`, which the caller gave out (from 1, never twice). `first_use`: where an
+    /// earlier run first used it (smaller: sooner); a known one is taken in that order.
     #[allow(clippy::too_many_arguments)]
-    pub fn push_as(&mut self, n: u64, shader_bytes: usize, known: bool, compute: bool, group: u64, slow_ms: Option<u64>, item: T) {
+    pub fn push_as(&mut self, n: u64, shader_bytes: usize, known: bool, compute: bool, group: u64, slow_ms: Option<u64>, first_use: Option<u64>, item: T) {
         self.next = self.next.max(n + 1);
         let slow = slow_ms.is_some() || shader_bytes >= HEAVY_SHADER_BYTES;
         let quickest_last = usize::MAX - slow_ms.map_or(usize::MAX, |ms| ms as usize);
@@ -694,7 +709,7 @@ impl<T> Backlog<T> {
             self.heavy_waiting += 1;
             Lane::Heavy
         } else if known {
-            self.known.push(n);
+            self.known.push((Reverse(first_use.unwrap_or(u64::MAX)), n));
             Lane::Known
         } else if compute {
             self.compute.push(n);
@@ -782,7 +797,7 @@ impl<T> Backlog<T> {
                 return self.take(n);
             }
         }
-        if let Some(n) = last_waiting(&mut self.known, &self.waiting) {
+        if let Some(n) = first_known(&mut self.known, &self.waiting) {
             return self.take(n);
         }
         if self.later_out >= share {
@@ -866,17 +881,16 @@ impl<T> Backlog<T> {
                 }
             }
         }
-        for lane in [Lane::Known, Lane::Compute, Lane::Graphics] {
+        if let Some(n) = first_known(&mut self.known, &self.waiting) {
+            return self.take(n);
+        }
+        for lane in [Lane::Compute, Lane::Graphics] {
             if lane == Lane::Graphics {
                 if let Some(n) = last_waiting(&mut self.depth, &self.waiting) {
                     return self.take(n);
                 }
             }
-            let list = match lane {
-                Lane::Known => &mut self.known,
-                Lane::Compute => &mut self.compute,
-                _ => &mut self.graphics,
-            };
+            let list = if lane == Lane::Compute { &mut self.compute } else { &mut self.graphics };
             if let Some(n) = last_waiting(list, &self.waiting) {
                 return self.take(n);
             }
@@ -1175,6 +1189,27 @@ mod tests {
 
     /// Drawn first: what an earlier run bound, the slow ones of it quickest measured first on a
     /// quarter of the workers; what no run bound behind it, on a quarter of the workers.
+    #[test]
+    fn known_ones_go_in_the_order_an_earlier_run_first_used_them() {
+        for drawn_first in [false, true] {
+            let mut b = if drawn_first { Backlog::drawn_first() } else { Backlog::default() };
+            let push = |b: &mut Backlog<&'static str>, first_use: Option<u64>, item: &'static str| {
+                let n = b.next;
+                b.push_as(n, 100, true, false, 0, None, first_use, item);
+            };
+            push(&mut b, None, "no first use, older");
+            push(&mut b, Some(7), "used third");
+            push(&mut b, Some(0), "bound first");
+            push(&mut b, None, "no first use, newer");
+            push(&mut b, Some(3), "bound later");
+            let take = |b: &mut Backlog<&'static str>| b.pop(8, &[], |_| true, |_| true, |_| false).map(|(item, _)| item);
+            for want in ["bound first", "bound later", "used third", "no first use, newer", "no first use, older"] {
+                assert_eq!(take(&mut b), Some(want), "drawn_first {drawn_first}");
+            }
+            assert_eq!(take(&mut b), None);
+        }
+    }
+
     #[test]
     fn drawn_first_builds_what_runs_bound_before_the_rest_and_caps_slow_and_later() {
         let mut b = Backlog::drawn_first();
@@ -2293,6 +2328,7 @@ mod tests {
         assert_eq!(admit(&ask(giant, false), &load, &calm), Verdict::Background, "the old check: it fits at admission");
         let loading = Room { fall: 300 * MIB, ..calm };
         assert_eq!(growth(&loading, giant).0, GROWTH_CAP, "15 GB at 300 MB/s for 50 s, capped");
+        assert_eq!(compile_rise(&Room { compile_rise: 258 * MIB, ..calm }, 64 << 20), GROWTH_CAP, "play-101's 258 MB/s rise for 90 s (23 GB), capped as the title's growth");
         assert_eq!(admit(&ask(giant, false), &load, &loading), Verdict::Hold);
         let slow = Room { fall: 20 * MIB, ..calm };
         assert_eq!(admit(&ask(giant, false), &load, &slow), Verdict::Background, "a slow rise over 50 s fits beside it");

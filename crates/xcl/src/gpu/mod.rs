@@ -4,6 +4,7 @@
 pub mod adapter;
 pub mod agility;
 pub mod bvh;
+pub mod cgbj;
 pub(crate) mod compute_effects;
 pub mod desc;
 pub mod dxbc;

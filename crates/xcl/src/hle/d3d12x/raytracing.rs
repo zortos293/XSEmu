@@ -20,7 +20,9 @@
 //! `XCL_RT_GATE` picks what happens to those pipelines and to the title layer's
 //! (`gpu::recomp::rt_gate_miss`): "miss", the default, builds and runs them with every
 //! intersection a miss (`gpu::recomp::rt_all_miss`: no structure exists, the builder being off);
-//! "hold" leaves them out as described here. The builder is left out in both.
+//! "hold" leaves them out as described here. The builder is left out in both. "probes" is "miss"
+//! with the title layer's ray activation and ray-hit resolve left out unbuilt
+//! (`title_gta6::probes_gate_pass`), the selection cool_fox lights its world with on NVIDIA.
 //! Fences are never touched: the skipped calls are recorded work, and the queues signal as before.
 //! The title layer (`title_gta6::rt_family`) adds the title's own ray passes that do not trace
 //! themselves. VIctory forks' `--no-rt` (DexNom RayTime: builder, ray bins, activation, traversal
@@ -66,21 +68,47 @@ const BUILDER_DLL: &str = "xboxbvhbuilder.dll";
 const BUILDER_STAGE: &str = "ray tracing off: a stage of the acceleration-structure builder (XboxBvhBuilder.dll) left out unbuilt";
 const TRAVERSAL: &str = "ray tracing off: a pipeline that traverses acceleration structures left out unbuilt";
 const TITLE_PASS: &str = "ray tracing off: one of the title's ray passes left out unbuilt";
+const PROBES_PASS: &str = "ray tracing off (XCL_RT_GATE=probes): the title's ray activation or ray-hit resolve left out unbuilt";
+
+/// `XCL_RT_GATE=probes`: every ray a miss as with "miss" (the translation is the same, so the
+/// cache stays warm), but the title's ray activation and ray-hit resolve are left out unbuilt
+/// (`title_gta6::probes_gate_pass`). Unset or any other value: as before.
+fn gate_probes() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = gate_is_probes(std::env::var("XCL_RT_GATE").ok().as_deref());
+        if on {
+            crate::xlog_info!("D3D12.X: ray tracing off: XCL_RT_GATE=probes: every ray a miss, and the title's CS_ScreenProbes_ActivateRays and CS_RaytracingResolve left out unbuilt (XCL_RT_GATE=miss runs them, XCL_TITLE_RT_SKIP=0 too)");
+        }
+        on
+    })
+}
+
+fn gate_is_probes(value: Option<&str>) -> bool {
+    value.is_some_and(|v| v.trim().eq_ignore_ascii_case("probes"))
+}
 
 /// Why a console shader is left out, and its family for the log (`first_of_family`).
 fn classify(container: &[u8]) -> Option<(&'static str, String)> {
-    classify_gated(container, crate::gpu::recomp::rt_all_miss())
+    let miss = crate::gpu::recomp::rt_all_miss();
+    classify_as(traces_rays(container), container, miss, miss && gate_probes())
 }
 
 /// `classify` with the gate as given: with every ray a miss (`miss`) nothing is left out, the
 /// traversals and the title's ray passes are built and run (the first of each kind is logged).
+#[cfg(test)]
 fn classify_gated(container: &[u8], miss: bool) -> Option<(&'static str, String)> {
-    classify_as(traces_rays(container), container, miss)
+    classify_as(traces_rays(container), container, miss, false)
 }
 
 /// `classify_gated` of a container that traverses acceleration structures or not (`traces`).
-fn classify_as(traces: bool, container: &[u8], miss: bool) -> Option<(&'static str, String)> {
+/// `probes`: with every ray a miss, the title's ray activation and ray-hit resolve are left out
+/// (`gate_probes`).
+fn classify_as(traces: bool, container: &[u8], miss: bool, probes: bool) -> Option<(&'static str, String)> {
     if miss {
+        if let Some(pass) = probes.then(|| super::title_gta6::probes_gate_pass(container)).flatten() {
+            return Some((PROBES_PASS, format!("title ray pass {} (XCL_RT_GATE=probes)", String::from_utf8_lossy(pass))));
+        }
         if traces {
             first_miss("a pipeline that traverses acceleration structures", container);
         } else if let Some(pass) = super::title_gta6::ray_pass(container) {
@@ -432,11 +460,24 @@ mod tests {
     #[test]
     fn with_every_ray_a_miss_no_traversal_or_ray_pass_is_left_out() {
         let traversal: &[u8] = b"CS_Tree_BatchCull_c47eb2b0_Wrapped";
-        assert_eq!(classify_as(true, traversal, false).map(|c| c.0), Some(TRAVERSAL));
-        assert_eq!(classify_as(true, traversal, true), None);
+        assert_eq!(classify_as(true, traversal, false, false).map(|c| c.0), Some(TRAVERSAL));
+        assert_eq!(classify_as(true, traversal, true, false), None);
+        assert_eq!(classify_as(true, traversal, true, true), None);
         assert_eq!(classify_gated(b"CS_RaytracingResolve_0", true), None);
         assert_eq!(classify_gated(b"CS_Tree_BatchCull_c47eb2b0_Wrapped", true), None);
         assert_eq!(classify_gated(b"CS_Tree_BatchCull_c47eb2b0_Wrapped", false), None);
+    }
+
+    #[test]
+    fn the_probes_gate_is_its_own_value() {
+        for probes in [Some("probes"), Some(" PROBES "), Some("Probes")] {
+            assert!(gate_is_probes(probes), "{probes:?}");
+        }
+        for other in [None, Some(""), Some("miss"), Some("hold"), Some("probe"), Some("0")] {
+            assert!(!gate_is_probes(other), "{other:?}");
+        }
+        assert_eq!(classify_as(false, b"CS_ScreenProbes_ActivateRays_d60186e6_Wrapped", true, false), None);
+        assert_eq!(classify_as(false, b"CS_ScreenProbes_TemporalResolve_0", true, true), None);
     }
 
     #[test]

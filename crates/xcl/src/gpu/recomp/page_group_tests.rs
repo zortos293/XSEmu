@@ -246,10 +246,23 @@ fn grouped_program() -> Vec<u8> {
     c
 }
 
+thread_local! {
+    /// translate_cs with the folded loads of a group
+    static FOLD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// translate_cs with a lone four-address load left to its accessor
+    static LONE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 fn translate_cs(code: &[u8], groups: bool) -> String {
     let cs = super::CsInterface { threads: [64, 1, 1], user_sgprs: 4, tgid: [true, false, false], tg_size: false, tid_components: 1 };
     super::emit::NO_PAGE_GROUPS.set(!groups);
+    // (the loads of a group as the tests here read them; super::emit::group_fold has its own)
+    let fold = super::emit::NO_GROUP_FOLD.replace(!FOLD.get());
+    // (and a group for every four-address load; super::emit::lone_loads has its own test too)
+    let lone = super::emit::NO_LONE_LOADS.replace(!LONE.get());
     let t = translate(code, &Options { mode: Mode::Compute(cs), wave64: false, split_wave64: true, mem_windows: 4, ..Default::default() });
+    super::emit::NO_LONE_LOADS.set(lone);
+    super::emit::NO_GROUP_FOLD.set(fold);
     super::emit::NO_PAGE_GROUPS.set(false);
     let t = t.unwrap();
     assert!(t.complete(), "{:?}", t.unsupported_why);
@@ -378,6 +391,95 @@ fn translated_loads_with_shrunk_accessors_compute_the_same() {
         assert!(new.contains("[loop] for (uint k = 0u; k < 2u; k++)") && !new.contains("uint2 z = "));
         assert_eq!(new.contains("uint4 w = xcl_mLoad4G(b, g, r); uint w4 = xcl_mLoadG(b + 16u, g, r);"), small);
         assert_eq!(new.contains("uint4 w = xcl_vLoad4G(b, g, r); uint w4 = xcl_vLoadG(b + 16u, g, r);"), small);
+        assert_eq!(interp::diff(&load(&old), &load(&new), 0..24, &Config::default()).0, Verdict::Equal);
+    }
+}
+
+/// Loads of 8 and 16 dwords of both kinds, with and without a register offset, a buffer load
+/// whose limit ends inside it (`OFFSET` past the records of most generated buffers); every
+/// loaded register stored.
+fn wide_loads_program() -> Vec<u8> {
+    let mut p: Vec<Inst> = vec![
+        ("S_BUFFER_LOAD_DWORDX16", "ENC_SMEM", vec![("SDATA", 16), ("SBASE", 4), ("SOFFSET", 125), ("OFFSET", 0x20)]),
+        ("S_BUFFER_LOAD_DWORDX8", "ENC_SMEM", vec![("SDATA", 32), ("SBASE", 4), ("SOFFSET", 125), ("OFFSET", 0xfffe8)]),
+        ("S_LOAD_DWORDX8", "ENC_SMEM", vec![("SDATA", 40), ("SBASE", 0), ("SOFFSET", 125), ("OFFSET", 0x8)]),
+        ("S_LOAD_DWORDX16", "ENC_SMEM", vec![("SDATA", 48), ("SBASE", 0), ("SOFFSET", 125), ("OFFSET", 0x48)]),
+        ("S_BUFFER_LOAD_DWORDX8", "ENC_SMEM", vec![("SDATA", 64), ("SBASE", 4), ("SOFFSET", 3), ("OFFSET", 0)]),
+        ("S_WAITCNT", "ENC_SOPP", vec![("SIMM16", 0)]),
+        ("V_LSHLREV_B32", "ENC_VOP2", vec![("VDST", 44), ("SRC0", 134), ("VSRC1", 0)]),
+    ];
+    for s in 16..72u64 {
+        p.push(("V_MOV_B32", "ENC_VOP1", vec![("VDST", 100), ("SRC0", s)]));
+        p.push(("BUFFER_STORE_DWORD", "ENC_MUBUF", vec![("VDATA", 100), ("VADDR", 44), ("SRSRC", 2), ("SOFFSET", 128), ("OFFSET", 4 * (s - 16)), ("OFFEN", 1)]));
+    }
+    p.push(("S_ENDPGM", "ENC_SOPP", vec![]));
+    code(&p)
+}
+
+/// `code` with its wide loads in a loop or not; `packed`: a wave64 program as one group of two
+/// hardware waves (the form without page groups), else a wave32 one.
+fn translate_looped(code: &[u8], groups: bool, looped: bool, packed: bool) -> String {
+    super::emit::NO_LOAD_LOOP.set(!looped);
+    let t = if packed {
+        let cs = super::CsInterface { threads: [64, 1, 1], user_sgprs: 4, tgid: [true, false, false], tg_size: false, tid_components: 1 };
+        let t = translate(code, &Options { mode: Mode::Compute(cs), wave64: true, split_wave64: true, legacy_compute_wave64: false, mem_windows: 4, ..Default::default() }).unwrap();
+        assert!(t.complete(), "{:?}", t.unsupported_why);
+        t.hlsl.replace("vector<uint64_t, 4>(", "uint64_t4(")
+    } else {
+        translate_cs(code, groups)
+    };
+    super::emit::NO_LOAD_LOOP.set(false);
+    t
+}
+
+/// A load of 8 or 16 dwords as one call in a loop (`emit::load_loop`) against a call for every
+/// four dwords, with the page groups on and off: the same registers. A wrong address, turn count
+/// or result in the loop must show.
+#[test]
+fn wide_loads_in_a_loop_compute_the_same() {
+    let c = wide_loads_program();
+    for (groups, packed) in [(false, false), (true, false), (false, true)] {
+        let (old, new) = (translate_looped(&c, groups, false, packed), translate_looped(&c, groups, true, packed));
+        let calls = |t: &str, f: &str| t[t.find("void main(").unwrap()..].matches(f).count();
+        let (four, load4) = if groups { ("xcl_loadx4G(", "xcl_mLoad4G(") } else { ("xcl_loadx4(", "xcl_mLoad4(") };
+        assert!(!old.contains("_j < 4u") && !old.contains("_j < 2u"));
+        assert_eq!((calls(&old, four), calls(&old, load4)), (8, 6), "{old}");
+        assert_eq!((calls(&new, four), calls(&new, load4)), (3, 2), "{new}");
+        assert_eq!((new.matches("_j < 4u").count(), new.matches("_j < 2u").count()), (2, 3));
+        let reference = load(&old);
+        assert_eq!(interp::diff(&reference, &load(&new), 0..24, &Config::default()).0, Verdict::Equal, "groups {groups}, packed {packed}");
+        for (from, to) in [
+            ("_o = 16u * t", "_o = 12u * t"),
+            ("_a + 16u * t", "_a + 8u * t"),
+            ("_j < 4u", "_j < 3u"),
+            ("_j < 2u", "_j < 1u"),
+            ("_j == 1u, t", "_j == 0u, t"),
+            ("uint4(0u, 4u, 8u, 12u); bool4", "uint4(0u, 4u, 8u, 8u); bool4"),
+        ] {
+            let at = new.find("void main(").unwrap();
+            assert!(new[at..].contains(from), "{from}");
+            let mutant = format!("{}{}", &new[..at], new[at..].replacen(from, to, 1));
+            assert!(matches!(interp::diff(&reference, &load(&mutant), 0..24, &Config::default()).0, Verdict::Different(_)), "groups {groups}, packed {packed}: mutant {to} not caught");
+        }
+    }
+}
+
+/// The programs of the tests above with the loads of their groups folded (emit::group_fold)
+/// against the same groups read through xcl_group_at: the same registers, and no load through
+/// the group left.
+#[test]
+fn translated_loads_with_folded_groups_compute_the_same() {
+    for (c, small) in [(grouped_program(), false), (small_loads_program(), true), (interleaved_program(), false), (wide_loads_program(), false)] {
+        let old = translate_cs(&c, true);
+        FOLD.set(true);
+        let new = translate_cs(&c, true);
+        FOLD.set(false);
+        let main = |t: &str| t[t.find("void main(").unwrap()..].to_string();
+        assert!(!old.contains("Fold(") && new.contains("uint4 xcl_mFold("));
+        assert!(!main(&new).contains("_g, t") && !main(&new).contains("G("), "{}", main(&new));
+        assert_eq!(main(&old).matches("= xcl_group_pages(t").count(), main(&new).matches("Fold(t").count());
+        assert_eq!(new.contains("uint4 w = xcl_mLoad4S(gs, r); uint w4 = xcl_mLoadS(gs + 16u, r);"), small);
+        assert_eq!(new.contains("uint4 w = xcl_vLoad4S(gs, r); uint w4 = xcl_vLoadS(gs + 16u, r);"), small);
         assert_eq!(interp::diff(&load(&old), &load(&new), 0..24, &Config::default()).0, Verdict::Equal);
     }
 }
@@ -546,6 +648,9 @@ fn with_atomic(mut c: Vec<u8>) -> Vec<u8> {
 /// accessors and that the program stores what they return; what the GPU caches it cannot show.
 #[test]
 fn plain_loads_compute_the_same() {
+    // the text this test reads is the earlier one (`XCL_RECOMP_NO_COMPACT_ACCESS`); the compact accessors have
+    // their own tests (`compact_access_tests`)
+    super::emit::NO_COMPACT_ACCESS.set(true);
     let mut mutants = std::collections::BTreeSet::new();
     for c in [with_atomic(grouped_program()), with_atomic(small_loads_program()), with_atomic(interleaved_program())] {
         let (coherent, plain) = (translate_plain(&c, false), translate_plain(&c, true));
@@ -588,5 +693,268 @@ fn plain_loads_compute_the_same() {
         let mutant = format!("{}{}", &plain[..at], plain[at..].replacen(from, to, 1));
         let v = interp::diff(&coherent, &load(&mutant), 0..24, &Config::default()).0;
         assert!(matches!(v, Verdict::Different(_)), "{cached} {to}: {v:?}");
+    }
+}
+
+/// Scalar loads from one base in several blocks: before a branch, on one side of it after a
+/// write of the base, in two blocks after the sides meet, in a loop that moves the base and in
+/// two blocks after it; a descriptor read in two of the blocks; every loaded register stored.
+/// The base moves by an input register: to another page, where a stale resolution shows.
+fn kept_program() -> Vec<u8> {
+    enum A {
+        I(Inst),
+        L(&'static str),
+        B(&'static str, &'static str),
+    }
+    let load = |n: &'static str, d: u64, o: u64| A::I((n, "ENC_SMEM", vec![("SDATA", d), ("SBASE", 0), ("SOFFSET", 125), ("OFFSET", o)]));
+    let buf = |n: &'static str, d: u64, o: u64| A::I((n, "ENC_SMEM", vec![("SDATA", d), ("SBASE", 4), ("SOFFSET", 125), ("OFFSET", o)]));
+    let add = |r: u64, k: u64| A::I(("S_ADD_U32", "ENC_SOP2", vec![("SDST", r), ("SSRC0", r), ("SSRC1", k)]));
+    let cmp = |n: &'static str, r: u64, k: u64| A::I((n, "ENC_SOPC", vec![("SSRC0", r), ("SSRC1", k)]));
+    let mut p = vec![
+        load("S_LOAD_DWORDX4", 8, 0x10),
+        buf("S_BUFFER_LOAD_DWORDX4", 28, 0x20),
+        cmp("S_CMP_EQ_U32", 2, 128),
+        A::B("S_CBRANCH_SCC1", "meet"),
+        load("S_LOAD_DWORDX2", 12, 0x20),
+        add(0, 3),
+        load("S_LOAD_DWORD", 14, 0x4),
+        A::L("meet"),
+        load("S_LOAD_DWORDX4", 16, 0x30),
+        cmp("S_CMP_EQ_U32", 3, 128),
+        A::B("S_CBRANCH_SCC1", "skip"),
+        load("S_LOAD_DWORD", 20, 0x1c),
+        A::L("skip"),
+        buf("S_BUFFER_LOAD_DWORD", 32, 0x30),
+        A::I(("S_MOV_B32", "ENC_SOP1", vec![("SDST", 23), ("SSRC0", 131)])),
+        A::L("turn"),
+        load("S_LOAD_DWORD", 21, 0x8),
+        A::I(("S_ADD_U32", "ENC_SOP2", vec![("SDST", 22), ("SSRC0", 22), ("SSRC1", 21)])),
+        add(0, 2),
+        A::I(("S_ADD_I32", "ENC_SOP2", vec![("SDST", 23), ("SSRC0", 23), ("SSRC1", 193)])),
+        cmp("S_CMP_GT_I32", 23, 128),
+        A::B("S_CBRANCH_SCC1", "turn"),
+        load("S_LOAD_DWORDX2", 24, 0x38),
+        cmp("S_CMP_EQ_U32", 2, 128),
+        A::B("S_CBRANCH_SCC1", "end"),
+        load("S_LOAD_DWORD", 26, 0x3c),
+        A::L("end"),
+        A::I(("V_LSHLREV_B32", "ENC_VOP2", vec![("VDST", 44), ("SRC0", 134), ("VSRC1", 0)])),
+    ];
+    for (k, s) in [8u64, 9, 10, 11, 12, 13, 14, 16, 17, 18, 19, 20, 22, 24, 25, 26, 28, 29, 30, 31, 32].into_iter().enumerate() {
+        p.push(A::I(("V_MOV_B32", "ENC_VOP1", vec![("VDST", 100), ("SRC0", s)])));
+        p.push(A::I(("BUFFER_STORE_DWORD", "ENC_MUBUF", vec![("VDATA", 100), ("VADDR", 44), ("SRSRC", 2), ("SOFFSET", 128), ("OFFSET", 4 * k as u64), ("OFFEN", 1)])));
+    }
+    p.push(A::I(("S_ENDPGM", "ENC_SOPP", vec![])));
+    let size = |a: &A| match a {
+        A::I(i) => code(std::slice::from_ref(i)).len(),
+        A::L(_) => 0,
+        A::B(..) => 4,
+    };
+    let at = |label: &str| p.iter().take_while(|a| !matches!(a, A::L(l) if *l == label)).map(size).sum::<usize>() as i64;
+    let mut out = Vec::new();
+    for a in &p {
+        match a {
+            A::I(i) => out.extend(code(std::slice::from_ref(i))),
+            A::L(_) => {}
+            A::B(n, l) => out.extend(encode(n, "ENC_SOPP", &[("SIMM16", ((at(l) - (out.len() as i64 + 4)) / 4) as i16 as u16 as u64)], None).unwrap()),
+        }
+    }
+    out
+}
+
+/// `hlsl` with every page mapped, to a view and a place in it that its number gives. The
+/// interpreter's memory is generated, so nearly every address of a translated program is a miss
+/// there, and a miss reads the same word whatever page was resolved for it.
+fn every_page_mapped(hlsl: &str) -> String {
+    let ok = "    bool ok = !or(xcl_origin > 65535u, or((xcl_origin == 0u) != (hi == 0u), h > 65535u));";
+    let entry = "    uint v = pte & 0xfffffu;";
+    assert!(hlsl.contains(ok) && hlsl.contains(entry));
+    hlsl.replacen(ok, "    bool ok = true;", 1).replacen(entry, "    pte = 0x80000000u | (((lo >> 19) & 127u) << 20) | (1u + ((lo >> 16) & 7u));\n    uint v = pte & 0xfffffu;", 1)
+}
+
+/// The pages of a base kept across blocks (`emit::keep_pages`) against a group in every block,
+/// through the group's pages, with them folded, with the accessors out of line and as a wave64
+/// program on two hardware waves: the same registers, with fewer resolutions in the text. A resolution that is not made again after a
+/// write of its base must show.
+#[test]
+fn kept_pages_compute_the_same() {
+    let c = kept_program();
+    let main = |t: &str| t[t.find("void main(").unwrap()..].to_string();
+    for (fold, outline, legacy) in [(false, false, false), (true, false, false), (false, true, false), (true, false, true)] {
+        let translate = |kept: bool| {
+            FOLD.set(fold);
+            super::emit::NO_KEPT_PAGES.set(!kept);
+            let t = if legacy {
+                // a wave64 program as two hardware waves that exchange their masks
+                let cs = super::CsInterface { threads: [64, 1, 1], user_sgprs: 4, tgid: [true, false, false], tg_size: false, tid_components: 1 };
+                let fold = super::emit::NO_GROUP_FOLD.replace(false);
+                let t = translate(&c, &Options { mode: Mode::Compute(cs), wave64: true, split_wave64: true, legacy_compute_wave64: true, mem_windows: 4, ..Default::default() }).unwrap();
+                super::emit::NO_GROUP_FOLD.set(fold);
+                assert!(t.complete(), "{:?}", t.unsupported_why);
+                t.hlsl.replace("vector<uint64_t, 4>(", "uint64_t4(")
+            } else if outline {
+                translate_outlined(&c, true)
+            } else {
+                translate_cs(&c, true)
+            };
+            super::emit::NO_KEPT_PAGES.set(false);
+            FOLD.set(false);
+            every_page_mapped(&t)
+        };
+        let (old, new) = (translate(false), translate(true));
+        assert!(!old.contains("xcl_k0_") && new.contains("static uint4 xcl_k0_r") && new.contains("static uint4 xcl_k1_r"), "{new}");
+        let resolutions = |t: &str| main(t).matches("xcl_group_pages(").count() + main(t).matches("xcl_mLoad(").count() + main(t).matches("xcl_mLoad2(").count() + main(t).matches("xcl_mLoad4(").count() + main(t).matches("xcl_loadx4(").count();
+        assert!(resolutions(&new) < resolutions(&old), "{} {}\n{}", resolutions(&old), resolutions(&new), main(&new));
+        assert_eq!(interp::diff(&load(&old), &load(&new), 0..24, &Config::default()).0, Verdict::Equal, "fold {fold} outline {outline} legacy {legacy}");
+        // the descriptor's pages are resolved at the start; the base's there, after its write
+        // on one side of the branch and after the one in the loop
+        assert_eq!(main(&new).matches("xcl_k0_g = ").count(), 1, "{}", main(&new));
+        let again: Vec<usize> = main(&new).match_indices("xcl_k1_g = ").map(|(i, _)| i).collect();
+        assert_eq!(again.len(), 3, "{}", main(&new));
+        if !outline {
+            for &i in &again[1..] {
+                let at = new.find("void main(").unwrap() + i;
+                let end = at + new[at..].find('\n').unwrap();
+                let stale = format!("{}{}", &new[..at], &new[end..]);
+                assert!(matches!(interp::diff(&load(&old), &load(&stale), 0..24, &Config::default()).0, Verdict::Different(_)), "a stale resolution not caught");
+            }
+        }
+    }
+}
+
+/// A four-address load alone on its base left to its accessor (`emit::lone_loads`) against a
+/// group declared for it at once, through the group's pages, with them folded and with the
+/// accessors out of line: the same registers. Where a second load joins, the group is declared
+/// before the first and the first reads through it.
+#[test]
+fn a_lone_four_address_load_keeps_its_accessor() {
+    let main = |t: &str| t[t.find("void main(").unwrap()..].to_string();
+    for c in [grouped_program(), small_loads_program(), interleaved_program(), wide_loads_program(), kept_program()] {
+        for (fold, outline) in [(false, false), (true, false), (false, true)] {
+            let translate = |lone: bool| {
+                FOLD.set(fold);
+                LONE.set(lone);
+                let t = if outline { translate_outlined(&c, true) } else { translate_cs(&c, true) };
+                LONE.set(false);
+                FOLD.set(false);
+                every_page_mapped(&t)
+            };
+            let (old, new) = (translate(false), translate(true));
+            assert!(main(&new).matches("xcl_group_pages(").count() <= main(&old).matches("xcl_group_pages(").count());
+            assert_eq!(interp::diff(&load(&old), &load(&new), 0..24, &Config::default()).0, Verdict::Equal, "fold {fold} outline {outline}");
+        }
+    }
+    // grouped_program: the s_buffer pair and the buffer loads at 4 and 16 still share a group each,
+    // the four-address load of each read through it; the x4 after the voffset moved has none
+    let c = grouped_program();
+    LONE.set(true);
+    let (new, folded) = (translate_cs(&c, true), { FOLD.set(true); translate_cs(&c, true) });
+    FOLD.set(false);
+    LONE.set(false);
+    let old = translate_cs(&c, true);
+    let decls = |t: &str| main(t).lines().filter(|l| l.contains("= xcl_group_pages(t") || l.contains("Fold(t")).count();
+    assert_eq!((decls(&old), decls(&new), decls(&folded)), (5, 4, 4), "{}", main(&new));
+    assert_eq!((main(&old).matches("xcl_loadx4G(").count(), main(&old).matches("xcl_loadx4(").count()), (3, 0));
+    assert_eq!((main(&new).matches("xcl_loadx4G(").count(), main(&new).matches("xcl_loadx4(").count()), (2, 1), "{}", main(&new));
+    assert_eq!((main(&folded).matches("Load4X(t").count(), main(&folded).matches("xcl_loadx4(").count()), (2, 1), "{}", main(&folded));
+}
+
+/// A base whose SGPR offset is written on one path and a scalar load that overwrites its own
+/// base, read in five blocks: plain, thread-limited and as a legacy wave64 program, through the
+/// group's pages and folded, and with the accessors out of line. Both bases are kept, each
+/// resolved at the start and after the load over the base; the stores are those of the groups
+/// of every block, and without the later resolutions they differ.
+#[test]
+fn kept_pages_follow_an_offset_register_and_a_load_over_its_base() {
+    enum A {
+        I(Inst),
+        L(&'static str),
+        B(&'static str, &'static str),
+    }
+    let ld = |d: u64, soff: u64, o: u64| A::I(("S_LOAD_DWORD", "ENC_SMEM", vec![("SDATA", d), ("SBASE", 0), ("SOFFSET", soff), ("OFFSET", o)]));
+    let cmp = |r: u64, k: u64| A::I(("S_CMP_EQ_U32", "ENC_SOPC", vec![("SSRC0", r), ("SSRC1", k)]));
+    let mut p = vec![
+        A::I(("S_LOAD_DWORDX4", "ENC_SMEM", vec![("SDATA", 8), ("SBASE", 0), ("SOFFSET", 125), ("OFFSET", 0x40)])),
+        ld(14, 3, 0x4),
+        ld(15, 125, 0x8),
+        cmp(2, 128),
+        A::B("S_CBRANCH_SCC1", "meet"),
+        A::I(("S_ADD_U32", "ENC_SOP2", vec![("SDST", 3), ("SSRC0", 3), ("SSRC1", 2)])),
+        ld(0, 125, 0x20),
+        ld(16, 3, 0xc),
+        A::L("meet"),
+        ld(17, 3, 0x10),
+        ld(18, 125, 0x14),
+        cmp(2, 129),
+        A::B("S_CBRANCH_SCC1", "b2"),
+        ld(19, 3, 0x18),
+        A::L("b2"),
+        ld(20, 3, 0x1c),
+        cmp(2, 130),
+        A::B("S_CBRANCH_SCC1", "b3"),
+        ld(21, 125, 0x24),
+        A::L("b3"),
+        ld(22, 3, 0x28),
+        ld(23, 125, 0x2c),
+        A::I(("V_LSHLREV_B32", "ENC_VOP2", vec![("VDST", 44), ("SRC0", 134), ("VSRC1", 0)])),
+    ];
+    for (k, s) in (14u64..24).enumerate() {
+        p.push(A::I(("V_MOV_B32", "ENC_VOP1", vec![("VDST", 100), ("SRC0", s)])));
+        p.push(A::I(("BUFFER_STORE_DWORD", "ENC_MUBUF", vec![("VDATA", 100), ("VADDR", 44), ("SRSRC", 2), ("SOFFSET", 128), ("OFFSET", 4 * k as u64), ("OFFEN", 1)])));
+    }
+    p.push(A::I(("S_ENDPGM", "ENC_SOPP", vec![])));
+    let size = |a: &A| match a {
+        A::I(i) => code(std::slice::from_ref(i)).len(),
+        A::L(_) => 0,
+        A::B(..) => 4,
+    };
+    let at = |label: &str| p.iter().take_while(|a| !matches!(a, A::L(l) if *l == label)).map(size).sum::<usize>() as i64;
+    let mut c = Vec::new();
+    for a in &p {
+        match a {
+            A::I(i) => c.extend(code(std::slice::from_ref(i))),
+            A::L(_) => {}
+            A::B(n, l) => c.extend(encode(n, "ENC_SOPP", &[("SIMM16", ((at(l) - (c.len() as i64 + 4)) / 4) as i16 as u16 as u64)], None).unwrap()),
+        }
+    }
+    let main = |t: &str| t[t.find("void main(").unwrap()..].to_string();
+    for (fold, limited, legacy, outline) in [(false, false, false, false), (true, false, false, false), (true, true, false, false), (true, false, true, false), (false, true, true, false), (false, false, false, true)] {
+        let translate = |kept: bool, closing: bool| {
+            super::emit::NO_KEPT_PAGES.set(!kept);
+            super::emit::KEPT_WRITES_CLOSE.set(closing);
+            let fold0 = super::emit::NO_GROUP_FOLD.replace(!fold);
+            super::emit::OUTLINE.set(outline.then_some(true));
+            let cs = super::CsInterface { threads: [64, 1, 1], user_sgprs: 4, tgid: [true, false, false], tg_size: false, tid_components: 1 };
+            let o = Options { mode: Mode::Compute(cs), wave64: legacy, split_wave64: true, legacy_compute_wave64: legacy, thread_limits: limited, mem_windows: 4, ..Default::default() };
+            let t = translate(&c, &o);
+            super::emit::OUTLINE.set(None);
+            super::emit::NO_GROUP_FOLD.set(fold0);
+            super::emit::KEPT_WRITES_CLOSE.set(false);
+            super::emit::NO_KEPT_PAGES.set(false);
+            let t = t.unwrap();
+            assert!(t.complete(), "{:?}", t.unsupported_why);
+            every_page_mapped(&t.hlsl.replace("vector<uint64_t, 4>(", "uint64_t4("))
+        };
+        let form = format!("fold {fold} limited {limited} legacy {legacy} outline {outline}");
+        let (old, new) = (translate(false, false), translate(true, false));
+        let kept = |t: &str| (0..3).map(|n| main(t).matches(&format!("xcl_k{n}_g = ")).count()).collect::<Vec<_>>();
+        assert_eq!(kept(&new), [2, 2, 0], "{form}\n{}", main(&new));
+        assert_eq!(interp::diff(&load(&old), &load(&new), 0..24, &Config::default()).0, Verdict::Equal, "{form}\n{}", main(&new));
+        let mut stale = new.clone();
+        for n in 0..2 {
+            let later: Vec<usize> = stale.match_indices(&format!("xcl_k{n}_g = ")).map(|(i, _)| i).skip(1).collect();
+            for &i in later.iter().rev() {
+                let (s, e) = (stale[..i].rfind('\n').unwrap() + 1, i + stale[i..].find('\n').unwrap());
+                stale.replace_range(s..e, "");
+            }
+        }
+        assert!(matches!(interp::diff(&load(&old), &load(&stale), 0..24, &Config::default()).0, Verdict::Different(_)), "{form}: a stale resolution not caught");
+        // Where the plan's own translation finds that no text can follow the load over the base
+        // (`emit::KEPT_WRITES_CLOSE`), the plan is made again without it: the loads that write
+        // reaches go back to their blocks. The base without the offset register keeps the start's
+        // resolution for its loads before the write, in two blocks; the other's are in one.
+        let closed = translate(true, true);
+        assert_eq!(kept(&closed), [1, 0, 0], "{form}\n{}", main(&closed));
+        assert_eq!(interp::diff(&load(&old), &load(&closed), 0..24, &Config::default()).0, Verdict::Equal, "{form}");
     }
 }

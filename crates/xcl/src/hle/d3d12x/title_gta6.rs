@@ -17,7 +17,12 @@
 //!   (the three compute giants play-92 could never build, up to 16.7 MB of DXIL), ray binning,
 //!   budgeting and sorting, ray-traced visibility and shadow passes – are left out unbuilt. The
 //!   general layer catches the tracing passes and the BVH builder. General fix: inline ray tracing
-//!   the driver can compile in bounded memory, then ray tracing on.
+//!   the driver can compile in bounded memory, then ray tracing on. With `XCL_RT_GATE=probes`
+//!   (every ray a miss otherwise, as "miss") only the ray activation and the ray-hit resolve are
+//!   left out (`probes_gate_pass`), as cool_fox does: its f4164f86 records that with
+//!   `CS_ScreenProbes_ActivateRays` running and no rays behind it "the whole picture lost light,
+//!   shadows and reflections"; the probe activation and the probes' temporal resolve run. Off
+//!   with `XCL_TITLE_RT_SKIP=0` or any other `XCL_RT_GATE`.
 //! - Watchdog (`XCL_TITLE_GTA6_WATCHDOG=0`): the title's watchdog thread ends the process (a store
 //!   to address 0) when its main thread's heartbeat has stood for 30 one-second ticks. play-95
 //!   ended so at 310 s: the main thread had waited 30.8 s for a frame XCL held up. While the
@@ -175,6 +180,25 @@ fn engaged(patch: Patch, detail: impl FnOnce() -> String) {
     if n == 1 || n.is_power_of_two() {
         crate::xlog_info!("D3D12.X: title patch {} ({}=0 turns it off): {} (#{n})", patch.what(), patch.switch(), detail());
     }
+}
+
+/// The two ray passes cool_fox leaves out with rays off (DoubleGhosty/cool_fox bd8b4f52,
+/// crates/victory-gpu/src/pipeline/make.rs:79-104, GPL-3.0-or-later; idle_without_rays in
+/// f4164f86 crates/victory-gpu/src/pipeline.rs): the screen probes' ray activation and the
+/// ray-hit resolve. The probe activation, tracing (every ray a miss) and temporal resolve run.
+const PROBE_GATE_PASSES: [&[u8]; 2] = [b"CS_ScreenProbes_ActivateRays", b"CS_RaytracingResolve"];
+
+/// Ray tracing off with `XCL_RT_GATE=probes` (`raytracing::classify_as`): a compute shader of
+/// `PROBE_GATE_PASSES`, left out unbuilt. Title-specific (by the pass names in GTA VI's
+/// containers, only with the title's id; `XCL_TITLE_RT_SKIP=0` turns it off). General fix: inline
+/// ray tracing the driver can compile in bounded memory, then ray tracing on.
+pub fn probes_gate_pass(container: &[u8]) -> Option<&'static [u8]> {
+    let name = PROBE_GATE_PASSES.iter().copied().find(|name| container.windows(name.len()).any(|w| w == *name))?;
+    if !title() || !on(Patch::RtSkip) {
+        return None;
+    }
+    engaged(Patch::RtSkip, || format!("{} left out unbuilt (XCL_RT_GATE=probes)", String::from_utf8_lossy(name)));
+    Some(name)
 }
 
 pub(super) fn ray_pass(container: &[u8]) -> Option<&'static [u8]> {

@@ -274,6 +274,26 @@ name = "testgame-mw"
 version = "0.1.0"
 
 [[package]]
+name = "thiserror"
+version = "2.0.21"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "09e52cb86a36cede5cb101bf8908837b3e4c6e5e59fe7fd85c23fb56200d189e"
+dependencies = [
+ "thiserror-impl",
+]
+
+[[package]]
+name = "thiserror-impl"
+version = "2.0.21"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fe5197923287db20a58125f0bc85c062f7f2c892de97b18c356f9efb14b28524"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 3.0.10",
+]
+
+[[package]]
 name = "toml"
 version = "1.2.1+spec-1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -563,12 +583,22 @@ dependencies = [
  "windows-core",
  "windows-sys 0.61.2",
  "xcl-bcpack",
+ "xcl-cgbj",
  "xcl-dxil",
 ]
 
 [[package]]
 name = "xcl-bcpack"
 version = "0.1.0"
+
+[[package]]
+name = "xcl-cgbj"
+version = "0.1.0"
+dependencies = [
+ "thiserror",
+ "windows-sys 0.61.2",
+ "zlib-rs",
+]
 
 [[package]]
 name = "xcl-dxil"
@@ -581,6 +611,12 @@ dependencies = [
  "miniz_oxide",
  "windows",
 ]
+
+[[package]]
+name = "zlib-rs"
+version = "0.6.8"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b268e58e7c693d7c271f93ffc4ba3b380412554231c85bf61ca7af91042a4112"
 
 [[package]]
 name = "zmij"

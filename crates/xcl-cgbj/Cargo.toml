@@ -1,0 +1,63 @@
+[package]
+name = "xcl-cgbj"
+description = "CGBJ's shader translator (a VIctory fork): console GFX10 shader code to a DXIL container, with no HLSL and no DXC"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+# This crate is CGBJ code and keeps CGBJ's licence. The rest of the tree is GPL-3.0-or-later too.
+license = "GPL-3.0-or-later"
+publish = false
+
+[lib]
+name = "xcl_cgbj"
+path = "src/lib.rs"
+
+[[bin]]
+name = "xcl-cgbj-census"
+path = "src/bin/xcl-cgbj-census.rs"
+
+[dependencies]
+thiserror = "2.0.21"
+zlib-rs = { version = "0.6.8", default-features = false, features = ["std"] }
+
+[features]
+# Host D3D12 pipeline checks (`emit::host`).
+host = ["dep:windows"]
+# Debugging switches (emitted-module dumps and the like).
+diagnostics = []
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61.2", features = ["Win32_System_LibraryLoader"] }
+windows = { version = "0.62.2", optional = true, features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Direct3D",
+    "Win32_Graphics_Direct3D12",
+    "Win32_Graphics_Dxgi",
+    "Win32_Graphics_Dxgi_Common",
+] }
+
+[target.'cfg(windows)'.dev-dependencies]
+windows = { version = "0.62.2", features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Direct3D",
+    "Win32_Graphics_Direct3D12",
+    "Win32_Graphics_Dxgi",
+    "Win32_Graphics_Dxgi_Common",
+] }
+
+# CGBJ's workspace lints, copied from its root Cargo.toml.
+[lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+unused_must_use = "deny"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
+type_complexity = "allow"
+needless_range_loop = "allow"
+chunks_exact_to_as_chunks = "allow"
+sliced_string_as_bytes = "allow"
+collapsible_match = "allow"
+manual_clamp = "allow"
+implicit_saturating_sub = "allow"
+min_max = "allow"
+undocumented_unsafe_blocks = "allow"

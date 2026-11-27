@@ -2,7 +2,9 @@
 resolver = "2"
 members = ["crates/xcl", "crates/xcl-bcpack", "tests/testtitle", "tests/testgamedll"]
 # The direct DXIL backend is its own workspace: no dependencies, builds and tests on Linux.
-exclude = ["crates/xcl-dxil"]
+# crates/xcl-cgbj is CGBJ's shader translator (GPL-3.0-or-later, see its PROVENANCE.md): its own
+# workspace too, and not yet a dependency of xcl.
+exclude = ["crates/xcl-dxil", "crates/xcl-cgbj"]
 
 [workspace.package]
 version = "0.1.0"
