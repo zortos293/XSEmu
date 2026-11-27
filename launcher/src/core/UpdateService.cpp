@@ -762,8 +762,10 @@ try {
   $files = @(Get-ChildItem -LiteralPath $root -Recurse -File)
   Note "replacing $($files.Count) files from $root"
   foreach ($f in $files) {
-    $rel = $f.FullName.Substring($root.Length).TrimStart('\')
-    if ($rel -match '^core\\') { Note "keeping $rel : XSEmu Core replaces it, not a launcher update"; continue }
+    # Either separator: the relative path is what decides whether a file is the Core's, and the
+    # regex below is what keeps a launcher update from replacing it.
+    $rel = $f.FullName.Substring($root.Length).TrimStart('\', '/')
+    if ($rel -match '^core[\\/]') { Note "keeping $rel : XSEmu Core replaces it, not a launcher update"; continue }
     $dest = Join-Path $AppDir $rel
     if (Test-Path -LiteralPath $dest) {
       $bak = Join-Path $Backup $rel
