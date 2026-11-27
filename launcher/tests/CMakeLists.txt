@@ -20,7 +20,6 @@ xsemu_test(tst_shadercache)
 xsemu_test(tst_settings)
 xsemu_test(tst_runners)
 xsemu_test(tst_settingsprofile)
-xsemu_test(tst_update)
 
 # a DexNom-shaped source build read back through every runner surface, then after a restart
 # (cargo is a small program here, so the build step starts the same way on every OS)
@@ -54,6 +53,8 @@ if(XSEMU_FAKE_EMULATOR)
     target_compile_definitions(tst_ingame PRIVATE XSEMU_FAKE_EMULATOR_PATH="$<TARGET_FILE:fake-xsemu>")
 
     # page switches and stats ticks timed on a generated PC-shaped shader cache and library
+    # A Core update is proven against a copy of fake-xsemu, so this test needs it built.
+    xsemu_test(tst_update)
     add_dependencies(tst_update fake-xsemu)
     target_compile_definitions(tst_update PRIVATE XSEMU_FAKE_EMULATOR_PATH="$<TARGET_FILE:fake-xsemu>")
 

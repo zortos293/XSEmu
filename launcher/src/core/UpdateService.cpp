@@ -305,6 +305,7 @@ void UpdateService::setState(State state, const QString& message)
 
 void UpdateService::finishFailed(const QString& error)
 {
+    releaseGate();
     m_status.state = State::Failed;
     m_status.error = error;
     m_status.message = error;
@@ -465,11 +466,24 @@ void UpdateService::runCheck(const CheckInputs& in)
     });
 }
 
+void UpdateService::releaseGate()
+{
+    if (m_gate.owner() == ProcessGate::Owner::Update)
+        m_gate.release(ProcessGate::Owner::Update);
+}
+
 void UpdateService::install(Part part)
 {
     QString why;
     if (!canInstall(part, &why)) {
         finishFailed(why);
+        return;
+    }
+    // Hold the one-process gate for the whole update. A game or a warm-up started mid-download would
+    // otherwise be replaced under, or killed by the launcher quitting to update itself.
+    const QString held = part == Part::Launcher ? QStringLiteral("the launcher update") : QStringLiteral("the XSEmu Core update");
+    if (!m_gate.acquire(ProcessGate::Owner::Update, held, [this] { cancel(); })) {
+        finishFailed(QStringLiteral("Something else is running the emulator. An update needs the launcher idle."));
         return;
     }
     const ReleasePart releasePart = part == Part::Launcher ? m_status.release.launcher : m_status.release.core;
@@ -516,6 +530,14 @@ void UpdateService::runInstall(Part part, const ReleasePart& releasePart)
         return;
     }
     post([this] { setState(State::Applying, QStringLiteral("Checking the download...")); });
+    if (m_gate.owner() != ProcessGate::Owner::Update) {
+        fail(QStringLiteral("The update lost its turn to a game or a warm-up; nothing was replaced."));
+        return;
+    }
+    if (const ProcessGate::External other = m_gate.external(); other.busy()) {
+        fail(QStringLiteral("An XSEmu process is running outside the launcher (%1); nothing was replaced.").arg(other.reason()));
+        return;
+    }
     if (fileSha256(asset).compare(releasePart.sha256, Qt::CaseInsensitive) != 0) {
         fail(QStringLiteral("%1 does not have the SHA-256 its release says.").arg(releasePart.asset));
         return;
@@ -534,6 +556,7 @@ void UpdateService::runInstall(Part part, const ReleasePart& releasePart)
             return;
         }
         post([this, version] {
+            releaseGate();
             removeTree(join(m_appDir, QString::fromLatin1(kUpdateDir)));
             m_status.state = State::UpToDate;
             refresh();
@@ -573,6 +596,7 @@ void UpdateService::runInstall(Part part, const ReleasePart& releasePart)
         return;
     }
     post([this] {
+        releaseGate();
         m_status.state = State::Applying;
         m_status.message = QStringLiteral("Restarting the launcher to finish the update...");
         m_status.done = -1;
@@ -610,7 +634,8 @@ bool UpdateService::applyCore(const QString& staged, const ReleasePart& part, QS
         return fail(QStringLiteral("The new XSEmu Core does not answer --version, so it was not installed."));
 
     // Keep the previous copy of every file the update replaces, instead of the whole folder: the DX
-    // compiler beside the Core belongs to the launcher and is not part of a Core update.
+    // compiler beside the Core belongs to the launcher and is not part of a Core update. The restore
+    // also removes a file the update introduced (a version file beside an older hand-placed Core).
     const QString previous = previousCoreDir();
     removeTree(previous);
     if (!QDir().mkpath(previous))
@@ -631,11 +656,13 @@ bool UpdateService::applyCore(const QString& staged, const ReleasePart& part, QS
     const auto restore = [&] {
         for (const ReleaseFile& f : part.files) {
             const QString from = join(previous, f.name);
-            if (!QFileInfo::exists(from))
-                continue;
             const QString to = join(m_coreDir, f.name);
-            QFile::remove(to);
-            QFile::copy(from, to);
+            if (QFileInfo::exists(from)) {
+                QFile::remove(to);
+                QFile::copy(from, to);
+            } else if (QFileInfo::exists(to)) {
+                QFile::remove(to);
+            }
         }
     };
     if (!keepPrevious()) {
@@ -694,6 +721,7 @@ try {
   Note "replacing $($files.Count) files from $root"
   foreach ($f in $files) {
     $rel = $f.FullName.Substring($root.Length).TrimStart('\')
+    if ($rel -match '^core\\') { Note "keeping $rel : XSEmu Core replaces it, not a launcher update"; continue }
     $dest = Join-Path $AppDir $rel
     if (Test-Path -LiteralPath $dest) {
       $bak = Join-Path $Backup $rel
@@ -751,10 +779,12 @@ bool UpdateService::restorePreviousCore(QString* error)
             *error = QStringLiteral("XSEmu is running. Stop it before going back to the previous Core.");
         return false;
     }
+    QStringList kept;
     QDirIterator it(previous, QDir::Files, QDirIterator::Subdirectories);
     while (it.hasNext()) {
         const QString from = it.next();
-        const QString to = join(m_coreDir, QDir(previous).relativeFilePath(from));
+        const QString relative = QDir(previous).relativeFilePath(from);
+        const QString to = join(m_coreDir, relative);
         QDir().mkpath(QFileInfo(to).absolutePath());
         QFile::remove(to);
         if (!QFile::copy(from, to)) {
@@ -762,7 +792,12 @@ bool UpdateService::restorePreviousCore(QString* error)
                 *error = QStringLiteral("Could not put %1 back.").arg(QFileInfo(to).fileName());
             return false;
         }
+        kept.append(relative);
     }
+    // A file the update introduced (the Core's version.json beside an older hand-placed program) says
+    // nothing about the Core that is back now.
+    if (QFileInfo::exists(join(m_coreDir, QString::fromLatin1(kCoreVersionFile))) && !kept.contains(QString::fromLatin1(kCoreVersionFile)))
+        QFile::remove(join(m_coreDir, QString::fromLatin1(kCoreVersionFile)));
     removeTree(previous);
     refresh();
     m_status.message = QStringLiteral("The previous XSEmu Core (%1) is back.")

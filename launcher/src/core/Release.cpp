@@ -156,11 +156,7 @@ bool newerThan(const QString& candidate, const QString& installed)
         return false;
     if (c.toString().compare(i.toString(), Qt::CaseInsensitive) == 0)
         return false;
-    if (compare(c, i) > 0)
-        return true;
-    // The installed build only reports its release family ("0.1.0" for the 0.1.0-pre.1 build), so a
-    // pre-release of that same family is newer than it.
-    return !i.prerelease.isEmpty() ? false : candidate.trimmed().toLower().startsWith(installed.trimmed().toLower() + QLatin1Char('-'));
+    return compare(c, i) > 0;
 }
 
 QString releaseAssetUrl(const QJsonObject& release, const QString& assetName)

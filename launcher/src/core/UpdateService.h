@@ -121,6 +121,7 @@ private:
     };
 
     void startWorker(std::function<void()> job);
+    void releaseGate();
     void post(std::function<void()> f);
     void finishFailed(const QString& error);
     void setState(State state, const QString& message);

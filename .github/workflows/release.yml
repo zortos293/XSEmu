@@ -70,7 +70,7 @@ jobs:
           # dxcompiler.dll and dxil.dll are not part of Windows. XSEmu.exe loads them from its own
           # folder (gpu/recomp/dxc.rs), so they go into core/ beside the bundled Core; bin/ keeps a
           # copy for someone who drops XSEmu.exe next to the launcher by hand.
-          $dxc = Get-ChildItem "$env:ProgramFiles(x86)\Windows Kits\10\bin\*\x64\dxcompiler.dll" |
+          $dxc = Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\bin\*\x64\dxcompiler.dll" |
             Sort-Object FullName -Descending | Select-Object -First 1
           if ($null -eq $dxc) { throw 'no dxcompiler.dll in the Windows SDK' }
           $dxil = Join-Path $dxc.DirectoryName 'dxil.dll'

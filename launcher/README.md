@@ -81,7 +81,15 @@ SHA-256 before unpacking it, checks every file inside the archive again, and ask
 `--version` before it goes into place. It updates nothing while a game or a warm-up runs. The
 previous Core is kept in `core.old` until the new one has started, and Settings → Updates can put it
 back. A launcher update stages the new files, starts a PowerShell script that waits for the launcher
-to exit, replaces the files (keeping a backup) and starts the launcher again.
+to exit, replaces the launcher's own files except `core/` (keeping a backup) and starts the launcher
+again; `core/` is only ever replaced by a Core update, so a launcher update cannot undo a newer Core.
+While an update runs the launcher holds the one-process gate, so a game or a warm-up cannot start
+under it, and a game started first blocks the update.
+
+Versions order by version alone: `0.1.1-pre.1` is above `0.1.0`, and a release is above its own
+pre-releases. The 0.1.0-pre.1 build answers `XSEmu 0.1.0` to `--version` and was built with the
+launcher version `0.1.0`, so the next release has to be tagged above it (`v0.1.1-pre.1`); a
+`v0.1.0-pre.2` would rank below what that build already reports and be offered to nobody.
 
 A Core update replaces only the files the manifest names, by default `XSEmu.exe` and
 `version.json`; the shader compiler DLLs belong to the launcher's bundle and stay. A release is

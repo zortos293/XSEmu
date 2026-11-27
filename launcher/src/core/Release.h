@@ -23,10 +23,11 @@ struct ReleaseVersion {
 // <0 when a is older, 0 when they are the same version, >0 when a is newer.
 int compare(const ReleaseVersion& a, const ReleaseVersion& b);
 
-// Whether candidate should replace installed: it is newer, or it is a pre-release of the version
-// installed reports. The second rule exists because a build that says "0.1.0" (the emulator's
-// --version reports the Cargo version, without the release's pre-release suffix) must still be
-// offered 0.1.0-pre.2 over it.
+// Whether candidate replaces installed, by version order alone: 0.1.1 above 0.1.0, and a release above
+// its own pre-releases (0.1.0 above 0.1.0-pre.2). No exception is made for a version that only names
+// its release family, such as the 0.1.0-pre.1 build whose --version answers "0.1.0": tag a release
+// above it (v0.1.1-pre.1) and it updates; treating 0.1.0-pre.2 as newer than 0.1.0 would move a
+// finished 0.1.0 install onto a pre-release of the version it already has.
 bool newerThan(const QString& candidate, const QString& installed);
 
 struct ReleaseFile {

@@ -1,10 +1,16 @@
 cmake_minimum_required(VERSION 3.21)
 
 # The version the About page, the update check and the release it came from agree on.
-# .github/workflows/release.yml passes the tag's version (-DXSEMU_LAUNCHER_VERSION=0.1.0-pre.2).
+# .github/workflows/release.yml passes the tag's version (-DXSEMU_LAUNCHER_VERSION=0.1.0-pre.2), which
+# may carry a pre-release suffix; project(VERSION) takes numbers only, so it keeps the release family
+# and XSEMU_VERSION carries the whole string.
 set(XSEMU_LAUNCHER_VERSION "0.1.0" CACHE STRING "Version reported by the launcher and compared with releases")
+string(REGEX MATCH "^[0-9]+(\\.[0-9]+)*" XSEMU_LAUNCHER_FAMILY "${XSEMU_LAUNCHER_VERSION}")
+if(XSEMU_LAUNCHER_FAMILY STREQUAL "")
+    message(FATAL_ERROR "XSEMU_LAUNCHER_VERSION '${XSEMU_LAUNCHER_VERSION}' does not start with a number")
+endif()
 
-project(XSEmuLauncher VERSION ${XSEMU_LAUNCHER_VERSION} DESCRIPTION "XSEmu launcher" LANGUAGES CXX)
+project(XSEmuLauncher VERSION ${XSEMU_LAUNCHER_FAMILY} DESCRIPTION "XSEmu launcher" LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -67,7 +73,7 @@ add_library(xsemu_core STATIC
     src/core/WarmupController.cpp src/core/WarmupController.h
 )
 target_include_directories(xsemu_core PUBLIC src src/core)
-target_compile_definitions(xsemu_core PUBLIC XSEMU_VERSION="${PROJECT_VERSION}")
+target_compile_definitions(xsemu_core PUBLIC XSEMU_VERSION="${XSEMU_LAUNCHER_VERSION}")
 target_link_libraries(xsemu_core PUBLIC Qt6::Core Qt6::Network)
 if(WIN32)
     target_link_libraries(xsemu_core PUBLIC dxgi psapi user32)
