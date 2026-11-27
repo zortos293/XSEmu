@@ -229,6 +229,9 @@ QList<RunnerSpec> build()
     v2.id = QStringLiteral("victory-dexnom");
     v2.name = QStringLiteral("VIctory (DexNom)");
     v2.repo = QStringLiteral("DexNom/VIctory");
+    // the 7900 XTX sources above are not this fork's: its own repository first, then upstream, which
+    // also carries 64bd58f (a deleted fork must not take the runner with it)
+    v2.remotes = {QStringLiteral("https://github.com/DexNom/VIctory.git"), QStringLiteral("https://github.com/Marvisak/VIctory.git")};
     v2.badge = QStringLiteral("AMD (tested on RX 7900 XTX)");
     v2.recommendWhy = QStringLiteral("VIctory (DexNom) is tested on a Radeon RX 7900 XTX");
     v2.recommendMinRamBytes = 0;
