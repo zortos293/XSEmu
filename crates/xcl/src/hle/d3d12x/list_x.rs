@@ -5525,6 +5525,10 @@ mod tests {
             crate::gpu::recomp::runner::skip_test("no unified memory");
             return;
         }
+        if !crate::hle::d3d12x::sparse::windows_ready() {
+            crate::gpu::recomp::runner::skip_test("no 4 GiB sparse memory window: this adapter cannot reserve one");
+            return;
+        }
         unsafe {
             let Ok(factory) = CreateDXGIFactory1::<IDXGIFactory4>() else {
                 crate::gpu::recomp::runner::skip_test("no WARP");
@@ -6240,6 +6244,12 @@ mod tests {
 
     #[test]
     fn resolve_query_data_applies_buffer_delta_to_pc_resolve_and_occlusion_writeback() {
+        if !crate::hle::d3d12x::sparse::windows_ready() {
+            // The resolve reaches its PC data through a console heap, which needs window-0 storage a
+            // software adapter cannot make; without it the whole buffer goes instead.
+            return crate::gpu::recomp::runner::skip_test(
+                "no 4 GiB sparse memory window: this adapter cannot reserve one, and the resolve needs a console heap");
+        }
         use std::cell::RefCell;
 
         thread_local! {

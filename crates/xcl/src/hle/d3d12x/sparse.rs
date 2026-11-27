@@ -795,6 +795,13 @@ pub fn accepts_allocations() -> bool {
     !UNAVAILABLE.load(Ordering::Acquire)
 }
 
+/// Whether the sparse windows are open and can take an allocation: false when this adapter could not
+/// create them, and false before anything has opened them. Tests and callers that need the sparse
+/// path ask this instead of assuming `crate::gpu::uma::get()` implies it.
+pub fn windows_ready() -> bool {
+    accepts_allocations() && STATE.lock().map(|s| s.is_some()).unwrap_or(false)
+}
+
 pub(super) fn reserve_tile_table(bytes: usize) -> Result<(), crate::util::HRESULT> {
     let mut g = STATE.lock().unwrap();
     let s = g.as_mut().ok_or(crate::util::E_NOTIMPL)?;

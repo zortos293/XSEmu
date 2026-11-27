@@ -355,8 +355,13 @@ unsafe fn submit_empty(dev: &ID3D12Device, queue: &ID3D12CommandQueue, note: imp
     let list: ID3D12GraphicsCommandList = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &alloc, None).unwrap();
     list.Close().unwrap();
     note(list.as_raw());
+    let reported = super::reports();
     queue.ExecuteCommandLists(&[Some(list.cast().unwrap())]);
-    super::submitted(queue.as_raw(), &[list.as_raw()]);
+    // On a real backend XCL's ExecuteCommandLists goes through `submitted` itself, so reporting the
+    // same submission here as well would count it twice.
+    if super::reports() == reported {
+        super::submitted(queue.as_raw(), &[list.as_raw()]);
+    }
     super::super::title_textures::list_reset(list.as_raw() as usize);
     std::mem::forget((alloc, list));
 }

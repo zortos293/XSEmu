@@ -1,12 +1,12 @@
 use super::*;
-use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0;
 
 #[test]
 fn immutable_versions_merge_only_after_ready_and_preserve_inflight_readers() {
     unsafe {
-        let mut dev = None;
-        D3D12CreateDevice(None, D3D_FEATURE_LEVEL_11_0, &mut dev).unwrap();
-        let dev: ID3D12Device = dev.unwrap();
+        let Some(dev) = crate::hle::d3d12x::real::test_device() else {
+            crate::gpu::recomp::runner::skip_test("no GPU");
+            return;
+        };
         assert!(init(&dev));
         let hi = 0x617u16;
         let change = |page: u16, plane, target| Change {

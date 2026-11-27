@@ -2,7 +2,6 @@ use super::*;
 use crate::hle::d3d12x::page_mappings::queue;
 use crate::hle::d3d12x::physical_directory::{self, prepare_version, Change, Mapping, Plane};
 use crate::hle::d3d12x::{console_heap, indirect};
-use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0;
 use windows::Win32::Graphics::Dxgi::Common::*;
 
 unsafe fn buffer(dev: &ID3D12Device, ty: D3D12_HEAP_TYPE, flags: D3D12_RESOURCE_FLAGS, state: D3D12_RESOURCE_STATES, n: u64) -> ID3D12Resource {
@@ -28,12 +27,10 @@ unsafe fn buffer(dev: &ID3D12Device, ty: D3D12_HEAP_TYPE, flags: D3D12_RESOURCE_
 #[test]
 fn a_directory_copy_splits_both_sides_and_drops_writes_to_an_unmapped_page() {
     unsafe {
-        let mut dev = None;
-        if D3D12CreateDevice(None, D3D_FEATURE_LEVEL_11_0, &mut dev).is_err() {
+        let Some(dev) = crate::hle::d3d12x::real::test_device() else {
             crate::gpu::recomp::runner::skip_test("no GPU");
             return;
-        }
-        let dev: ID3D12Device = dev.unwrap();
+        };
         assert!(physical_directory::init(&dev));
         let base = 0x0618_0000_0000u64;
         prepare_version(vec![Change { guest: base + 5 * 65536, plane: Plane::Gpu, target: Mapping::Unmapped }]).unwrap().publish_at_ready();
@@ -117,12 +114,10 @@ const RIG_SIZE: u64 = 6 * 65536;
 
 impl Rig {
     unsafe fn new(base: u64) -> Option<Rig> {
-        let mut dev = None;
-        if D3D12CreateDevice(None, D3D_FEATURE_LEVEL_11_0, &mut dev).is_err() {
+        let Some(dev) = crate::hle::d3d12x::real::test_device() else {
             crate::gpu::recomp::runner::skip_test("no GPU");
             return None;
-        }
-        let dev: ID3D12Device = dev.unwrap();
+        };
         assert!(physical_directory::init(&dev));
         prepare_version(vec![Change { guest: base + 5 * 65536, plane: Plane::Gpu, target: Mapping::Unmapped }]).unwrap().publish_at_ready();
         let q: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC { Type: D3D12_COMMAND_LIST_TYPE_DIRECT, ..Default::default() }).unwrap();

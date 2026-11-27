@@ -1,6 +1,5 @@
 use super::*;
 use crate::hle::d3d12x::{console_heap, physical_directory};
-use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0;
 
 unsafe fn buffer(
     dev: &ID3D12Device,
@@ -40,9 +39,10 @@ unsafe fn buffer(
 #[test]
 fn a_fixed_packet_gathers_args_and_predicate_then_executes_only_the_guest_command_conditionally() {
     unsafe {
-        let mut dev = None;
-        D3D12CreateDevice(None, D3D_FEATURE_LEVEL_11_0, &mut dev).unwrap();
-        let dev: ID3D12Device = dev.unwrap();
+        let Some(dev) = crate::hle::d3d12x::real::test_device() else {
+            crate::gpu::recomp::runner::skip_test("no GPU");
+            return;
+        };
         assert!(physical_directory::init(&dev));
         let q: ID3D12CommandQueue = dev
             .CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC {

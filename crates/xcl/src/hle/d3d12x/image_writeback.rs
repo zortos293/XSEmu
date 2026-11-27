@@ -109,8 +109,19 @@ const NAMES: [&str; 25] = [
 
 static COUNTS: [AtomicU64; 25] = [const { AtomicU64::new(0) }; 25];
 
+#[cfg(test)]
+thread_local! {
+    /// what this thread counted: the tests compare deltas while three other tests submit in the
+    /// same process and the product's counters are shared
+    static TEST_COUNTS: std::cell::RefCell<[u64; 23]> = const { std::cell::RefCell::new([0; 23]) };
+    /// submissions this thread reported, so a test can tell whether the queue's own wrapper did it
+    static REPORTS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
 fn count(c: Count) {
     let n = COUNTS[c as usize].fetch_add(1, Ordering::Relaxed) + 1;
+    #[cfg(test)]
+    TEST_COUNTS.with(|t| t.borrow_mut()[c as usize] += 1);
     if n.is_power_of_two() {
         crate::xlog_info!("D3D12.X: image writeback: {} ({n} so far)", NAMES[c as usize]);
     }
@@ -613,10 +624,17 @@ fn uav_state(img: &Image, state: u32) -> bool {
 
 /// The PC lists went to queue, in this order: the images they wrote are captured and guarded,
 /// and every image they wrote or transitioned is ordered after them.
+#[cfg(test)]
+pub(super) fn reports() -> u64 {
+    REPORTS.with(|r| r.get())
+}
+
 pub(super) unsafe fn submitted(queue: *mut c_void, lists: &[*mut c_void]) {
     if !ACTIVE.load(Ordering::Relaxed) || lists.is_empty() || super::title_textures::is_own_work() {
         return;
     }
+    #[cfg(test)]
+    REPORTS.with(|r| r.set(r.get() + 1));
     let Some(q) = ID3D12CommandQueue::from_raw_borrowed(&queue) else { return };
     let _submission = Submission::enter();
     let notes = super::title_textures::list_transitions(lists);
@@ -1147,7 +1165,7 @@ unsafe fn read_back(contexts: &mut BTreeMap<usize, Context>, res: &ID3D12Resourc
 
 #[cfg(test)]
 fn counted(name: &str) -> u64 {
-    NAMES.iter().position(|n| *n == name).map_or(0, |i| COUNTS[i].load(Ordering::Relaxed))
+    NAMES.iter().position(|n| *n == name).map_or(0, |i| TEST_COUNTS.with(|t| t.borrow()[i]))
 }
 
 #[cfg(test)]
