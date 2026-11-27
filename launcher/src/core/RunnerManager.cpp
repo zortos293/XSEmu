@@ -63,7 +63,8 @@ RunnerManager::RunnerManager(QObject* parent)
 RunnerManager::~RunnerManager()
 {
     if (m_task) {
-        // no finished() into a half-destroyed manager (m_settings may be gone already)
+        // no finished() into a half-destroyed manager (`m_settings` is a QPointer: it is null if the
+        // settings were destroyed first, whichever order `Services` destroys its members in)
         m_task->disconnect(this);
         m_task->cancel();
         // a move-and-rebuild writes the new folder before it builds: stopping here must put the runner

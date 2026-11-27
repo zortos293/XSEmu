@@ -119,7 +119,9 @@ private:
     void setLocation(const QString& id, const QString& folder);
     void finishMove(bool ok, const QString& message);
 
-    AppSettings* m_settings = nullptr;
+    // A pointer that clears itself: the destructor rolls a move-and-rebuild back through the settings,
+    // and that must not depend on `Services` destroying its settings after this manager.
+    QPointer<AppSettings> m_settings;
     std::function<QString(const QString&)> m_inUse;
     QPointer<RunnerInstall> m_task;
     QString m_taskId;
