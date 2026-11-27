@@ -656,13 +656,20 @@ void CoverArtService::finishCurrent()
         QString& name = e.file(kind);
         if (name.isEmpty())
             continue;
-        QFile::remove(dir.filePath(name));
-        if (!QFile::rename(dir.filePath(name + QStringLiteral(".part")), dir.filePath(name))) {
-            QFile::remove(dir.filePath(name + QStringLiteral(".part")));
-            name = old.file(kind);
-            e.authors[size_t(kind)] = old.authors[size_t(kind)];
-            e.fetchedAt = {}; // looked up again on the next request
+        const QString dest = dir.filePath(name);
+        const QString part = dest + QStringLiteral(".part");
+        const QString backup = dest + QStringLiteral(".old");
+        QFile::remove(backup);
+        const bool moved = !QFile::exists(dest) || QFile::rename(dest, backup);
+        if (moved && QFile::rename(part, dest)) {
+            QFile::remove(backup);
+            continue;
         }
+        if (moved)
+            QFile::rename(backup, dest);
+        QFile::remove(part);
+        name = old.file(kind);
+        e.authors[size_t(kind)] = old.authors[size_t(kind)];
     }
     for (CoverCache::Kind kind : CoverCache::kKinds) {
         const QString was = old.fetched[size_t(kind)];
