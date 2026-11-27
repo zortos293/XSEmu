@@ -54,6 +54,11 @@ if(XSEMU_FAKE_EMULATOR)
     target_compile_definitions(tst_ingame PRIVATE XSEMU_FAKE_EMULATOR_PATH="$<TARGET_FILE:fake-xsemu>")
 
     # page switches and stats ticks timed on a generated PC-shaped shader cache and library
+    # A Core update is proven against a copy of fake-xsemu, so this test needs it built.
+    xsemu_test(tst_update)
+    add_dependencies(tst_update fake-xsemu)
+    target_compile_definitions(tst_update PRIVATE XSEMU_FAKE_EMULATOR_PATH="$<TARGET_FILE:fake-xsemu>")
+
     xsemu_test(tst_perf)
     target_link_libraries(tst_perf PRIVATE xsemu_ui)
     add_dependencies(tst_perf fake-xsemu)

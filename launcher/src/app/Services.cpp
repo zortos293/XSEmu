@@ -8,6 +8,7 @@ Services::Services(QObject* parent)
     , emulator(settings, gate)
     , warmup(settings, gate)
     , covers(settings)
+    , updates(settings, gate)
 {
     runners.setSettings(&settings);
     runners.setInUseCheck([this](const QString& id) -> QString {

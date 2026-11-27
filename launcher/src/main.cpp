@@ -6,6 +6,7 @@
 
 #include <QApplication>
 #include <QTextStream>
+#include <QTimer>
 
 int main(int argc, char** argv)
 {
@@ -49,5 +50,14 @@ int main(int argc, char** argv)
 
     window.resize(Metrics::WindowWidth, 800);
     window.show();
+
+    // The emulator answered the control pipe with the new Core: the copy kept in core.old is no longer
+    // needed. An update found a few seconds in, so the library is usable at once, and nothing is ever
+    // installed without the user asking for it.
+    QObject::connect(&services.emulator, &EmulatorController::helloReceived, &services.updates, &UpdateService::noteEmulatorStarted);
+    if (services.settings.checkForUpdates() && services.settings.firstLaunchDone())
+        QTimer::singleShot(6000, &services.updates, [&services] { services.updates.check(false); });
+    // The launcher's files are staged and its updater script runs: quit so it can replace them.
+    QObject::connect(&services.updates, &UpdateService::launcherUpdateReady, &app, &QCoreApplication::quit);
     return QApplication::exec();
 }

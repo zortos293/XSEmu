@@ -120,6 +120,8 @@ QString ProcessGate::blockedReason(Action action) const
         if (action == Action::StartWarmup)
             return QStringLiteral("A warm-up is already running.");
         return QStringLiteral("A shader warm-up is running. Cancel it or wait for it to finish, because only one XSEmu Core process runs at a time.");
+    case Owner::Update:
+        return QStringLiteral("%1 is running. Wait for it to finish or stop it, because it replaces the files a game would start from.").arg(what);
     }
     return {};
 }
@@ -129,6 +131,7 @@ QString ProcessGate::stopActionLabel() const
     switch (m_owner) {
     case Owner::Game: return QStringLiteral("Stop game");
     case Owner::Warmup: return QStringLiteral("Cancel warm-up");
+    case Owner::Update: return QStringLiteral("Stop update");
     case Owner::None: break;
     }
     return {};

@@ -27,5 +27,7 @@ struct EmulatorBuild {
     static EmulatorBuild probe(const QString& path, const std::function<bool()>& abandon = {});
     // The kept answer for the file as it is now, without starting anything; found is false when none.
     static EmulatorBuild cached(const QString& path);
+    // Drop the kept answers for a path, for when the file behind it is not the one that was asked.
+    static void forget(const QString& path);
     static bool speaksProtocol(const QString& versionLine, const QString& help);
 };

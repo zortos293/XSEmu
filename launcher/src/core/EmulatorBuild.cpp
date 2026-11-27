@@ -91,6 +91,22 @@ EmulatorBuild EmulatorBuild::cached(const QString& path)
     return answers().value(keyFor(fi), b);
 }
 
+void EmulatorBuild::forget(const QString& path)
+{
+    // The key ends with the size and the modification time, so a replacement of the same size (an
+    // update, a rollback) can be answered with the build that was there before when the file times
+    // land on the same tick.
+    const QString prefix = QFileInfo(path).absoluteFilePath() + QLatin1Char('|');
+    const QMutexLocker lock(&answersLock);
+    auto& kept = answers();
+    for (auto it = kept.begin(); it != kept.end();) {
+        if (it.key().startsWith(prefix))
+            it = kept.erase(it);
+        else
+            ++it;
+    }
+}
+
 EmulatorBuild EmulatorBuild::probe(const QString& path, const std::function<bool()>& abandon)
 {
     const QFileInfo fi(path);

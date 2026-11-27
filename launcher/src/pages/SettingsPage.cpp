@@ -99,6 +99,7 @@ SettingsPage::SettingsPage(Services& services, QWidget* parent)
         {QStringLiteral("Input"), QStringLiteral("keyboard")},
         {QStringLiteral("Graphics"), QStringLiteral("monitor")},
         {QStringLiteral("Logs & crash reports"), QStringLiteral("file")},
+        {QStringLiteral("Updates"), QStringLiteral("refresh")},
         {QStringLiteral("About"), QStringLiteral("info")},
     };
     for (int i = 0; i < items.size(); ++i) {
@@ -121,7 +122,7 @@ SettingsPage::SettingsPage(Services& services, QWidget* parent)
         SettingsSections::console(services), SettingsSections::network(services), SettingsSections::shaders(services),
         SettingsSections::runProfile(services), SettingsSections::overlay(services), SettingsSections::gameFolders(services, [this] { emit addGamesRequested(); }),
         SettingsSections::input(services), SettingsSections::graphics(services), SettingsSections::logs(services),
-        SettingsSections::about(services),
+        SettingsSections::updates(services), SettingsSections::about(services),
     };
     for (QWidget* page : pages) {
         auto* scroll = new QScrollArea;

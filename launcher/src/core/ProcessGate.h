@@ -19,7 +19,9 @@
 class ProcessGate : public QObject {
     Q_OBJECT
 public:
-    enum class Owner { None, Game, Warmup };
+    // Update: the launcher is replacing its own files or the Core's, which needs the same idle slot a
+    // game or a warm-up would take (UpdateService holds it for the whole update).
+    enum class Owner { None, Game, Warmup, Update };
     enum class Action { LaunchGame, StartWarmup };
 
     explicit ProcessGate(QObject* parent = nullptr);
