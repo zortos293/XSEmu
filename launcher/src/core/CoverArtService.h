@@ -156,6 +156,7 @@ private:
     void downloadImage(CoverCache::Kind kind, const Image& image, std::function<void()> next);
     bool holdOnRateLimit(QNetworkReply* reply);
     void finishCurrent();
+    void dropStaged();
     void failCurrent(const QString& message);
     QNetworkReply* apiGet(const QUrl& url);
     QNetworkAccessManager* net();
@@ -167,7 +168,7 @@ private:
     QList<Job> m_queue;
     bool m_busy = false;
     Job m_job;
-    CoverCache::Entry m_found; // what the current job found so far
+    CoverCache::Entry m_found; // what the current job found so far; its files are staged as <name>.part until it finishes
     struct Failure {
         QDateTime at;
         QString message;

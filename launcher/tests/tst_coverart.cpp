@@ -1,6 +1,7 @@
 #include "AppSettings.h"
 #include "CoverArtService.h"
 
+#include <QDir>
 #include <QFile>
 #include <QHash>
 #include <QSignalSpy>
@@ -428,6 +429,7 @@ void TestCoverArt::failedImageDownloadKeepsTheOldArt()
     QTRY_COMPARE_WITH_TIMEOUT(failed.size(), 2, 10000);
     QCOMPARE(covers.cache().entry(g.titleId()).fetchedAt, fetched);
     QVERIFY(QFile::exists(covers.artPath(g.titleId(), CoverCache::Kind::Grid)));
+    QCOMPARE(QDir(covers.cache().dir()).entryList({QStringLiteral("*.part")}, QDir::Files), QStringList());
 }
 
 void TestCoverArt::replacingACustomImageIsSafe()

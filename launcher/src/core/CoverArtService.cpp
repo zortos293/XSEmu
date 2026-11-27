@@ -539,6 +539,7 @@ bool CoverArtService::holdOnRateLimit(QNetworkReply* reply)
         return false;
     bool ok = false;
     const int s = reply->rawHeader("Retry-After").toInt(&ok);
+    dropStaged();
     m_queue.prepend(m_job);
     m_busy = false;
     m_resume->start((ok ? qBound(1, s, 600) : 60) * 1000);
@@ -576,6 +577,7 @@ void CoverArtService::fetchKind(size_t index)
         return;
     }
     if (!canLookUp()) {
+        dropStaged();
         m_busy = false;
         m_pending.remove(m_job.game.titleId());
         emit artChanged(m_job.game.titleId());
@@ -632,7 +634,7 @@ void CoverArtService::downloadImage(CoverCache::Kind kind, const Image& image, s
         }
         const QString name = CoverCache::fileName(m_job.game.titleId(), kind, QFileInfo(image.url.path()).suffix());
         QDir().mkpath(m_cache.dir());
-        QSaveFile f(QDir(m_cache.dir()).filePath(name));
+        QSaveFile f(QDir(m_cache.dir()).filePath(name + QStringLiteral(".part")));
         if (!f.open(QIODevice::WriteOnly) || f.write(bytes) != bytes.size() || !f.commit()) {
             failCurrent(QStringLiteral("Couldn't save the art: %1").arg(f.errorString()));
             return;
@@ -651,6 +653,17 @@ void CoverArtService::finishCurrent()
     e.custom = old.custom;
     const QDir dir(m_cache.dir());
     for (CoverCache::Kind kind : CoverCache::kKinds) {
+        QString& name = e.file(kind);
+        if (name.isEmpty())
+            continue;
+        QFile::remove(dir.filePath(name));
+        if (!QFile::rename(dir.filePath(name + QStringLiteral(".part")), dir.filePath(name))) {
+            QFile::remove(dir.filePath(name + QStringLiteral(".part")));
+            name.clear();
+            e.authors[size_t(kind)].clear();
+        }
+    }
+    for (CoverCache::Kind kind : CoverCache::kKinds) {
         const QString was = old.fetched[size_t(kind)];
         if (!was.isEmpty() && was != e.file(kind))
             QFile::remove(dir.filePath(was));
@@ -664,8 +677,19 @@ void CoverArtService::finishCurrent()
     pump();
 }
 
+void CoverArtService::dropStaged()
+{
+    const QDir dir(m_cache.dir());
+    for (QString& name : m_found.fetched) {
+        if (!name.isEmpty())
+            QFile::remove(dir.filePath(name + QStringLiteral(".part")));
+        name.clear();
+    }
+}
+
 void CoverArtService::failCurrent(const QString& message)
 {
+    dropStaged();
     const QString id = m_job.game.titleId();
     m_failures.insert(id, {QDateTime::currentDateTimeUtc(), message});
     m_busy = false;
