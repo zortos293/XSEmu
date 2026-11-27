@@ -213,11 +213,7 @@ WarmupPage::WarmupPage(Services& services, QWidget* parent)
 
     connect(m_start, &Button::clicked, this, [this] { start(false); });
     connect(m_warm, &Button::clicked, this, [this] { start(m_fullPass); });
-    connect(m_resume, &Button::clicked, this, [this] {
-        // stopped part way: the full pass builds what the budgeted one left; otherwise run the same pass again
-        const bool full = m_s.warmup.state() == WarmupController::State::StoppedPartWay || m_s.warmup.progress().full;
-        start(full);
-    });
+    connect(m_resume, &Button::clicked, this, [this] { start(m_continueFull); });
     connect(m_play, &Button::clicked, this, [this] {
         if (auto* w = qobject_cast<MainWindow*>(window()))
             w->play(m_s.warmup.game());
@@ -429,19 +425,23 @@ void WarmupPage::refresh()
                                                         LaunchConfig::profileIdentity(m_s.settings, runGame.titleId()));
         const QString leftCount = run.left > 0 ? Format::count(run.left) : QString();
         const QString atOf = run.total > 0 && run.done <= run.total ? QStringLiteral("at %1 of %2").arg(Format::count(run.done), Format::count(run.total)) : game;
-        // what the pass built and left: its own done line, else the last progress line it wrote
-        const QString sofar = run.left > 0   ? QStringLiteral("%1 built · %2 left").arg(Format::count(run.done), leftCount)
-                            : run.left == 0  ? QStringLiteral("%1 built · nothing left").arg(Format::count(run.done))
-                            : pr.passDone > 0 ? QStringLiteral("%1 built · stopped in %2").arg(Format::count(pr.passDone), WarmupController::phaseLabel(pr.phase).toLower())
-                                              : atOf;
-        const double fraction = run.left > 0  ? fractionOf(run.done, run.done + run.left)
+        // A failed build is not built: `done` counts what the pass settled with, failures included, so
+        // take them out and built + left is the whole pass. Without a done line there is no honest
+        // whole-pass count, so the phase position says where it stopped instead.
+        const qint64 built = qMax<qint64>(0, run.done - run.failed);
+        const QString sofar = run.left > 0 ? QStringLiteral("%1 built · %2 left").arg(Format::count(built), leftCount)
+                            : run.left == 0 ? QStringLiteral("%1 built · nothing left").arg(Format::count(built))
+                            : pr.total > 0  ? QStringLiteral("stopped in %1 at %2 of %3").arg(WarmupController::phaseLabel(pr.phase).toLower(), Format::count(pr.done), Format::count(pr.total))
+                                            : atOf;
+        const double fraction = run.left > 0  ? fractionOf(built, built + run.left)
                               : run.left == 0 ? 1.0
-                              : pr.total > 0 && !m_s.warmup.doneLine() ? pr.phaseFraction()
+                              : pr.total > 0  ? pr.phaseFraction()
                               : run.total > 0 && run.done <= run.total ? fractionOf(run.done, run.total)
                               : -1;
         const bool canPlay = runGame.isValid() && m_s.gate.isFree();
         // what an unfinished pass leaves behind: go on with the leftovers, play anyway, or build everything
         const auto unfinished = [&] {
+            m_continueFull = resume ? resume->full : run.full;
             m_resume->setVariant(resume ? Button::Variant::Primary : Button::Variant::Secondary);
             m_resume->setText(resume ? QStringLiteral("Continue") : QStringLiteral("Retry"));
             m_resume->setToolTip(!resume ? QString()
@@ -486,6 +486,7 @@ void WarmupPage::refresh()
                 m_block->setNote(QStringLiteral("%1 pipelines failed to build; the game compiles them when it needs them. The log names them.").arg(Format::count(run.failed))
                                  + (resume ? QStringLiteral(" Continue tries them again.") : QString()));
             m_fullPass = false;
+            m_continueFull = resume && resume->full;
             if (resume) {
                 m_resume->setVariant(Button::Variant::Secondary);
                 m_resume->setText(QStringLiteral("Continue"));
@@ -533,7 +534,7 @@ void WarmupPage::refresh()
             const QString why = m_s.warmup.errorMessage().isEmpty() ? QString() : QStringLiteral(" ") + sentence(m_s.warmup.errorMessage());
             const QString code = QStringLiteral("XSEmu Core exited with code %1.").arg(Format::exitCode(run.exitCode));
             // a refusal before the pass started built nothing, so only the code and the reason are worth saying
-            m_block->setNote(run.done > 0 ? code + QLatin1Char(' ') + keeps + then + why : code + why);
+            m_block->setNote(built > 0 ? code + QLatin1Char(' ') + keeps + then + why : code + why);
             unfinished();
             return;
         }
@@ -578,10 +579,12 @@ void WarmupPage::refresh()
     // button runs again, and the leftovers are what it says it has
     const auto resume = WarmupController::resumable(recent, m_s.settings.warmupInFlight(), picked.titleId(), QString(),
                                                     LaunchConfig::profileIdentity(m_s.settings, picked.titleId()));
+    m_continueFull = resume && resume->full;
     if (resume) {
-        lastRunText = resume->left > 0 ? QStringLiteral("%1 built · %2 left").arg(Format::count(resume->built), Format::count(resume->left))
-                     : resume->built > 0 ? QStringLiteral("%1 built · the rest is left").arg(Format::count(resume->built))
-                                         : QStringLiteral("a pass was interrupted");
+        lastRunText = resume->left > 0 && resume->built > 0 ? QStringLiteral("%1 built · %2 left").arg(Format::count(resume->built), Format::count(resume->left))
+                     : resume->left > 0                      ? QStringLiteral("%1 left").arg(Format::count(resume->left))
+                     : resume->built > 0                     ? QStringLiteral("%1 built · the rest is left").arg(Format::count(resume->built))
+                                                             : QStringLiteral("a pass was interrupted");
     }
     m_block->setSubtitle(pickedState == TitleShaderState::NeverWarmed ? QStringLiteral("never warmed up") : lastRunText);
 
@@ -675,6 +678,7 @@ void WarmupPage::refreshRunner(const RunnerSpec& spec, const Game& picked, bool 
                 m_block->setSubtitle(joined({m_s.warmup.game().title(), version}));
                 m_block->setFraction(-1);
                 m_block->setNote(run.message);
+                m_continueFull = false;
                 m_resume->setText(QStringLiteral("Run again"));
                 m_resume->show();
                 m_log->setEnabled(QFileInfo::exists(WarmupController::logPath()));
@@ -714,6 +718,7 @@ void WarmupPage::refreshRunner(const RunnerSpec& spec, const Game& picked, bool 
             m_block->setFraction(comparable ? fractionOf(run.done, run.total) : -1);
             m_block->setNote(QStringLiteral("%1 exited with code %2.").arg(spec.name, Format::exitCode(run.exitCode))
                              + (run.message.isEmpty() ? QString() : QStringLiteral(" ") + sentence(run.message)));
+            m_continueFull = false;
             m_resume->setText(QStringLiteral("Retry"));
             m_resume->show();
             m_log->setEnabled(QFileInfo::exists(WarmupController::logPath()));
@@ -725,6 +730,7 @@ void WarmupPage::refreshRunner(const RunnerSpec& spec, const Game& picked, bool 
             m_block->setSubtitle(joined({comparable ? at : m_s.warmup.game().title(), version}));
             m_block->setFraction(comparable ? fractionOf(run.done, run.total) : -1);
             m_block->setNote(QStringLiteral("What %1 built is kept in its own cache.").arg(spec.name));
+            m_continueFull = false;
             m_resume->setText(QStringLiteral("Run again"));
             m_resume->show();
             m_dismiss->show();

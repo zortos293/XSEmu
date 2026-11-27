@@ -346,8 +346,8 @@ void TestInGame::warmupFailureOffersContinueAndPlay()
             labels << l->text();
     }
     const QString page = labels.join(QLatin1Char('\n'));
-    // what is left, from the pass's own last word, and an exit code that says why it stopped
-    QVERIFY2(page.contains(QLatin1String("2,180 built")), qPrintable(page));
+    // a crash has no done line, so the card says where it stopped rather than claiming a total
+    QVERIFY2(page.contains(QLatin1String("stopped in bound pipelines at 2,180 of 3,120")), qPrintable(page));
     QVERIFY2(page.contains(QLatin1String("XSEmu Core exited with code 3")), qPrintable(page));
     QVERIFY2(page.contains(QLatin1String("Continue goes on from where this pass stopped")), qPrintable(page));
     // Continue, Play and a full pass are all offered, and nothing is stuck: no Cancel, no running bar
@@ -374,10 +374,30 @@ void TestInGame::warmupFailureOffersContinueAndPlay()
         if (l->isVisibleTo(warmupPage))
             labels << l->text();
     }
-    QVERIFY2(labels.join(QLatin1Char('\n')).contains(QLatin1String("940 left")), qPrintable(labels.join(QLatin1Char('|'))));
+    const QString stopped = labels.join(QLatin1Char('\n'));
+    QVERIFY2(stopped.contains(QStringLiteral("2,180 built · 940 left")), qPrintable(stopped));
     QVERIFY2(shown.contains(QStringLiteral("Continue")), qPrintable(shown.join(QLatin1Char('|'))));
     QVERIFY2(shown.contains(QStringLiteral("Full pass")), qPrintable(shown.join(QLatin1Char('|'))));
     QVERIFY2(shown.contains(QStringLiteral("Play Signal Garden")), qPrintable(shown.join(QLatin1Char('|'))));
+
+    // Continue runs the pass that stopped: this one was a full pass, so the pass it starts is full too
+    // (the budgeted one it would otherwise start filters stale pipelines and has a time limit)
+    run.full = true;
+    m_s->settings.clearRecentWarmups();
+    m_s->settings.addRecentWarmup(run);
+    m_s->warmup.simulateForScreenshot(WarmupController::State::StoppedPartWay, garden, progress, {}, run);
+    QApplication::processEvents();
+    QAbstractButton* cont = nullptr;
+    for (QAbstractButton* b : warmupPage->findChildren<QAbstractButton*>()) {
+        if (b->isVisibleTo(warmupPage) && b->text() == QLatin1String("Continue"))
+            cont = b;
+    }
+    QVERIFY(cont);
+    cont->click();
+    QTRY_VERIFY_WITH_TIMEOUT(m_s->warmup.isActive(), 10000);
+    QVERIFY2(m_s->warmup.progress().full, "Continue kept the pass the stop belonged to");
+    m_s->warmup.cancel();
+    QTRY_VERIFY_WITH_TIMEOUT(!m_s->warmup.isActive(), 20000);
 }
 
 int main(int argc, char** argv)

@@ -420,6 +420,13 @@ void TestSettings::warmupResume()
     std::optional<WarmupController::Resume> r = resumable({run(WarmupRun::Result::Finished, 3120, 16)}, std::nullopt);
     QVERIFY(r.has_value());
     QCOMPARE(r->left, 16);
+    // a failed build is not built: the count Continue names leaves it to the leftovers
+    WarmupRun someFailed = run(WarmupRun::Result::Cancelled, 100, 20);
+    someFailed.failed = 10;
+    r = resumable({someFailed}, std::nullopt);
+    QVERIFY(r.has_value());
+    QCOMPARE(r->built, 90);
+    QCOMPARE(r->left, 20);
     // a crash that built something: Continue goes on from it, with the same pass and no honest count left
     r = resumable({run(WarmupRun::Result::Failed, 2180, -1), run(WarmupRun::Result::Finished, 3120, 0)}, std::nullopt);
     QVERIFY(r.has_value());

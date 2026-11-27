@@ -473,6 +473,7 @@ void WarmupController::writeCheckpoint()
     pass.profile = m_profile;
     pass.full = m_progress.full;
     pass.built = m_progress.passDone;
+    pass.failed = m_progress.failed;
     pass.phase = m_progress.phase;
     pass.startedAt = m_startedAt;
     m_settings.setWarmupInFlight(pass);
@@ -487,25 +488,27 @@ std::optional<WarmupController::Resume> WarmupController::resumable(const QList<
     // a pass the launcher did not see the end of: it closed or died, so no run recorded it
     if (inFlight && inFlight->isValid() && inFlight->titleId == titleId && inFlight->runnerId == runnerId
         && (profile.isEmpty() || inFlight->profile.isEmpty() || inFlight->profile == profile))
-        return Resume{inFlight->full, inFlight->built, -1, inFlight->phase};
+        return Resume{inFlight->full, qMax<qint64>(0, inFlight->built - inFlight->failed), -1, inFlight->phase};
     for (const WarmupRun& r : runs) {
         if (r.titleId != titleId || r.runnerId != runnerId)
             continue;
         if (!profile.isEmpty() && !r.profile.isEmpty() && r.profile != profile)
             return std::nullopt; // the run profile changed, so its keys are not this profile's keys
+        // `done` counts what the pass settled with, failed builds included; `built` is what it kept
+        const qint64 built = qMax<qint64>(0, r.done - r.failed);
         switch (r.result) {
         case WarmupRun::Result::Cancelled:
         case WarmupRun::Result::StoppedPartWay:
-            return Resume{r.full, r.done, r.left, QString()};
+            return Resume{r.full, built, r.left, QString()};
         case WarmupRun::Result::Failed:
             // a refusal before the pass started (another process, no device) left nothing to continue
             if (r.done <= 0)
                 return std::nullopt;
-            return Resume{r.full, r.done, r.left, QString()};
+            return Resume{r.full, built, r.left, QString()};
         case WarmupRun::Result::Finished:
             // a pass that went through everything can still leave builds it could not make
             if (r.left > 0)
-                return Resume{r.full, r.done, r.left, QString()};
+                return Resume{r.full, built, r.left, QString()};
             return std::nullopt;
         case WarmupRun::Result::NothingToBuild:
             return std::nullopt;

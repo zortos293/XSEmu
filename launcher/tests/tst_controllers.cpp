@@ -497,7 +497,7 @@ void TestControllers::warmupFailureKeepsWhatItBuilt()
     const auto resume = WarmupController::resumable(m_settings->recentWarmups(), m_settings->warmupInFlight(),
                                                    run.titleId, QString(), {});
     QVERIFY(resume.has_value());
-    QCOMPARE(resume->built, run.done);
+    QCOMPARE(resume->built, run.done - run.failed);
     QVERIFY(!resume->full);
     // and the launcher is usable again: the gate is free for Play or another pass
     QVERIFY(m_gate->isFree());
