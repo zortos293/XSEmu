@@ -27,6 +27,10 @@
 
 namespace {
 
+// An asset download that stops sending data for this long is given up on rather than held forever;
+// progress restarts the clock.
+constexpr int kAssetStallTimeoutMs = 60000;
+
 // One GET into memory or into a file. GitHub's API wants a User-Agent, and its asset downloads
 // redirect to a storage host, so redirects are followed.
 bool httpGet(const QUrl& url, const QByteArray& userAgent, QIODevice* sink, QByteArray* body,
@@ -95,7 +99,7 @@ bool downloadDefault(const QUrl& url, const QByteArray& userAgent, const QString
             *error = QStringLiteral("cannot write %1").arg(QDir::toNativeSeparators(file));
         return false;
     }
-    if (!httpGet(url, userAgent, &out, nullptr, progress, 0, error))
+    if (!httpGet(url, userAgent, &out, nullptr, progress, kAssetStallTimeoutMs, error))
         return false;
     if (!out.commit()) {
         if (error)
@@ -256,6 +260,8 @@ void UpdateService::refresh()
     m_status.coreBundled = !m_status.corePath.isEmpty() && samePath(QFileInfo(m_status.corePath).absolutePath(), m_coreDir);
     m_status.installedCore = installedCoreVersion();
     m_status.corePreviousKept = QFileInfo::exists(previousCoreDir());
+    if (!m_status.checkedAt.isValid())
+        m_status.checkedAt = m_settings.lastUpdateCheck();
 }
 
 bool UpdateService::canInstall(Part part, QString* why) const
@@ -404,14 +410,17 @@ void UpdateService::runCheck(const CheckInputs& in)
     Status found;
     QString why;
     int asked = 0;
+    bool unreadable = false;
     for (const QJsonObject& release : candidates) {
         if (asked++ >= 5 || m_cancel.load())
             break;
         const QString url = releaseAssetUrl(release, QString::fromLatin1(kManifestAsset));
         QString fetchError;
         const QByteArray bytes = m_fetch(QUrl(url), &fetchError, 30000);
-        if (!fetchError.isEmpty())
+        if (!fetchError.isEmpty()) {
+            unreadable = true;
             continue;
+        }
         QString parseWhy;
         const QJsonObject manifest = parseJsonObject(bytes, &parseWhy);
         if (!parseWhy.isEmpty())
@@ -420,6 +429,7 @@ void UpdateService::runCheck(const CheckInputs& in)
         const ReleaseInfo info = parseRelease(release, manifest, &releaseWhy);
         if (!info.hasParts()) {
             why = releaseWhy;
+            unreadable = true;
             continue;
         }
         Status s;
@@ -437,7 +447,7 @@ void UpdateService::runCheck(const CheckInputs& in)
         }
     }
 
-    post([this, found, asked] {
+    post([this, found, asked, unreadable] {
         const bool had = found.updateAvailable();
         m_status.release = found.release;
         m_status.launcherUpdate = found.launcherUpdate;
@@ -461,6 +471,8 @@ void UpdateService::runCheck(const CheckInputs& in)
                 ? QStringLiteral("No newer release than %1 was found.").arg(launcherVersion())
                 : QStringLiteral("XSEmu Launcher %1 and XSEmu Core %2 are up to date.")
                       .arg(launcherVersion(), m_status.installedCore.isEmpty() ? QStringLiteral("(version unknown)") : m_status.installedCore);
+            if (unreadable)
+                m_status.message += QStringLiteral(" Some newer releases could not be read, so one may still be there.");
         }
         emit changed();
     });
@@ -632,14 +644,21 @@ bool UpdateService::applyCore(const QString& staged, const ReleasePart& part, QS
     const EmulatorBuild probe = EmulatorBuild::probe(join(staged, program));
     if (!probe.found || !probe.version.startsWith(QLatin1String("XSEmu ")))
         return fail(QStringLiteral("The new XSEmu Core does not answer --version, so it was not installed."));
+    if (!probe.capable)
+        return fail(QStringLiteral("The new XSEmu Core is too old for this launcher (%1), so it was not installed.").arg(probe.version));
 
     // Keep the previous copy of every file the update replaces, instead of the whole folder: the DX
     // compiler beside the Core belongs to the launcher and is not part of a Core update. The restore
     // also removes a file the update introduced (a version file beside an older hand-placed Core).
     const QString previous = previousCoreDir();
-    removeTree(previous);
-    if (!QDir().mkpath(previous))
-        return fail(QStringLiteral("Could not write to %1.").arg(QDir::toNativeSeparators(m_appDir)));
+    // A copy already there has not been retired by a launch yet: it is the last Core that ran, and it
+    // is a better way back than the one this update is replacing.
+    const bool keepOld = !QFileInfo::exists(previous);
+    if (keepOld) {
+        removeTree(previous);
+        if (!QDir().mkpath(previous))
+            return fail(QStringLiteral("Could not write to %1.").arg(QDir::toNativeSeparators(m_appDir)));
+    }
     const auto keepPrevious = [&]() -> bool {
         for (const ReleaseFile& f : part.files) {
             const QString from = join(m_coreDir, f.name);
@@ -665,12 +684,13 @@ bool UpdateService::applyCore(const QString& staged, const ReleasePart& part, QS
             }
         }
     };
-    if (!keepPrevious()) {
+    if (keepOld && !keepPrevious()) {
         removeTree(previous);
         return fail(QStringLiteral("Could not copy the current XSEmu Core aside, so nothing was replaced."));
     }
     if (!QDir().mkpath(m_coreDir)) {
-        removeTree(previous);
+        if (keepOld)
+            removeTree(previous);
         return fail(QStringLiteral("Could not write to %1.").arg(QDir::toNativeSeparators(m_coreDir)));
     }
     for (const ReleaseFile& f : part.files) {
@@ -716,6 +736,8 @@ try {
   while ((Get-Process -Id $WaitPid -ErrorAction SilentlyContinue) -and ((Get-Date) -lt $deadline)) { Start-Sleep -Milliseconds 250 }
   if (Get-Process -Id $WaitPid -ErrorAction SilentlyContinue) { throw 'the launcher did not exit' }
   New-Item -ItemType Directory -Force -Path $Backup | Out-Null
+  $addedFile = "$Backup.added.txt"
+  Remove-Item -LiteralPath $addedFile -Force -ErrorAction SilentlyContinue
   $root = (Resolve-Path -LiteralPath $Stage).Path
   $files = @(Get-ChildItem -LiteralPath $root -Recurse -File)
   Note "replacing $($files.Count) files from $root"
@@ -727,6 +749,8 @@ try {
       $bak = Join-Path $Backup $rel
       New-Item -ItemType Directory -Force -Path (Split-Path -LiteralPath $bak) | Out-Null
       Copy-Item -LiteralPath $dest -Destination $bak -Force
+    } else {
+      Add-Content -LiteralPath $addedFile -Value $rel
     }
     New-Item -ItemType Directory -Force -Path (Split-Path -LiteralPath $dest) | Out-Null
     Copy-Item -LiteralPath $f.FullName -Destination $dest -Force
@@ -737,10 +761,16 @@ try {
   if ($null -eq $new -or $new.HasExited) { throw 'the new launcher exited at once' }
   Note "the new launcher ($($new.Id)) is up; removing the backup"
   Remove-Item -LiteralPath $Backup -Recurse -Force -ErrorAction SilentlyContinue
+  Remove-Item -LiteralPath $addedFile -Force -ErrorAction SilentlyContinue
   Remove-Item -LiteralPath $Stage -Recurse -Force -ErrorAction SilentlyContinue
   Note 'done'
 } catch {
   Note "failed: $($_.Exception.Message); restoring"
+  if (Test-Path -LiteralPath $addedFile) {
+    # files the update brought that the old launcher does not know: a rollback takes them away again
+    foreach ($rel in Get-Content -LiteralPath $addedFile) { Remove-Item -LiteralPath (Join-Path $AppDir $rel) -Force -ErrorAction SilentlyContinue }
+    Remove-Item -LiteralPath $addedFile -Force -ErrorAction SilentlyContinue
+  }
   Restore-Backup
   Start-Process -FilePath (Join-Path $AppDir $Program)
 }
@@ -777,6 +807,16 @@ bool UpdateService::restorePreviousCore(QString* error)
     if (!m_gate.isFree()) {
         if (error)
             *error = QStringLiteral("XSEmu is running. Stop it before going back to the previous Core.");
+        return false;
+    }
+    if (m_status.busy()) {
+        if (error)
+            *error = QStringLiteral("An update is running. Wait for it to finish.");
+        return false;
+    }
+    if (const ProcessGate::External other = m_gate.external(); other.busy()) {
+        if (error)
+            *error = other.reason();
         return false;
     }
     QStringList kept;

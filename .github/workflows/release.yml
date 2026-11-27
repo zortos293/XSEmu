@@ -140,6 +140,7 @@ jobs:
           if ($LASTEXITCODE -eq 0) {
             Write-Host "the release $tag exists: replacing its assets and notes"
             gh release upload $tag @assets --clobber --repo $env:GITHUB_REPOSITORY
+            if ($LASTEXITCODE -ne 0) { throw 'uploading the assets failed' }
             gh release edit $tag --notes-file out\notes.md @prerelease --repo $env:GITHUB_REPOSITORY
           } else {
             gh release create $tag @assets --title "XSEmu $env:VERSION" --notes-file out\notes.md @prerelease `

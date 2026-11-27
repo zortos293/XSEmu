@@ -320,6 +320,15 @@ private slots:
     {
         Fixture f;
         Fake fake(f);
+        // The installed program differs from the release's, so the swap is visible in the bytes (the
+        // stand-in would otherwise be the same file on both sides).
+        {
+            QFile marker(f.coreProgram());
+            QVERIFY(marker.open(QIODevice::Append));
+            marker.write("\nold core");
+        }
+        const QByteArray oldBytes = bytesOf(f.coreProgram());
+        QVERIFY(shaOf(oldBytes) != fake.newProgramSha);
         AppSettings settings(f.appSettingsIni);
         settings.setPrereleaseUpdates(true);
         settings.setEmulatorPathOverride(f.coreProgram());
@@ -340,6 +349,7 @@ private slots:
         QCOMPARE(updates.installedCoreVersion(), QStringLiteral("0.1.1-pre.1"));
         QCOMPARE(shaOf(bytesOf(f.coreProgram())), fake.newProgramSha);
         QVERIFY2(QFileInfo::exists(f.previousProgram()), "the previous copy stays until the new Core starts");
+        QCOMPARE(shaOf(bytesOf(f.previousProgram())), shaOf(oldBytes));
         QVERIFY2(QFileInfo::exists(QDir(f.coreDir).filePath(QStringLiteral("version.json"))), "the other files in core stay");
 
         updates.noteEmulatorStarted();
