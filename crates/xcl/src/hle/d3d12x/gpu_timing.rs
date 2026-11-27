@@ -1456,25 +1456,38 @@ unsafe fn retry_parked() {
 }
 
 thread_local! {
-    /// submissions this thread is reporting right now: XCL's own queue wrapper reports the lists a
-    /// caller hands it, so a caller that reports the same call again would arm the recording twice
-    /// and count one submission as two
-    static REPORTING: Cell<u32> = const { Cell::new(0) };
+    /// the lists this thread is reporting right now: XCL's own queue wrapper reports the lists it is
+    /// handed, so a caller that reports the same list again is describing one submission twice, while
+    /// a nested report of a *different* list is the re-entrant submission the tests below prove
+    static REPORTING: std::cell::RefCell<Vec<usize>> = const { std::cell::RefCell::new(Vec::new()) };
 }
 
-struct Reporting(());
+struct Reporting(Vec<usize>);
 
 impl Drop for Reporting {
-    fn drop(&mut self) { REPORTING.with(|d| d.set(d.get() - 1)); }
+    fn drop(&mut self) {
+        REPORTING.with(|r| {
+            let mut reporting = r.borrow_mut();
+            for list in &self.0 {
+                if let Some(at) = reporting.iter().position(|x| x == list) {
+                    reporting.remove(at);
+                }
+            }
+        });
+    }
 }
 
 pub(super) unsafe fn submit(raw: *mut c_void, lists: &[*mut c_void], f: impl FnOnce()) {
-    if !REPORTING.with(|d| d.get() > 0) {
-        REPORTING.with(|d| d.set(d.get() + 1));
-        let _reporting = Reporting(());
-        return submit_once(raw, lists, f);
+    if lists
+        .iter()
+        .any(|&list| REPORTING.with(|r| r.borrow().contains(&(list as usize))))
+    {
+        return f();
     }
-    f()
+    let reported: Vec<usize> = lists.iter().map(|&list| list as usize).collect();
+    REPORTING.with(|r| r.borrow_mut().extend(reported.iter().copied()));
+    let _reporting = Reporting(reported);
+    submit_once(raw, lists, f)
 }
 
 unsafe fn submit_once(raw: *mut c_void, lists: &[*mut c_void], f: impl FnOnce()) {

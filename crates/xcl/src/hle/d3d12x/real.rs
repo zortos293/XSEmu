@@ -12958,6 +12958,19 @@ mod device_abi_tests {
         assert_eq!(super::super::backend(), super::super::Backend::Real);
         // A console mesh program becomes a host mesh shader through the DX compiler: without it the
         // build misses and creation answers E_INVALIDARG (it goes to the background in a launcher).
+        // The host mesh pipeline is built for an adapter with hardware of its own: a runner's software
+        // adapter advertises mesh shaders and then refuses the pipeline with E_INVALIDARG.
+        let own_memory = unsafe {
+            windows::Win32::Graphics::Dxgi::CreateDXGIFactory1::<windows::Win32::Graphics::Dxgi::IDXGIFactory4>()
+                .ok()
+                .and_then(|f| f.EnumAdapters1(0).ok())
+                .and_then(|a| a.GetDesc1().ok())
+                .is_some_and(|d| d.DedicatedVideoMemory != 0)
+        };
+        if !own_memory {
+            return crate::gpu::recomp::runner::skip_test(
+                "no hardware adapter: a software adapter advertises mesh shaders and then refuses the pipeline");
+        }
         if let Err(e) = crate::gpu::recomp::dxc::location() {
             return crate::gpu::recomp::runner::skip_test(&format!("no DX compiler: {e}"));
         }
