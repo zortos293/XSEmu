@@ -41,6 +41,7 @@ unsafe fn buffer(dev: &ID3D12Device, ty: D3D12_HEAP_TYPE, flags: D3D12_RESOURCE_
 #[test]
 fn translated_draw_rows_take_gathered_guest_records_and_bound_their_draws() {
     unsafe {
+        let _serial = crate::hle::d3d12x::physical_directory::test_serial();
         let Some(dev) = crate::hle::d3d12x::real::test_device() else {
             crate::gpu::recomp::runner::skip_test("no GPU");
             return;

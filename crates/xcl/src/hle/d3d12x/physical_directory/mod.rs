@@ -277,6 +277,17 @@ pub(super) unsafe fn init(device: &ID3D12Device) -> bool {
         .is_some_and(|b| b.dev.as_raw() == device.as_raw())
 }
 
+/// The physical directory is one per process and its tests are not: each one maps pages, publishes a
+/// topology and then reads the index it landed on, so two of them running at once on `cargo test`'s
+/// four threads read each other's indexes. Every test that touches it holds this for its whole run.
+/// A test that panics poisons the lock; the next one takes it anyway, because what it guards is order,
+/// not the directory's integrity.
+#[cfg(test)]
+pub(crate) fn test_serial() -> std::sync::MutexGuard<'static, ()> {
+    static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    SERIAL.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 pub(super) fn current_topology() -> Option<Arc<Topology>> {
     Some(Arc::clone(&BACKEND.get()?.head.lock().unwrap()))
 }

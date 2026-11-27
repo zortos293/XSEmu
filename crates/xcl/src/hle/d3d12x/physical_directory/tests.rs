@@ -3,6 +3,7 @@ use super::*;
 #[test]
 fn immutable_versions_merge_only_after_ready_and_preserve_inflight_readers() {
     unsafe {
+        let _serial = crate::hle::d3d12x::physical_directory::test_serial();
         let Some(dev) = crate::hle::d3d12x::real::test_device() else {
             crate::gpu::recomp::runner::skip_test("no GPU");
             return;

@@ -27,6 +27,7 @@ unsafe fn buffer(dev: &ID3D12Device, ty: D3D12_HEAP_TYPE, flags: D3D12_RESOURCE_
 #[test]
 fn a_directory_copy_splits_both_sides_and_drops_writes_to_an_unmapped_page() {
     unsafe {
+        let _serial = crate::hle::d3d12x::physical_directory::test_serial();
         let Some(dev) = crate::hle::d3d12x::real::test_device() else {
             crate::gpu::recomp::runner::skip_test("no GPU");
             return;
@@ -177,6 +178,7 @@ impl Rig {
 #[test]
 fn a_query_resolve_reaches_the_destination_owner_and_drops_an_unmapped_page() {
     unsafe {
+        let _serial = crate::hle::d3d12x::physical_directory::test_serial();
         let Some(rig) = Rig::new(0x0619_0000_0000) else { return };
         let to = rig.base + 5 * 65536 - 16;
         let copy = Copy::write(to, 32, rig.locator, rig.fallback()).unwrap();
@@ -216,6 +218,7 @@ fn a_query_resolve_reaches_the_destination_owner_and_drops_an_unmapped_page() {
 #[test]
 fn a_predicate_gather_reads_the_owner_and_zero_from_an_unmapped_page() {
     unsafe {
+        let _serial = crate::hle::d3d12x::physical_directory::test_serial();
         let Some(rig) = Rig::new(0x061A_0000_0000) else { return };
         let pipeline = shared_pipeline(&rig.dev).unwrap();
         let (mapped, unmapped) = (rig.base + 2 * 65536 + 40, rig.base + 5 * 65536 + 8);
