@@ -563,12 +563,16 @@ private slots:
         updates.armTestLever(QStringLiteral("install"));
         updates.check(true);
 
-        // The lever's Core half goes in, then its launcher half asks to replace the launcher, which
-        // this host refuses by design: the launcher replaces itself on Windows only. The refusal is
-        // the proof that the lever got to the second step, after the Core, with nobody clicking.
+        // The lever's Core half goes in, then its launcher half asks to replace the launcher with
+        // nobody clicking.
         QVERIFY(waitFor([&] { return updates.status().state == UpdateService::State::Failed; }));
-        QVERIFY2(updates.status().error.contains(QStringLiteral("replaces itself on Windows only")),
-                 qPrintable(updates.status().error));
+        // A host that can replace its launcher gets as far as asking for the launcher's archive, which
+        // this fixture does not serve; this one refuses the replacement outright. Either way the
+        // failure names the launcher step, which is what says the lever reached it.
+        const QString error = updates.status().error;
+        QVERIFY2(error.contains(QStringLiteral("XSEmuLauncher-windows.zip"))
+                     || error.contains(QStringLiteral("replaces itself on Windows only")),
+                 qPrintable(error));
         QCOMPARE(shaOf(bytesOf(f.coreProgram())), fake.newProgramSha);
         QVERIFY2(QFileInfo::exists(f.previousProgram()), "the Core the update replaced stays in core.old");
 
@@ -576,6 +580,33 @@ private slots:
         QVERIFY2(text.contains(QStringLiteral("armed 'install'")), qPrintable(text));
         QVERIFY2(text.contains(QStringLiteral("install: the Core, 0.1.0-pre.1 to 0.1.1-pre.1")), qPrintable(text));
         QVERIFY2(text.contains(QStringLiteral("install: the launcher, ")), qPrintable(text));
+    }
+
+    void testLeverStopsWhenTheCoreStepFails()
+    {
+        Fixture f;
+        // The manifest names another hash than the Core the release serves, so the lever's first step
+        // fails before it can put anything in place.
+        Fake fake(f, {}, QString(64, QLatin1Char('0')));
+        AppSettings settings(f.appSettingsIni);
+        settings.setPrereleaseUpdates(true);
+        settings.setEmulatorPathOverride(f.coreProgram());
+        ProcessGate gate;
+        UpdateService updates(settings, gate);
+        updates.setDirectories(f.appDir, f.coreDir);
+        fake.attach(updates);
+
+        updates.armTestLever(QStringLiteral("install"));
+        updates.check(true);
+        QVERIFY(waitFor([&] { return updates.status().state == UpdateService::State::Failed; }));
+        QVERIFY2(updates.status().error.contains(QStringLiteral("SHA-256")), qPrintable(updates.status().error));
+
+        // Nothing may follow a failed step: the launcher's install empties update/, which is where a
+        // Core failure keeps its recovery copy.
+        QTest::qWait(500);
+        const QString text = leverLog(f);
+        QVERIFY2(text.contains(QStringLiteral("install: the Core")), qPrintable(text));
+        QVERIFY2(!text.contains(QStringLiteral("install: the launcher")), qPrintable(text));
     }
 
     void testLeverRestoresThePreviousCore()
