@@ -458,8 +458,9 @@ void WarmupPage::refresh()
                 m_play->setText(runGame.title().size() > 24 ? QStringLiteral("Play") : QStringLiteral("Play %1").arg(runGame.title()));
                 m_play->show();
             }
-            m_log->setEnabled(QFileInfo::exists(WarmupController::logPath()));
-            m_log->show();
+            // the log as a note-row link, so the header keeps room for Continue and Play
+            if (QFileInfo::exists(WarmupController::logPath()))
+                m_showLog->show();
             m_dismiss->show();
         };
         // what the pass kept, and what Continue would build from it
