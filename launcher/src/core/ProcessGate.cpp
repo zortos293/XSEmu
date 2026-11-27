@@ -113,13 +113,13 @@ QString ProcessGate::blockedReason(Action action) const
     case Owner::Game: {
         const QString state = m_paused ? QStringLiteral("is paused") : QStringLiteral("is running");
         if (action == Action::StartWarmup)
-            return QStringLiteral("%1 %2. Stop it to warm up shaders, because only one XSEmu process runs at a time.").arg(what, state);
-        return QStringLiteral("%1 %2. Stop it to play another game, because only one XSEmu process runs at a time.").arg(what, state);
+            return QStringLiteral("%1 %2. Stop it to warm up shaders, because only one XSEmu Core process runs at a time.").arg(what, state);
+        return QStringLiteral("%1 %2. Stop it to play another game, because only one XSEmu Core process runs at a time.").arg(what, state);
     }
     case Owner::Warmup:
         if (action == Action::StartWarmup)
             return QStringLiteral("A warm-up is already running.");
-        return QStringLiteral("A shader warm-up is running. Cancel it or wait for it to finish, because only one XSEmu process runs at a time.");
+        return QStringLiteral("A shader warm-up is running. Cancel it or wait for it to finish, because only one XSEmu Core process runs at a time.");
     }
     return {};
 }

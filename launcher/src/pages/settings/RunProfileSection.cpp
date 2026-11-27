@@ -14,7 +14,7 @@ QWidget* SettingsSections::runProfile(Services& s)
 {
     const SettingsKit::Section sec = SettingsKit::makeSection(
         QStringLiteral("Run profile"),
-        QStringLiteral("The environment variables XSEmu starts with, one KEY=VALUE per line. Play and Warm-up use the same profile, so the warm-up "
+        QStringLiteral("The environment variables XSEmu Core starts with, one KEY=VALUE per line. Play and Warm-up use the same profile, so the warm-up "
                        "fills the shader cache the game reads. A game can have its own profile in its details."));
     sec.caps(QStringLiteral("Variables"));
     auto* editor = new RunProfileEditor(int(AppSettings::defaultRunProfile().size()) + 1);

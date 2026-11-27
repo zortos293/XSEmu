@@ -17,6 +17,7 @@
 
 #include <QAbstractButton>
 #include <QApplication>
+#include <QComboBox>
 #include <QDir>
 #include <QFile>
 #include <QFileInfo>
@@ -41,6 +42,7 @@ private slots:
     void crashScreen_data();
     void crashScreen();
     void xsemuWarmupIsOff();
+    void warmupFailureOffersContinueAndPlay();
 
 private:
     QAbstractButton* button(const char* name) const;
@@ -255,7 +257,7 @@ void TestInGame::xsemuWarmupIsOff()
 
     QString error;
     QVERIFY(!m_s->warmup.start(false, garden, &error));
-    QCOMPARE(error, QStringLiteral("The XSEmu warm-up is turned off in this build."));
+    QCOMPARE(error, QStringLiteral("The XSEmu Core warm-up is turned off in this build."));
     QVERIFY(m_s->gate.isFree());
     QCOMPARE(m_s->warmup.state(), WarmupController::State::Idle);
 
@@ -291,11 +293,136 @@ void TestInGame::xsemuWarmupIsOff()
     }
     QVERIFY(warmupPage);
     const QString page = visibleText(warmupPage);
-    QVERIFY2(page.contains(QLatin1String("The XSEmu warm-up is turned off in this build.")), qPrintable(page));
+    QVERIFY2(page.contains(QLatin1String("The XSEmu Core warm-up is turned off in this build.")), qPrintable(page));
     QVERIFY2(!page.contains(QLatin1String("Start warm-up")) && !page.contains(QLatin1String("Warm up ")) && !page.contains(QLatin1String("Retry")), qPrintable(page));
 
     m_s->settings.setXsemuWarmup(true);
     QVERIFY(LaunchErrors::shadersCold(*m_s, garden));
+}
+
+// A warm-up that failed leaves the page usable: what is left is named, Continue continues that pass,
+// a full pass is one click away, and Play stays available (the gate is free once the pass ended).
+void TestInGame::warmupFailureOffersContinueAndPlay()
+{
+    const Game garden = fixtureGame(QStringLiteral("Signal Garden"));
+    QTRY_VERIFY_WITH_TIMEOUT(m_s->library.game(garden.titleId()).isValid(), 10000);
+    m_s->settings.setXsemuWarmup(true);
+
+    WarmupRun run;
+    run.titleId = garden.titleId();
+    run.titleName = garden.title();
+    run.done = 2180;
+    run.total = 3120;
+    run.tookS = 96;
+    run.exitCode = 3;
+    run.result = WarmupRun::Result::Failed;
+    run.finishedAt = QDateTime::currentDateTime();
+    WarmupController::Progress progress;
+    progress.targets = 3120;
+    progress.done = 2180;
+    progress.total = 3120;
+    progress.phase = QStringLiteral("bound");
+    progress.passDone = 2180;
+    m_s->settings.clearRecentWarmups();
+    m_s->settings.addRecentWarmup(run);
+    m_s->warmup.simulateForScreenshot(WarmupController::State::Failed, garden, progress,
+                                      QStringLiteral("the driver compile crashed (0xC0000005)"), run);
+    m_w->showPage(Page::Warmup);
+    QApplication::processEvents();
+
+    QWidget* warmupPage = nullptr;
+    for (QWidget* child : m_w->gameDetailsPage()->parentWidget()->findChildren<QWidget*>(Qt::FindDirectChildrenOnly)) {
+        if (QByteArray(child->metaObject()->className()) == "WarmupPage")
+            warmupPage = child;
+    }
+    QVERIFY(warmupPage);
+    QStringList shown;
+    for (const QAbstractButton* b : warmupPage->findChildren<QAbstractButton*>()) {
+        if (b->isVisibleTo(warmupPage) && b->isEnabled())
+            shown << b->text();
+    }
+    QStringList labels;
+    for (const QLabel* l : warmupPage->findChildren<QLabel*>()) {
+        if (l->isVisibleTo(warmupPage))
+            labels << l->text();
+    }
+    const QString page = labels.join(QLatin1Char('\n'));
+    // a crash has no done line, so the card says where it stopped rather than claiming a total
+    QVERIFY2(page.contains(QLatin1String("stopped in bound pipelines at 2,180 of 3,120")), qPrintable(page));
+    QVERIFY2(page.contains(QLatin1String("XSEmu Core exited with code 3")), qPrintable(page));
+    QVERIFY2(page.contains(QLatin1String("Continue goes on from where this pass stopped")), qPrintable(page));
+    // Continue, Play and a full pass are all offered, and nothing is stuck: no Cancel, no running bar
+    QVERIFY2(shown.contains(QStringLiteral("Continue")), qPrintable(shown.join(QLatin1Char('|'))));
+    QVERIFY2(shown.contains(QStringLiteral("Play Signal Garden")), qPrintable(shown.join(QLatin1Char('|'))));
+    QVERIFY2(!shown.contains(QStringLiteral("Cancel")), qPrintable(shown.join(QLatin1Char('|'))));
+    QVERIFY(m_s->gate.isFree());
+
+    // the same for a pass the 20-minute budget stopped: Continue carries on, and a full pass is offered
+    // because that is the one result a full pass answers
+    run.result = WarmupRun::Result::StoppedPartWay;
+    run.left = 3120 - 2180;
+    m_s->settings.clearRecentWarmups();
+    m_s->settings.addRecentWarmup(run);
+    m_s->warmup.simulateForScreenshot(WarmupController::State::StoppedPartWay, garden, progress, {}, run);
+    QApplication::processEvents();
+    shown.clear();
+    labels.clear();
+    for (const QAbstractButton* b : warmupPage->findChildren<QAbstractButton*>()) {
+        if (b->isVisibleTo(warmupPage) && b->isEnabled())
+            shown << b->text();
+    }
+    for (const QLabel* l : warmupPage->findChildren<QLabel*>()) {
+        if (l->isVisibleTo(warmupPage))
+            labels << l->text();
+    }
+    const QString stopped = labels.join(QLatin1Char('\n'));
+    QVERIFY2(stopped.contains(QStringLiteral("2,180 built · 940 left")), qPrintable(stopped));
+    QVERIFY2(shown.contains(QStringLiteral("Continue")), qPrintable(shown.join(QLatin1Char('|'))));
+    QVERIFY2(shown.contains(QStringLiteral("Full pass")), qPrintable(shown.join(QLatin1Char('|'))));
+    QVERIFY2(shown.contains(QStringLiteral("Play Signal Garden")), qPrintable(shown.join(QLatin1Char('|'))));
+
+    // Continue runs the pass that stopped: this one was a full pass, so the pass it starts is full too
+    // (the budgeted one it would otherwise start filters stale pipelines and has a time limit)
+    run.full = true;
+    m_s->settings.clearRecentWarmups();
+    m_s->settings.addRecentWarmup(run);
+    m_s->warmup.simulateForScreenshot(WarmupController::State::StoppedPartWay, garden, progress, {}, run);
+    QApplication::processEvents();
+    QAbstractButton* cont = nullptr;
+    for (QAbstractButton* b : warmupPage->findChildren<QAbstractButton*>()) {
+        if (b->isVisibleTo(warmupPage) && b->text() == QLatin1String("Continue"))
+            cont = b;
+    }
+    QVERIFY(cont);
+    cont->click();
+    QTRY_VERIFY_WITH_TIMEOUT(m_s->warmup.isActive(), 10000);
+    QVERIFY2(m_s->warmup.progress().full, "Continue kept the pass the stop belonged to");
+    m_s->warmup.cancel();
+    QTRY_VERIFY_WITH_TIMEOUT(!m_s->warmup.isActive(), 20000);
+
+    // the idle card's Continue is the same promise: it is the warm-up button with another label, and
+    // it too must run the pass that stopped rather than a budgeted one
+    QComboBox* games = warmupPage->findChild<QComboBox*>();
+    QVERIFY(games);
+    const QString idleTitle = games->currentData().toString();
+    QVERIFY(!idleTitle.isEmpty());
+    WarmupRun idleRun = run;
+    idleRun.titleId = idleTitle;
+    m_s->settings.clearRecentWarmups();
+    m_s->settings.addRecentWarmup(idleRun);
+    m_s->warmup.simulateForScreenshot(WarmupController::State::Idle, Game{}, WarmupController::Progress{});
+    QApplication::processEvents();
+    QAbstractButton* idleContinue = nullptr;
+    for (QAbstractButton* b : warmupPage->findChildren<QAbstractButton*>()) {
+        if (b->isVisibleTo(warmupPage) && b->isEnabled() && b->text().startsWith(QLatin1String("Continue")))
+            idleContinue = b;
+    }
+    QVERIFY2(idleContinue, "the idle card offers Continue for a pass that stopped");
+    idleContinue->click();
+    QTRY_VERIFY_WITH_TIMEOUT(m_s->warmup.isActive(), 10000);
+    QVERIFY2(m_s->warmup.progress().full, "the idle Continue kept the pass the stop belonged to");
+    m_s->warmup.cancel();
+    QTRY_VERIFY_WITH_TIMEOUT(!m_s->warmup.isActive(), 20000);
 }
 
 int main(int argc, char** argv)

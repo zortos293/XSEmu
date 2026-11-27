@@ -211,9 +211,9 @@ QString forbiddenReason(const KeySpec& spec, const QVariant& v)
     if (!spec.unavailable.isEmpty())
         return spec.unavailable;
     if (spec.key == QLatin1String("offline") && !v.toBool())
-        return QStringLiteral("XSEmu runs games offline. Online play isn't available.");
+        return QStringLiteral("XSEmu Core runs games offline. Online play isn't available.");
     if (spec.key == QLatin1String("store") && v.toString() != QLatin1String("offline-error"))
-        return QStringLiteral("Games always get the store's offline error. XSEmu never reports a licence it doesn't have.");
+        return QStringLiteral("Games always get the store's offline error. XSEmu Core never reports a licence it doesn't have.");
     return {};
 }
 
@@ -355,7 +355,7 @@ QString infoString(const QJsonObject& o, const char* key, int max = kInfoMax)
 const QList<KeySpec>& keys()
 {
     using K = KeySpec::Kind;
-    static const QString notInBuild = s("Not in this XSEmu build yet.");
+    static const QString notInBuild = s("Not in this XSEmu Core build yet.");
     static const QList<KeySpec> list{
         {s("device_type"), s("Console"), K::Choice, {{s("lockhart"), s("Series S")}, {s("anaconda"), s("Series X")}}},
         {s("display_mode"), s("Display mode"), K::DisplayMode, {}},

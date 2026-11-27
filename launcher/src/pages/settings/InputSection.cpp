@@ -62,12 +62,12 @@ QWidget* SettingsSections::input(Services& s)
         const QList<int> pads = connectedControllers();
         pad->setText(pads.isEmpty() ? QStringLiteral("Not connected") : QStringLiteral("Connected"));
         pad->setRole(pads.isEmpty() ? Theme::Role::Text3 : Theme::Role::Success);
-        padRow->setHelp(pads.isEmpty() ? QStringLiteral("Connect an Xbox or other XInput controller. XSEmu uses the first one as the console's gamepad.")
+        padRow->setHelp(pads.isEmpty() ? QStringLiteral("Connect an Xbox or other XInput controller. XSEmu Core uses the first one as the console's gamepad.")
                                         : QStringLiteral("Connected over XInput, slot %1. Used as the console's first gamepad.").arg(pads.first()));
 #else
         pad->setText(QStringLiteral("Windows only"));
         pad->setRole(Theme::Role::Text3);
-        padRow->setHelp(QStringLiteral("XSEmu reads the first XInput controller of the PC as the console's gamepad."));
+        padRow->setHelp(QStringLiteral("XSEmu Core reads the first XInput controller of the PC as the console's gamepad."));
 #endif
     };
     pollPads();
@@ -81,7 +81,7 @@ QWidget* SettingsSections::input(Services& s)
     kbm->setChecked(kbmValue().isValid() ? kbmValue().toBool() : true);
     QObject::connect(kbm, &Toggle::toggled, sec.page, [&s](bool on) { s.settings.setXclDefault(QStringLiteral("keyboard_mouse"), on); });
     sec.row(QStringLiteral("Keyboard and mouse as gamepad"),
-            QStringLiteral("WASD the left stick, the mouse the right stick, the mouse buttons the triggers, the wheel the bumpers. XSEmu holds the cursor in the game window while this is on."),
+            QStringLiteral("WASD the left stick, the mouse the right stick, the mouse buttons the triggers, the wheel the bumpers. XSEmu Core holds the cursor in the game window while this is on."),
             kbm);
 
     QStringList labels;
@@ -98,7 +98,7 @@ QWidget* SettingsSections::input(Services& s)
 
     sec.caps(QStringLiteral("Focus"));
     auto* pauseOnFocus = new Toggle;
-    sec.row(QStringLiteral("Pause when XSEmu loses focus"), QStringLiteral("Stops the game when you switch windows."), pauseOnFocus)
+    sec.row(QStringLiteral("Pause when XSEmu Core loses focus"), QStringLiteral("Stops the game when you switch windows."), pauseOnFocus)
         ->setUnavailable(QStringLiteral("Not in this launcher build yet."));
     sec.finish();
     return sec.page;
