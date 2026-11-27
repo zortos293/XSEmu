@@ -14,6 +14,7 @@
 #include <QProcess>
 #include <QSaveFile>
 #include <QStandardPaths>
+#include <QTimer>
 
 namespace {
 
@@ -189,14 +190,18 @@ void RunnerInstall::fail(const QString& error)
         m_process->killTree();
     m_file.close();
     QDir(QDir(m_dir).filePath(QStringLiteral("staging"))).removeRecursively();
-    log(QStringLiteral("Install failed: %1").arg(error));
+    log(QStringLiteral("%1: %2").arg(m_cancelled ? QStringLiteral("Install cancelled") : QStringLiteral("Install failed"), error));
     m_log.close();
-    QSaveFile record(failurePath(m_spec.id));
-    if (record.open(QIODevice::WriteOnly)) {
-        record.write(QJsonDocument(QJsonObject{{QStringLiteral("error"), error},
-                                               {QStringLiteral("at"), QDateTime::currentDateTimeUtc().toString(Qt::ISODate)}})
-                         .toJson());
-        record.commit();
+    // Stopping an install is not a failure: with no record, the runner reads afterwards as it did before
+    // (not installed, or installed at the version it has), also after a restart.
+    if (!m_cancelled) {
+        QSaveFile record(failurePath(m_spec.id));
+        if (record.open(QIODevice::WriteOnly)) {
+            record.write(QJsonDocument(QJsonObject{{QStringLiteral("error"), error},
+                                                   {QStringLiteral("at"), QDateTime::currentDateTimeUtc().toString(Qt::ISODate)}})
+                             .toJson());
+            record.commit();
+        }
     }
     emit finished(false, error);
 }
@@ -207,7 +212,7 @@ void RunnerInstall::setStep(const QString& detail)
     emit progressChanged();
 }
 
-void RunnerInstall::download(const QString& url, const QString& to, const QString& sha256)
+void RunnerInstall::download(const QString& url, const QString& to, const QString& sha256, int attempt)
 {
     QDir().mkpath(QFileInfo(to).absolutePath());
     m_file.setFileName(to + QStringLiteral(".part"));
@@ -216,25 +221,32 @@ void RunnerInstall::download(const QString& url, const QString& to, const QStrin
         return;
     }
     m_hash.reset();
-    log(QStringLiteral("GET %1").arg(url));
+    log(QStringLiteral("GET %1%2").arg(url, attempt > 0 ? QStringLiteral(" (attempt %1)").arg(attempt + 1) : QString()));
     m_progress.bytes = true;
     setStep(QUrl(url).fileName());
     QNetworkRequest req{QUrl(url)};
     req.setHeader(QNetworkRequest::UserAgentHeader, QStringLiteral("XSEmuLauncher"));
     req.setAttribute(QNetworkRequest::RedirectPolicyAttribute, QNetworkRequest::NoLessSafeRedirectPolicy);
     m_reply = m_net->get(req);
-    connect(m_reply, &QNetworkReply::readyRead, this, [this] {
-        const QByteArray chunk = m_reply->readAll();
+    // the reply the callbacks below belong to: m_reply may be cleared (finished) or replaced before a
+    // queued readyRead arrives, and the file is closed by then
+    QNetworkReply* const reply = m_reply;
+    connect(reply, &QNetworkReply::readyRead, this, [this, reply] {
+        if (m_cancelled || m_done)
+            return;
+        const QByteArray chunk = reply->readAll();
         m_hash.addData(chunk);
-        m_file.write(chunk);
+        if (m_file.isOpen())
+            m_file.write(chunk);
     });
-    connect(m_reply, &QNetworkReply::downloadProgress, this, [this](qint64 got, qint64 total) {
+    connect(reply, &QNetworkReply::downloadProgress, this, [this](qint64 got, qint64 total) {
+        if (m_done)
+            return;
         m_progress.done = got;
         m_progress.total = total > 0 ? total : -1;
         emit progressChanged();
     });
-    connect(m_reply, &QNetworkReply::finished, this, [this, to, sha256, url] {
-        QNetworkReply* reply = m_reply;
+    connect(reply, &QNetworkReply::finished, this, [this, reply, to, sha256, url, attempt] {
         m_reply.clear();
         reply->deleteLater();
         if (m_cancelled || m_done)
@@ -244,7 +256,16 @@ void RunnerInstall::download(const QString& url, const QString& to, const QStrin
         m_file.write(rest);
         m_file.close();
         if (reply->error() != QNetworkReply::NoError) {
-            fail(QStringLiteral("The download from %1 failed: %2").arg(QUrl(url).host().isEmpty() ? url : QUrl(url).host(), reply->errorString()));
+            const QString why = reply->errorString();
+            if (attempt + 1 < kDownloadAttempts) {
+                log(QStringLiteral("The download from %1 failed (%2); trying again").arg(url, why));
+                QTimer::singleShot(1000 * (attempt + 1), this, [this, url, to, sha256, attempt] {
+                    if (!m_cancelled && !m_done)
+                        download(url, to, sha256, attempt + 1);
+                });
+                return;
+            }
+            fail(QStringLiteral("The download from %1 failed: %2").arg(QUrl(url).host().isEmpty() ? url : QUrl(url).host(), why));
             return;
         }
         const QString got = QString::fromLatin1(m_hash.result().toHex());

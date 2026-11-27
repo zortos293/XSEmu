@@ -191,10 +191,15 @@ QList<RunnerSpec> build()
     v1.recommendMinRamBytes = 64ULL * 1024 * 1024 * 1024;
     v1.summary = QStringLiteral("VIctory fork with code paths for Radeon GPUs.");
     v1.licence = QStringLiteral("GPL-3.0");
-    v1.note = QStringLiteral("Needs 64 GB of RAM.");
+    v1.note = QStringLiteral("Needs 64 GB of RAM. Its GitHub repository was deleted; XSEmu Launcher builds the audited commit from the upstream VIctory repository.");
     v1.windowsOnly = true;
     v1.install = RunnerSpec::Install::BuildFromSource;
     v1.commit = QStringLiteral("c9c932cbcc38defd8f1683d62dd298187f565031");
+    v1.tree = QStringLiteral("2c208def544ad8df2b06a6da082522554b73f8cf");
+    // the fork's own GitHub repository (and its author's account) is gone: the pinned commit is fetched
+    // from the upstream VIctory repository, which carries it, and from a mirror of the fork
+    v1.remotes = {QStringLiteral("https://github.com/Marvisak/VIctory.git"),
+                  QStringLiteral("https://git.gtahub.st/github/avatarmanz--VIctory-7900XTX.git")};
     v1.toolchains = {QStringLiteral("git"), QStringLiteral("msvc"), QStringLiteral("rust")};
     v1.buildSteps = {{QStringLiteral("cargo"), QStringLiteral("build"), QStringLiteral("--locked"), QStringLiteral("--profile"), QStringLiteral("diag"),
                       QStringLiteral("-p"), QStringLiteral("victory"), QStringLiteral("--features"), QStringLiteral("diagnostics")}};
@@ -224,6 +229,9 @@ QList<RunnerSpec> build()
     v2.id = QStringLiteral("victory-dexnom");
     v2.name = QStringLiteral("VIctory (DexNom)");
     v2.repo = QStringLiteral("DexNom/VIctory");
+    // the 7900 XTX sources above are not this fork's: its own repository first, then upstream, which
+    // also carries 64bd58f (a deleted fork must not take the runner with it)
+    v2.remotes = {QStringLiteral("https://github.com/DexNom/VIctory.git"), QStringLiteral("https://github.com/Marvisak/VIctory.git")};
     v2.badge = QStringLiteral("AMD (tested on RX 7900 XTX)");
     v2.recommendWhy = QStringLiteral("VIctory (DexNom) is tested on a Radeon RX 7900 XTX");
     v2.recommendMinRamBytes = 0;
@@ -231,6 +239,7 @@ QList<RunnerSpec> build()
     v2.note.clear();
     v2.environment = victoryEnvironment;
     v2.commit = QStringLiteral("64bd58f5fb794216894bc0e33e03a3a64d19c347");
+    v2.tree = QStringLiteral("34844940e7b4325f8c7cc5a202b29460d29cfa74");
     // the BCPack format tables the build embeds, fetched from where its own setup script fetches them
     v2.fetches = {{QStringLiteral("https://raw.githubusercontent.com/Marvisak/VIctory/2849477415a46f5a079c85cf3e64a3dff32f713c/crates/victory-formats/src/bcpack-tables.bin"),
                    QStringLiteral("1f1d4760419202bb5672f0c428ce51e456b5d08fbaec8f371d043fd94e01c36b"),
