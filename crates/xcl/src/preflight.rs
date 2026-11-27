@@ -31,6 +31,8 @@ pub struct Check {
 pub struct Gpu {
     pub name: String,
     pub warp: bool,
+    /// read from a device (`device_caps`): without it only the name and `warp` are known
+    pub probed: bool,
     /// (6, 6) = Shader Model 6.6
     pub shader_model: (u8, u8),
     /// the message for a missing SM 6.6 (it depends on the Agility SDK state)
@@ -54,15 +56,20 @@ fn check(level: Level, what: impl Into<String>, fix: Option<&str>) -> Check {
     Check { level, what: what.into(), fix: fix.map(str::to_string) }
 }
 
-pub fn checks(f: &Found) -> Vec<Check> {
+/// The checks of the GPU alone (`checks`; the host's, `log_device_checks`).
+fn gpu_checks(gpu: &Result<Gpu, String>) -> Vec<Check> {
     let mut v = Vec::new();
-    match &f.gpu {
+    match gpu {
         Err(e) => v.push(check(Level::Error, format!("no D3D12 device: {e}"), Some("update the GPU driver"))),
         Ok(g) => {
             if g.warp {
                 v.push(check(Level::Warning, "GPU: WARP (software renderer) – no hardware D3D12 device was usable", Some("update the GPU driver; d3d12_adapter in xcl.toml or XCL_ADAPTER picks the GPU")));
             } else {
                 v.push(check(Level::Ok, format!("GPU: {}", g.name), None));
+            }
+            if !g.probed {
+                v.push(check(Level::Note, "shader model, mesh shaders and wave width: checked by the game process on its own device, in xcl.log (XCL_PREFLIGHT_DEVICE=1: here, with a device of the launcher's own)", None));
+                return v;
             }
             if g.shader_model < (6, 6) {
                 v.push(check(Level::Error, format!("{} (has {}.{}): shaders cannot run", g.no_sm66, g.shader_model.0, g.shader_model.1), Some("update the GPU driver; on Windows 10, put the D3D12 Agility SDK's D3D12Core.dll in a D3D12 folder next to XSEmu.exe")));
@@ -79,6 +86,11 @@ pub fn checks(f: &Found) -> Vec<Check> {
             }
         }
     }
+    v
+}
+
+pub fn checks(f: &Found) -> Vec<Check> {
+    let mut v = gpu_checks(&f.gpu);
     match &f.dxc {
         Ok(dir) => {
             use crate::gpu::recomp::dxc;
@@ -96,8 +108,19 @@ pub fn checks(f: &Found) -> Vec<Check> {
     v
 }
 
+/// Whether `xcl run` makes a D3D12 device of its own for the GPU checks (`XCL_PREFLIGHT_DEVICE=1`;
+/// off by default). Making it maps NVIDIA's shader cache into the launcher, which lives for the
+/// whole run, so what it holds is paid beside the host's for the whole session: play-118 on 102q2
+/// fell ~1 GB/s from its first second there and was stopped before the host started. Off, the
+/// launcher names the adapter from DXGI alone and the host checks its own device
+/// (`log_device_checks`).
+pub fn device_probe() -> bool {
+    std::env::var("XCL_PREFLIGHT_DEVICE").is_ok_and(|v| v.trim() == "1")
+}
+
 /// The adapter `setting` (`d3d12_adapter`, overridden by `XCL_ADAPTER`) picks – the same
-/// choice and the same fallback to WARP as the D3D12 backend's device.
+/// choice and the same fallback to WARP as the D3D12 backend's device. Without `device_probe`
+/// only its name, from DXGI; with it, a device made, read (`device_caps`), released and trimmed.
 fn probe_gpu(setting: &str) -> Result<Gpu, String> {
     use crate::gpu::adapter::{self, Selector};
     use windows::Win32::Graphics::Direct3D::*;
@@ -106,17 +129,22 @@ fn probe_gpu(setting: &str) -> Result<Gpu, String> {
     unsafe {
         let factory: IDXGIFactory6 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).map_err(|e| format!("DXGI: {e}"))?;
         let sel = Selector::from_env_or(setting);
+        let mut list = if sel != Selector::Warp { adapter::candidates(&factory, &sel) } else { Vec::new() };
+        if list.is_empty() && sel != Selector::Warp {
+            list = adapter::candidates(&factory, &Selector::Auto);
+        }
+        if !device_probe() {
+            return Ok(match list.first() {
+                Some((_, desc)) => Gpu { name: format!("{} ({} MiB VRAM)", adapter::name(desc), desc.DedicatedVideoMemory >> 20), ..Gpu::default() },
+                None => Gpu { name: "WARP (software renderer)".into(), warp: true, ..Gpu::default() },
+            });
+        }
+        crate::hle::d3d12x::real::game_trim_device(true);
         let mut found: Option<(ID3D12Device, String)> = None;
-        if sel != Selector::Warp {
-            let mut list = adapter::candidates(&factory, &sel);
-            if list.is_empty() {
-                list = adapter::candidates(&factory, &Selector::Auto);
-            }
-            for (a, desc) in list {
-                if let Ok(dev) = crate::gpu::agility::create_device(&a, D3D_FEATURE_LEVEL_12_0) {
-                    found = Some((dev, format!("{} ({} MiB VRAM)", adapter::name(&desc), desc.DedicatedVideoMemory >> 20)));
-                    break;
-                }
+        for (a, desc) in list {
+            if let Ok(dev) = crate::gpu::agility::create_device(&a, D3D_FEATURE_LEVEL_12_0) {
+                found = Some((dev, format!("{} ({} MiB VRAM)", adapter::name(&desc), desc.DedicatedVideoMemory >> 20)));
+                break;
             }
         }
         let warp = found.is_none();
@@ -128,6 +156,18 @@ fn probe_gpu(setting: &str) -> Result<Gpu, String> {
                 (d, "WARP (software renderer)".into())
             }
         };
+        crate::hle::d3d12x::real::game_trim_device(false);
+        let gpu = device_caps(&dev, name, warp);
+        drop(dev);
+        crate::hle::d3d12x::real::trim_mapped_files();
+        Ok(gpu)
+    }
+}
+
+/// What D3D12 reports of `dev` (named `name`, WARP with `warp`): the GPU the checks look at.
+pub(crate) fn device_caps(dev: &windows::Win32::Graphics::Direct3D12::ID3D12Device, name: String, warp: bool) -> Gpu {
+    use windows::Win32::Graphics::Direct3D12::*;
+    unsafe {
         // the highest model asked for that the runtime knows; a lower one comes back if that is all
         let mut shader_model = (0, 0);
         for m in [D3D_SHADER_MODEL_6_6, D3D_SHADER_MODEL_6_5, D3D_SHADER_MODEL_6_0] {
@@ -144,8 +184,26 @@ fn probe_gpu(setting: &str) -> Result<Gpu, String> {
         let mesh = dev.CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS7, &mut o7 as *mut _ as _, std::mem::size_of_val(&o7) as u32).is_ok()
             && o7.MeshShaderTier.0 >= D3D12_MESH_SHADER_TIER_1.0;
         let no_sm66 = crate::gpu::agility::format_no_sm66_message(&name, crate::gpu::agility::state());
-        Ok(Gpu { name, warp, shader_model, no_sm66, mesh, wave_min: o1.WaveLaneCountMin, wave_max: o1.WaveLaneCountMax })
+        Gpu { name, warp, probed: true, shader_model, no_sm66, mesh, wave_min: o1.WaveLaneCountMin, wave_max: o1.WaveLaneCountMax }
     }
+}
+
+/// The host's device (`dev`, `name`) checked as `xcl run` would have with `device_probe`: once,
+/// each GPU check in the log, those not OK as warnings (on the console too).
+pub(crate) fn log_device_checks(dev: &windows::Win32::Graphics::Direct3D12::ID3D12Device, name: &str) {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    if device_probe() {
+        return;
+    }
+    ONCE.call_once(|| {
+        for c in gpu_checks(&Ok(device_caps(dev, name.to_string(), name.starts_with("WARP")))) {
+            let fix = c.fix.map_or(String::new(), |f| format!(" → {f}"));
+            match c.level {
+                Level::Ok => crate::xlog_info!("D3D12: GPU check on the game's device (XCL_PREFLIGHT_DEVICE=0): {}", c.what),
+                _ => crate::xlog_warn!("D3D12: GPU check on the game's device (XCL_PREFLIGHT_DEVICE=0): {}{fix}", c.what),
+            }
+        }
+    });
 }
 
 fn xgameruntime_present() -> bool {
@@ -186,7 +244,7 @@ mod tests {
     use super::*;
 
     fn gpu() -> Gpu {
-        Gpu { name: "Radeon RX 9070 (16304 MiB VRAM)".into(), warp: false, shader_model: (6, 6), no_sm66: "x: no SM 6.6".into(), mesh: true, wave_min: 32, wave_max: 64 }
+        Gpu { name: "Radeon RX 9070 (16304 MiB VRAM)".into(), warp: false, probed: true, shader_model: (6, 6), no_sm66: "x: no SM 6.6".into(), mesh: true, wave_min: 32, wave_max: 64 }
     }
 
     fn found(gpu: Gpu) -> Found {
@@ -239,6 +297,15 @@ mod tests {
         assert_eq!(c[1].what, r"DXC 1.7: C:\dxc");
         assert!(c[2].what.contains("older than 1.8") && c[2].fix.as_deref().is_some_and(|f| f.contains("XCL_DXC_DIR")), "{:?}", c[2]);
         assert_eq!(levels(&Found { dxc_toolchain: dxc(1, 8), ..found(gpu()) }), [Level::Ok, Level::Ok]);
+    }
+
+    /// `XCL_PREFLIGHT_DEVICE` off: the launcher has the adapter's name only, and says where the rest is checked.
+    #[test]
+    fn an_adapter_not_probed_leaves_its_checks_to_the_game() {
+        let c = checks(&found(Gpu { name: "RTX".into(), ..Gpu::default() }));
+        assert_eq!(c.iter().map(|c| c.level).collect::<Vec<_>>(), [Level::Ok, Level::Note, Level::Ok]);
+        assert!(c[1].what.contains("XCL_PREFLIGHT_DEVICE=1"), "{:?}", c[1]);
+        assert_eq!(levels(&found(Gpu { name: "WARP".into(), warp: true, ..Gpu::default() }))[..2], [Level::Warning, Level::Note]);
     }
 
     #[test]

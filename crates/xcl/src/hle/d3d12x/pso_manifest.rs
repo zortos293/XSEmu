@@ -204,14 +204,129 @@ fn entries(file: &[u8]) -> Vec<&[u8]> {
 /// The keys of the kept entries (`entries`, `key_of`), the file read an entry at a time: after a
 /// hundred runs it holds 954,785 entries in 718 MB, four fifths of it zeros, and read whole it was
 /// a game run's highest Rust heap (749 MB at its start, 134 MB live). `XCL_PSO_MANIFEST_STREAM=0`:
-/// read whole, as before.
+/// read whole, as before. The entries a key list covers (`kept_keys`) are not read: only its
+/// keys, and the entries added since.
 fn keys_in(path: &Path) -> HashSet<u64> {
-    use std::io::Read;
-    let mut keys = HashSet::new();
-    let Ok(file) = std::fs::File::open(path) else { return keys };
-    let mut left = file.metadata().map_or(0, |m| m.len());
+    use std::io::{Read, Seek};
+    let Ok(file) = std::fs::File::open(path) else { return HashSet::new() };
+    let len = file.metadata().map_or(0, |m| m.len());
+    let listed = keys_listed();
+    let t0 = std::time::Instant::now();
+    let (mut keys, start) = listed.then(|| kept_keys(path, &file, len)).flatten().unwrap_or_default();
+    let from_list = keys.len();
+    let mut end = start;
+    if (&file).seek(std::io::SeekFrom::Start(start)).is_ok() {
+        let mut left = len - start;
+        let mut reader = std::io::BufReader::with_capacity(1 << 20, &file);
+        let (mut len, mut entry) = ([0u8; 4], Vec::new());
+        while left >= 4 && reader.read_exact(&mut len).is_ok() {
+            let n = u32::from_le_bytes(len) as u64;
+            left -= 4;
+            if n > left {
+                break;
+            }
+            entry.resize(n as usize, 0);
+            if reader.read_exact(&mut entry).is_err() {
+                break;
+            }
+            left -= n;
+            end += 4 + n;
+            keys.insert(key_of(&entry));
+        }
+    }
+    if listed && end > start {
+        keep_keys(path, &file, &keys, end);
+    }
+    static SAID: std::sync::Once = std::sync::Once::new();
+    if listed && len > 0 {
+        SAID.call_once(|| {
+            crate::xlog_info!(
+                "pipeline list: {} pipelines kept, {from_list} of them from pipelines.keys and {} MB of entries read in {} ms (XCL_PSO_MANIFEST_KEYS=0: the whole list read)",
+                keys.len(),
+                (end - start) >> 20,
+                t0.elapsed().as_millis()
+            )
+        });
+    }
+    keys
+}
+
+/// `pipelines.keys` beside the list: the keys of its entries up to a length of the list, so that
+/// a run reads them (8 bytes a pipeline: 7 MB and 40 ms for 959,791, against 688 MB and 855 ms
+/// for the whole list with the file in memory) and only the entries added since. Made again when
+/// the list grew; one that does not match the list's bytes before the length it covers (the list
+/// rewritten or cut) is not used. Old builds do not read it. `XCL_PSO_MANIFEST_KEYS=0`: not read
+/// or written.
+const KEYS_MAGIC: &[u8; 8] = b"XCLKEYS1";
+/// bytes of the list, before the length a key list covers, that the key list is checked against
+const KEYS_CHECKED: u64 = 64 << 10;
+
+fn keys_listed() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var("XCL_PSO_MANIFEST_KEYS").map_or(true, |v| v.trim() != "0"))
+}
+
+fn keys_path(list: &Path) -> PathBuf {
+    list.with_extension("keys")
+}
+
+/// What a key list covering `end` bytes of `file` is checked by: a hash of the `KEYS_CHECKED`
+/// bytes before `end`, and `end` (None: they cannot be read).
+fn list_check(mut file: &std::fs::File, end: u64) -> Option<u64> {
+    use std::io::{Read, Seek};
+    let from = end.saturating_sub(KEYS_CHECKED);
+    file.seek(std::io::SeekFrom::Start(from)).ok()?;
+    let mut b = vec![0u8; (end - from) as usize];
+    file.read_exact(&mut b).ok()?;
+    Some(crate::gpu::shader::fnv64(&b) ^ end)
+}
+
+/// The keys of list `path`'s key list (`file` the list, `len` its length) and the length of the
+/// list they cover. None: there is none, or it is not one of this list.
+fn kept_keys(path: &Path, file: &std::fs::File, len: u64) -> Option<(HashSet<u64>, u64)> {
+    let b = std::fs::read(keys_path(path)).ok()?;
+    let word = |k: usize| Some(u64::from_le_bytes(b.get(8 + 8 * k..16 + 8 * k)?.try_into().ok()?));
+    if b.get(..8) != Some(&KEYS_MAGIC[..]) {
+        return None;
+    }
+    let (covered, check, count) = (word(0)?, word(1)?, word(2)?);
+    if covered > len || (b.len() as u64 - 32) != count.checked_mul(8)? || list_check(file, covered)? != check {
+        return None;
+    }
+    Some((b[32..].chunks_exact(8).map(|k| u64::from_le_bytes(k.try_into().unwrap())).collect(), covered))
+}
+
+/// Write the key list of list `path`: `keys`, those of its first `end` bytes.
+fn keep_keys(path: &Path, file: &std::fs::File, keys: &HashSet<u64>, end: u64) {
+    let Some(check) = list_check(file, end) else { return };
+    let mut b = Vec::with_capacity(32 + 8 * keys.len());
+    b.extend_from_slice(KEYS_MAGIC);
+    for w in [end, check, keys.len() as u64] {
+        b.extend_from_slice(&w.to_le_bytes());
+    }
+    keys.iter().for_each(|k| b.extend_from_slice(&k.to_le_bytes()));
+    let to = keys_path(path);
+    let tmp = to.with_extension(format!("keys.{}.tmp", std::process::id()));
+    if std::fs::write(&tmp, &b).is_err() || std::fs::rename(&tmp, &to).is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+}
+
+/// The list a warm-up child indexes instead of its folder's own (`Store::index`, `write_subset`).
+pub(super) const WARM_LIST: &str = "XCL_WARM_LIST";
+
+/// The entries of `keys` from the list in folder `dir`, written to `to` in the list's own form
+/// (each a length and an encoded record, a key's first entry only), the list read an entry at a
+/// time; how many. A warm-up's children index it (`WARM_LIST`) instead of the whole list: in the
+/// 102n test (2026-11-27) each of 8 children read the 722 MB list whole, was replaced at its 2 GB
+/// of private commit after a few keys, and its successor read it again; the PC fell to 61 MB.
+pub(super) fn write_subset(dir: &Path, keys: &HashSet<u64>, to: &Path) -> std::io::Result<usize> {
+    use std::io::{Read, Write};
+    let file = std::fs::File::open(dir.join("pipelines.bin"))?;
+    let mut left = file.metadata()?.len();
     let mut file = std::io::BufReader::with_capacity(1 << 20, file);
-    let (mut len, mut entry) = ([0u8; 4], Vec::new());
+    let mut out = std::io::BufWriter::new(std::fs::File::create(to)?);
+    let (mut len, mut entry, mut seen) = ([0u8; 4], Vec::new(), HashSet::new());
     while left >= 4 && file.read_exact(&mut len).is_ok() {
         let n = u32::from_le_bytes(len) as u64;
         left -= 4;
@@ -219,13 +334,16 @@ fn keys_in(path: &Path) -> HashSet<u64> {
             break;
         }
         entry.resize(n as usize, 0);
-        if file.read_exact(&mut entry).is_err() {
-            break;
-        }
+        file.read_exact(&mut entry)?;
         left -= n;
-        keys.insert(key_of(&entry));
+        let key = key_of(&entry);
+        if keys.contains(&key) && seen.insert(key) {
+            out.write_all(&len)?;
+            out.write_all(&entry)?;
+        }
     }
-    keys
+    out.flush()?;
+    Ok(seen.len())
 }
 
 /// `Store::index`: the list's bytes and each key's first entry in them (offset, length).
@@ -367,8 +485,15 @@ impl Store {
 
     /// Each kept pipeline's entry by key, the list read once: a warm-up child decodes the keys it
     /// is given from it (`Index::get`) instead of reading the list again for each batch.
+    /// A warm-up child reads the pass's own list instead when the parent wrote one (`WARM_LIST`).
     pub(super) fn index(dir: &Path) -> Index {
-        let file = std::fs::read(dir.join("pipelines.bin")).unwrap_or_default();
+        let list = std::env::var_os(WARM_LIST).map_or_else(|| dir.join("pipelines.bin"), PathBuf::from);
+        Self::index_at(dir, &list)
+    }
+
+    /// `index` of the list at `list`, its shaders in folder `dir`.
+    pub(super) fn index_at(dir: &Path, list: &Path) -> Index {
+        let file = std::fs::read(list).unwrap_or_default();
         let base = file.as_ptr() as usize;
         let mut at = HashMap::new();
         for e in entries(&file) {
@@ -435,6 +560,20 @@ impl Store {
 
     pub(super) fn recently_created(dir: &Path, count: std::num::NonZeroU32) -> std::io::Result<(std::ops::RangeInclusive<u32>, HashSet<u64>)> {
         Self::recently_in(dir, "created.bin", count)
+    }
+
+    /// The pipelines the last `count` runs bound (`note_bound`), each once, in the order of its
+    /// first bind in them (`bound.bin` is kept in bind order).
+    pub(super) fn bound_in_order(dir: &Path, count: std::num::NonZeroU32) -> Vec<u64> {
+        let last = Self::runs_in(dir);
+        let runs = last.saturating_sub(count.get() - 1).max(1)..=last;
+        let file = std::fs::read(dir.join("bound.bin")).unwrap_or_default();
+        let mut seen = HashSet::new();
+        file.chunks_exact(CREATED)
+            .filter(|e| runs.contains(&u32::from_le_bytes(e[16..].try_into().unwrap())))
+            .map(|e| u64::from_le_bytes(e[..8].try_into().unwrap()))
+            .filter(|&key| seen.insert(key))
+            .collect()
     }
 
     /// The pipelines the last `count` runs bound (`note_bound`); none before `bound.bin` was kept.
@@ -717,6 +856,20 @@ pub(super) fn note_bound(key: u64) {
     }
 }
 
+/// Where pipeline `key` comes in the order the runs of the last `STALE_AFTER_RUNS` first bound
+/// their pipelines (`Store::bound_in_order`; 0: the first), for the order the game builds the ones
+/// earlier runs used in (`pso_async::first_use`).
+pub(super) fn bound_order() -> &'static HashMap<u64, usize> {
+    static ORDER: OnceLock<HashMap<u64, usize>> = OnceLock::new();
+    ORDER.get_or_init(|| {
+        if cfg!(test) {
+            return HashMap::new();
+        }
+        let runs = std::num::NonZeroU32::new(STALE_AFTER_RUNS + 1).unwrap();
+        Store::bound_in_order(&dir(), runs).into_iter().enumerate().map(|(rank, key)| (key, rank)).collect()
+    })
+}
+
 /// An earlier run of the last `STALE_AFTER_RUNS` bound pipeline `key`.
 pub(super) fn bound_earlier(key: u64) -> bool {
     static EARLIER: OnceLock<HashSet<u64>> = OnceLock::new();
@@ -808,39 +961,44 @@ pub(super) struct Targets {
     pub keys: Vec<u64>,
     /// of `keys`, those with a measured wait (first)
     pub waited: usize,
-    /// of `keys`, those a run drew with otherwise
+    /// of `keys`, those the last runs bound, after the waited ones: with them the first tier
     pub drawn: usize,
+    /// of `keys`, the other pipelines of the shaders runs used, after the first tier
+    pub variants: usize,
     /// kept pipelines no run drew with: left for their first bind in a run, or `warm-up --full`
     pub left: usize,
 }
 
-/// The pipelines kept in `dir` that runs drew with, as `xcl warm-up --blocking` builds them:
-/// those whose bind a run of `min_run` on waited for, the longest wait first (`blocking_order`);
-/// then those the last `STALE_AFTER_RUNS` runs bound (`note_bound`) or whose shaders a run used
-/// or skipped a draw for (`used`: shader keys, `shaders_key`), the slowest measured first, the
-/// others in the order kept. The ones no run drew with are counted, not built.
-pub(super) fn blocking_targets(dir: &Path, text: &str, min_run: u32, used: &HashSet<u64>) -> Targets {
+/// The pipelines kept in `dir` that runs drew with, as `xcl warm-up --blocking` builds them. The
+/// first tier: those whose bind a run of `min_run` on waited for, the longest wait first
+/// (`blocking_order`), then the exact ones the last `bound_runs` runs bound (`note_bound`), in
+/// the order of their first bind. Then, with `variants`, the other pipelines of the shaders a run
+/// used or skipped a draw for (`used`: shader keys, `shaders_key`), the slowest measured first.
+/// The rest are counted, not built. The last six runs (play-109 to play-114) bound 2,133
+/// pipelines, while the shaders they used have 77,690: a pass of all of them first spent its hour
+/// on pipelines no run had bound.
+pub(super) fn blocking_targets(dir: &Path, text: &str, min_run: u32, used: &HashSet<u64>, bound_runs: std::num::NonZeroU32, variants: bool) -> Targets {
     let mut keys = blocking_order(text, Some(min_run));
     let waited = keys.len();
     let mut seen: HashSet<u64> = keys.iter().copied().collect();
-    let bound = Store::recently_bound(dir, std::num::NonZeroU32::new(STALE_AFTER_RUNS).unwrap());
     let file = std::fs::read(dir.join("pipelines.bin")).unwrap_or_default();
-    let (mut drawn, mut left) = (Vec::new(), 0);
+    let (mut kept, mut by_shader) = (HashSet::new(), Vec::new());
     for e in entries(&file) {
         let key = key_of(e);
-        if !seen.insert(key) {
-            continue;
-        }
-        if bound.contains(&key) || encoded_shaders_key(e).is_some_and(|k| used.contains(&k)) {
-            drawn.push(key);
-        } else {
-            left += 1;
+        if kept.insert(key) && encoded_shaders_key(e).is_some_and(|k| used.contains(&k)) {
+            by_shader.push(key);
         }
     }
-    drawn.sort_by_key(|&key| std::cmp::Reverse(slow_ms(key).unwrap_or(0)));
-    let n = drawn.len();
-    keys.extend(drawn);
-    Targets { keys, waited, drawn: n, left }
+    drop(file);
+    let bound: Vec<u64> = Store::bound_in_order(dir, bound_runs).into_iter().filter(|key| kept.contains(key) && seen.insert(*key)).collect();
+    let drawn = bound.len();
+    keys.extend(bound);
+    let mut others: Vec<u64> = by_shader.into_iter().filter(|key| seen.insert(*key)).collect();
+    others.sort_by_key(|&key| std::cmp::Reverse(slow_ms(key).unwrap_or(0)));
+    let n = if variants { others.len() } else { 0 };
+    keys.extend(others.into_iter().take(n));
+    let left = kept.len() - keys.iter().filter(|key| kept.contains(key)).count();
+    Targets { keys, waited, drawn, variants: n, left }
 }
 
 #[cfg(test)]
@@ -871,15 +1029,24 @@ mod tests {
         let run = store.begin_run(true).unwrap();
         store.bound(&mut None, bound.key(), 0, run).unwrap();
         let used_key = shaders_key(used.shaders.iter().map(|(_, s)| crate::gpu::shader::fnv64(s)));
-        let t = blocking_targets(&dir, &format!("{run} {:x} 900\n", waited.key()), run, &[used_key].into_iter().collect());
+        let three = std::num::NonZeroU32::new(3).unwrap();
+        let t = blocking_targets(&dir, &format!("{run} {:x} 900\n", waited.key()), run, &[used_key].into_iter().collect(), three, true);
         assert_eq!(t.keys, [waited.key(), bound.key(), used.key()]);
-        assert_eq!((t.waited, t.drawn, t.left), (1, 2, 1));
+        assert_eq!((t.waited, t.drawn, t.variants, t.left), (1, 1, 1, 1));
+        let t = blocking_targets(&dir, &format!("{run} {:x} 900\n", waited.key()), run, &[used_key].into_iter().collect(), three, false);
+        assert_eq!(t.keys, [waited.key(), bound.key()], "XCL_WARM_VARIANTS=0: the first tier alone");
+        assert_eq!((t.waited, t.drawn, t.variants, t.left), (1, 1, 0, 2));
+        // (the bound ones in the order of their first bind, each once)
+        store.bound(&mut None, neither.key(), 0, run).unwrap();
+        store.bound(&mut None, bound.key(), 0, run).unwrap();
+        assert_eq!(Store::bound_in_order(&dir, three), [bound.key(), neither.key()]);
         std::fs::remove_dir_all(dir).unwrap();
     }
 
     fn temp_dir(name: &str) -> PathBuf {
         let d = std::env::temp_dir().join(format!("xcl-pso-manifest-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).expect("a temporary folder for the manifest test");
         d
     }
 
@@ -926,6 +1093,10 @@ mod tests {
         assert_eq!(index.get(b.key()), Some(b.clone()));
         assert_eq!(Store::load_keys(&dir, &[a.key(), b.key()].into_iter().collect()).records.len(), 2);
         assert_eq!(index.get(a.key() ^ 2), None);
+        let subset = dir.join("subset.bin");
+        assert_eq!(write_subset(&dir, &[b.key()].into_iter().collect(), &subset).unwrap(), 1);
+        let small = Store::index_at(&dir, &subset);
+        assert_eq!((small.get(a.key()), small.get(b.key())), (None, Some(b.clone())), "a warm-up's own list holds its keys alone");
         std::fs::remove_file(shader_path(&dir, crate::gpu::shader::fnv64(b"compute shader"), b"compute shader".len() as u32)).unwrap();
         assert_eq!(index.get(b.key()), None, "a shader it names is missing");
         std::fs::remove_dir_all(dir).unwrap();
@@ -979,6 +1150,49 @@ mod tests {
             assert_eq!(keys_in(&path), whole(&torn));
             assert_eq!(keys_in(&path).len(), 2);
         }
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A key list spares reading the entries it covers, follows the list as it grows, and is
+    /// not used once the list's bytes are not the ones it was made of.
+    #[test]
+    fn a_key_list_spares_reading_the_entries_it_covers() {
+        let dir = temp_dir("key-list");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("pipelines.bin");
+        let entry = |shader: &[u8], name: &[u8]| {
+            let e = sample(Kind::Graphics, shader, name).encode();
+            let mut b = (e.len() as u32).to_le_bytes().to_vec();
+            b.extend_from_slice(&e);
+            b
+        };
+        let whole = |file: &[u8]| entries(file).into_iter().map(key_of).collect::<HashSet<u64>>();
+        let mut file = [entry(b"one", b"A"), entry(b"two", b"B")].concat();
+        std::fs::write(&path, &file).unwrap();
+        assert_eq!(keys_in(&path), whole(&file));
+        let list = |path: &Path| kept_keys(path, &std::fs::File::open(path).unwrap(), std::fs::metadata(path).unwrap().len());
+        assert_eq!(list(&path), Some((whole(&file), file.len() as u64)), "a key list of the whole list");
+        // (the list grows, a torn entry after it: the list covers the entries, not the tear)
+        let grown = file.len() as u64;
+        file.extend(entry(b"three", b"C"));
+        let covered = file.len() as u64;
+        file.extend_from_slice(&[9, 0, 0, 0, 1]);
+        std::fs::write(&path, &file).unwrap();
+        assert_eq!(keys_in(&path), whole(&file));
+        assert_eq!(keys_in(&path).len(), 3);
+        assert_eq!(list(&path).map(|l| l.1), Some(covered));
+        // (its keys are taken as they are: a key only the list holds comes back)
+        let mut fake = std::fs::read(keys_path(&path)).unwrap();
+        fake[24..32].copy_from_slice(&4u64.to_le_bytes());
+        fake.extend_from_slice(&0x1234_5678u64.to_le_bytes());
+        std::fs::write(keys_path(&path), &fake).unwrap();
+        assert!(keys_in(&path).contains(&0x1234_5678), "the keys come from the key list");
+        // (the list rewritten with other bytes, or cut short: the key list is not used)
+        let rewritten = [entry(b"four", b"D"), entry(b"five", b"E"), entry(b"six", b"F")].concat();
+        std::fs::write(&path, &rewritten).unwrap();
+        assert_eq!(keys_in(&path), whole(&rewritten));
+        std::fs::write(&path, &file[..grown as usize]).unwrap();
+        assert_eq!(keys_in(&path), whole(&file[..grown as usize]));
         let _ = std::fs::remove_dir_all(dir);
     }
 

@@ -85,11 +85,13 @@ impl Probe {
             let _ = writeln!(body, "{pad}    {}", super::loop_guard_line(em));
             return;
         }
-        let _ = writeln!(body, "{pad}    if (WaveActiveAnyTrue(xcl_budget == 0u)) {{ xcl_lp_exit = 1u; xcl_trip(0u); break; }}");
+        // the tests and the count of `LOOP_GUARD_WAVE` / `LOOP_GUARD`, as the program's other loops have them
+        let (test, end, spend) = if matches!(em.loop_budget, super::LoopBudget::Wave(_)) { ("WaveActiveAnyTrue(", ")", "xcl_budget -= min(xcl_budget, 1u);") } else { ("", "", "xcl_budget--;") };
+        let _ = writeln!(body, "{pad}    if ({test}xcl_budget == 0u{end}) {{ xcl_lp_exit = 1u; xcl_trip(0u); break; }}");
         if self.cap != 0 {
-            let _ = writeln!(body, "{pad}    if (WaveActiveAnyTrue(xcl_lp_n >= {}u)) {{ xcl_lp_exit = 2u; xcl_trip(0u); break; }}", self.cap);
+            let _ = writeln!(body, "{pad}    if ({test}xcl_lp_n >= {}u{end}) {{ xcl_lp_exit = 2u; xcl_trip(0u); break; }}", self.cap);
         }
-        let _ = writeln!(body, "{pad}    xcl_budget -= min(xcl_budget, 1u); xcl_lp_n++;");
+        let _ = writeln!(body, "{pad}    {spend} xcl_lp_n++;");
         if let Some(id) = self.id {
             let _ = writeln!(body, "{pad}    if ((xcl_lp_n & (xcl_lp_n - 1u)) == 0u) xcl_lp_pulse({id}u, {}u, xcl_lp_n);", self.pc + 1);
         }

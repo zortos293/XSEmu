@@ -67,12 +67,16 @@ fn program(f: Form, oracle: bool) -> Vec<u8> {
 }
 
 fn translate_cs(f: Form, oracle: bool) -> String {
+    translation(f, oracle).hlsl
+}
+
+fn translation(f: Form, oracle: bool) -> super::Translation {
     let [_, y, z] = f.threads;
     let cs = CsInterface { threads: f.threads, user_sgprs: 2, tgid: [true, false, false], tg_size: false, tid_components: if z > 1 { 3 } else if y > 1 { 2 } else { 1 } };
     let opt = Options { mode: Mode::Compute(cs), wave64: f.wave64, split_wave64: f.split, legacy_compute_wave64: f.legacy, thread_limits: !oracle, ..Default::default() };
     let t = translate(&program(f, oracle), &opt).unwrap();
     assert!(t.complete(), "{f:?}: {:?}", t.unsupported_why);
-    t.hlsl
+    t
 }
 
 fn load(hlsl: &str) -> interp::Program {
@@ -151,6 +155,31 @@ fn thread_limits_leave_the_threads_past_each_count_out_of_exec() {
         }
         for seed in 0..6 {
             assert!(run(&a, &b, seed, None).0, "{f:?}, seed {seed}\n{limited}");
+        }
+    }
+}
+
+/// The lane-independent form (`Options::lane_independent`) starts every thread as its own wave:
+/// the limits leave the same threads out of it as out of the wave forms, with no wave operation.
+#[test]
+fn the_lane_independent_form_keeps_the_thread_limits() {
+    for threads in [[64, 1, 1], [128, 1, 1], [8, 8, 1], [4, 4, 4]] {
+        let f = Form { wave64: true, split: true, legacy: false, threads, barrier: false };
+        super::LANE_INDEPENDENT.set(true);
+        let lone = translation(f, false);
+        super::LANE_INDEPENDENT.set(false);
+        assert!(lone.lane_independent, "{f:?}: the program keeps a wave form\n{}", lone.hlsl);
+        assert!(lone.hlsl.contains("xcl_tl") && !lone.hlsl.contains("WaveActive"), "{f:?}\n{}", lone.hlsl);
+        let oracle = translation(f, true);
+        assert!(!oracle.lane_independent);
+        let (a, b) = (load(&lone.hlsl), load(&oracle.hlsl));
+        for l in limits(f.threads) {
+            let (same, stored) = run(&a, &b, 1, Some(l));
+            assert!(same, "{f:?}, limits {l:?}\n{}", lone.hlsl);
+            assert_eq!(stored, started(f.threads, l), "{f:?}, limits {l:?}: words the oracle stored");
+        }
+        for seed in 0..6 {
+            assert!(run(&a, &b, seed, None).0, "{f:?}, seed {seed}\n{}", lone.hlsl);
         }
     }
 }

@@ -179,7 +179,7 @@ void AppSettings::setOverlayDefault(bool on) { write(Key::OverlayDefault, on); }
 
 QString AppSettings::steamGridDbKey() const { return read(Key::SteamGridDbKey).toString().trimmed(); }
 void AppSettings::setSteamGridDbKey(const QString& key) { write(Key::SteamGridDbKey, key.trimmed()); }
-bool AppSettings::artLookups() const { return read(Key::ArtLookups, false).toBool(); }
+bool AppSettings::artLookups() const { return read(Key::ArtLookups, true).toBool(); }
 void AppSettings::setArtLookups(bool on) { write(Key::ArtLookups, on); }
 
 QString AppSettings::defaultRunner() const { return read(Key::DefaultRunner, QStringLiteral("xsemu")).toString(); }

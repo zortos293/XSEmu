@@ -5,6 +5,7 @@
 
 #include <QWidget>
 
+class ArtworkCard;
 class Badge;
 class Button;
 class DetailsHero;
@@ -16,10 +17,11 @@ class SegmentedControl;
 class Services;
 class Toggle;
 
-// Game details (Game details page): the hero band with cover, title and play record; the action bar
-// (Play / Warm up, shader state, Open folder, more); and five cards: the game's facts, the shader
-// cache as far as the launcher can tell, the last run, per-game overrides that write the title's
-// own xcl.toml (or the launcher's per-game settings), and the game's own run profile when it has one.
+// Game details (Game details page): the hero band with cover, title (or the game's logo) and play
+// record; the action bar (Play / Warm up, shader state, Open folder, more); and six cards: the game's
+// facts, the shader cache as far as the launcher can tell, the last run, its artwork (ArtworkCard),
+// per-game overrides that write the title's own xcl.toml (or the launcher's per-game settings), and
+// the game's own run profile when it has one.
 // Reached from a cover tile; Back returns.
 class GameDetailsPage : public QWidget {
     Q_OBJECT
@@ -55,6 +57,7 @@ private:
     InfoCard* m_gameCard;
     InfoCard* m_cacheCard;
     InfoCard* m_runCard;
+    ArtworkCard* m_artCard;
     InfoCard* m_overrides;
     Label* m_overridesNote;
     InfoCard* m_profileCard;

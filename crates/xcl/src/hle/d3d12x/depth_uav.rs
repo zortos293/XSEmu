@@ -31,14 +31,28 @@
 //! compute list cannot draw: the copy back by a pass that it owes is made by the next direct
 //! list that names the depth buffer in a transition.
 //!
-//! Left as null views: the stencil plane and multisampled depth buffers.
+//! Left as null views: multisampled depth buffers. The stencil plane has a shadow of its own
+//! (`stencil`, `XCL_STENCIL_UAV=0`: null views as before).
+//!
+//! A title that never moves its depth buffers to or from UNORDERED_ACCESS (on the console the
+//! two are one memory, so it need not) has them kept in step by use as well
+//! (`XCL_DEPTH_UAV_SYNC`, on by default; `=0`: at those transitions only), as VICTORY does
+//! (crates/victory-gpu/src/host.rs `twin_use`): a draw or dispatch whose unordered access
+//! tables name a shadow leaves it ahead of its depth plane, and a draw with the depth buffer as
+//! its depth target (not a read-only one), a clear or a copy into it leaves the plane ahead. The
+//! side a command uses is first copied from the other when that is ahead, as at a transition of
+//! the depth buffer, and what a list still has ahead when it closes is copied then, for the lists
+//! after it, which may read the depth buffer through views XCL does not see. A copy needs the
+//! state each of the plane's subresources is in on the list (its transitions, depth target,
+//! clears and copies say it): until it is known the copy waits for a later use, on a later list
+//! too (a list that closes leaves the side ahead with the shadow). Bundles take no part.
 //!
 //! `XCL_DEPTH_UAV_TWIN=0` (upstream's name): no shadows, null views as before.
 
 use std::collections::HashMap;
 use std::collections::hash_map::Entry;
 use std::ffi::c_void;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 
 use windows::core::Interface;
@@ -49,6 +63,8 @@ use windows::Win32::Graphics::Dxgi::Common::*;
 use super::depth_lineage;
 use super::depth_state::{self, Range};
 use super::real;
+
+mod stencil;
 
 const ALL: u32 = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
 const UNORDERED_ACCESS: u32 = D3D12_RESOURCE_STATE_UNORDERED_ACCESS.0 as u32;
@@ -123,6 +139,8 @@ pub(super) struct Shadow {
     /// a copy back was recorded: the title drew or dispatched while it had the depth buffer
     /// in unordered access
     written: AtomicBool,
+    /// the side a list that closed left ahead of the other (`Ahead`, `XCL_DEPTH_UAV_SYNC`)
+    ahead: AtomicU8,
 }
 
 // D3D12 resources and descriptor heaps are free-threaded
@@ -183,6 +201,9 @@ static COPIES_OUT: AtomicU64 = AtomicU64::new(0);
 static COPIES_OUT_LEFT_OUT: AtomicU64 = AtomicU64::new(0);
 static COPIES_OWED: AtomicU64 = AtomicU64::new(0);
 static WRITTEN: AtomicU64 = AtomicU64::new(0);
+static USE_OUT: AtomicU64 = AtomicU64::new(0);
+static USE_IN: AtomicU64 = AtomicU64::new(0);
+static USE_LEFT: AtomicU64 = AtomicU64::new(0);
 
 /// What was counted so far.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -202,6 +223,11 @@ pub struct Counts {
     /// depth buffers whose shadow was copied back at least once: the title drew or dispatched
     /// while it had them in unordered access (whether a shader stored to them is not known)
     pub written: u64,
+    /// copies by use (`XCL_DEPTH_UAV_SYNC`): shadow → depth, depth → shadow, and sides lists
+    /// left ahead when they closed (for the lists after them)
+    pub by_use_out: u64,
+    pub by_use_in: u64,
+    pub by_use_left: u64,
 }
 
 pub fn counts() -> Counts {
@@ -216,19 +242,23 @@ pub fn counts() -> Counts {
         copies_out_left_out: c(&COPIES_OUT_LEFT_OUT),
         copies_owed: c(&COPIES_OWED),
         written: c(&WRITTEN),
+        by_use_out: c(&USE_OUT),
+        by_use_in: c(&USE_IN),
+        by_use_left: c(&USE_LEFT),
     }
 }
 
 fn log_counts(why: &str) {
     let c = counts();
     crate::xlog_info!(
-        "D3D12.X: depth buffers with unordered access ({why}): {} views made ({} left null), {} shadow textures, {} of them written back (draws or dispatches ran while the title had them in unordered access); copied to the shadow {} times ({} not needed), back {} times ({} not needed, {} left to a direct list)",
-        c.views, c.null_views, c.shadows, c.written, c.copies_in, c.copies_in_left_out, c.copies_out, c.copies_out_left_out, c.copies_owed
+        "D3D12.X: depth buffers with unordered access ({why}): {} views made ({} left null), {} shadow textures, {} of them written back (draws or dispatches ran while the title had them in unordered access); copied to the shadow {} times ({} not needed), back {} times ({} not needed, {} left to a direct list); by use: into the plane {} times, into the shadow {} times, {} left to a later list",
+        c.views, c.null_views, c.shadows, c.written, c.copies_in, c.copies_in_left_out, c.copies_out, c.copies_out_left_out, c.copies_owed, c.by_use_out, c.by_use_in, c.by_use_left
     );
 }
 
 /// Every 300 frames the title presents (`present`): the counts, when they changed.
 pub(super) fn log_frame() {
+    stencil::log_frame();
     if !active() {
         return;
     }
@@ -472,6 +502,7 @@ unsafe fn make(res: *mut c_void, rd: &D3D12_RESOURCE_DESC) -> Result<Shadow, Str
             exact: rd.Format == typeless,
             owed: Mutex::new(Vec::new()),
             written: AtomicBool::new(false),
+            ahead: AtomicU8::new(Ahead::Neither as u8),
         })
     })
 }
@@ -479,6 +510,7 @@ unsafe fn make(res: *mut c_void, rd: &D3D12_RESOURCE_DESC) -> Result<Shadow, Str
 /// The depth buffer `res` is gone (its last reference released).
 pub(super) fn forget(res: usize) {
     depth_lineage::forget(res);
+    stencil::forget(res);
     if !active() {
         return;
     }
@@ -487,6 +519,9 @@ pub(super) fn forget(res: usize) {
         if let Some(d) = SLOT146.lock().unwrap().as_mut() {
             d.samples.remove(&res);
         }
+    }
+    if let Some(m) = DSVS.lock().unwrap().as_mut() {
+        m.retain(|_, d| d.depth != res);
     }
     drop(gone);
 }
@@ -530,6 +565,11 @@ pub(super) unsafe fn view(
         let (mips, slices) = (u32::from(rd.MipLevels), u32::from(rd.DepthOrArraySize));
         if mip < mips && count != 0 && slice.checked_add(count).is_some_and(|end| end <= slices) {
             view_range = Range::Rect { ranges: [(mip, 1), (slice, count), (if stencil { 1 } else { plane }, 1)], mips, slices };
+        }
+    }
+    if stencil {
+        if let Some(v) = stencil::view(res, rd, desc) {
+            return Some(v);
         }
     }
     let made = (|| {
@@ -596,6 +636,8 @@ pub(super) unsafe fn view(
 struct Recording {
     ops: u64,
     in_step: Vec<(usize, u32, u64)>,
+    /// what it did with each shadow it used (`XCL_DEPTH_UAV_SYNC`)
+    uses: Vec<Use>,
 }
 
 static RECORDINGS: Mutex<Option<HashMap<usize, Recording>>> = Mutex::new(None);
@@ -630,10 +672,7 @@ fn in_step(list: *mut c_void, res: usize, sub: u32) -> bool {
 
 fn mark_in_step(list: *mut c_void, res: usize, sub: u32) {
     let mut g = RECORDINGS.lock().unwrap();
-    let r = g.get_or_insert_with(HashMap::new).entry(list as usize).or_insert_with(|| {
-        RECORDING.fetch_add(1, Ordering::AcqRel);
-        Recording::default()
-    });
+    let r = recording(&mut g, list);
     let ops = r.ops;
     r.in_step.retain(|&(d, s, at)| at == ops && !(d == res && (s == sub || sub == ALL)));
     r.in_step.push((res, sub, ops));
@@ -649,6 +688,7 @@ pub(super) unsafe extern "system" fn pc_dispatch(this: *mut c_void, x: u32, y: u
 
 /// PC `ClearDepthStencilView` of an adopted list.
 pub(super) unsafe extern "system" fn pc_clear_depth_stencil(this: *mut c_void, dsv: usize, flags: u32, depth: f32, stencil: u8, n: u32, rects: *const RECT) {
+    on_clear(this, dsv, flags);
     note_op(this);
     let f = raw::<unsafe extern "system" fn(*mut c_void, usize, u32, f32, u8, u32, *const RECT)>(this, CLEAR_DEPTH_STENCIL_VIEW);
     super::gpu_timing::class(this, super::gpu_timing::Kind::Clear, || f(this, dsv, flags, depth, stencil, n, rects));
@@ -978,17 +1018,47 @@ pub(super) struct Later {
     runs: Vec<(u32, u32, u32)>,
 }
 
+/// The title's transition `b` on `list` (`transition_uav`), with what it says of the state a
+/// depth buffer with a shadow is in (`XCL_DEPTH_UAV_SYNC`): the depth plane is used before it –
+/// a shadow ahead of it is copied into it first – and is in the state after it then.
+pub(super) unsafe fn on_transition(list: *mut c_void, b: &mut [u32; 8], later: &mut Vec<Later>) -> bool {
+    let res = (b[2] as u64 | (b[3] as u64) << 32) as usize;
+    let (sub, before, after) = (b[4], pc_state(b[5]), pc_state(b[6]));
+    let begin = b[1] & D3D12_RESOURCE_BARRIER_FLAG_BEGIN_ONLY.0 as u32 != 0;
+    let names_uav = (b[5] | b[6]) & UNORDERED_ACCESS != 0;
+    let shadow = if res != 0 && sync() { known(res).flatten() } else { None };
+    if let Some(s) = shadow.as_ref().filter(|_| !names_uav && !begin) {
+        use_side(list, res, s, Side::Plane, false, &plane_subs(s, sub), Some(before));
+    }
+    let kept = transition_uav(list, b, later);
+    if let Some(s) = &shadow {
+        let state = if begin { UNKNOWN } else { after };
+        let mut g = RECORDINGS.lock().unwrap();
+        let u = recording(&mut g, list).use_of(res, s);
+        for k in plane_subs(s, sub) {
+            if let Some(x) = u.states.get_mut(k as usize) {
+                *x = state;
+            }
+        }
+        if names_uav && !begin {
+            u.ahead = Ahead::Neither;
+        }
+    }
+    kept
+}
+
 /// The title's transition `b` (PC state bits only) on `list`, when it names UNORDERED_ACCESS or
 /// depth buffers have shadows: for a depth buffer with a shadow the states become the PC's
 /// (`pc_state`), a copy back to the depth plane is recorded now – before the barrier – and a copy
 /// to the shadow is left in `later`. False: the barrier is dropped.
-pub(super) unsafe fn on_transition(list: *mut c_void, b: &mut [u32; 8], later: &mut Vec<Later>) -> bool {
+unsafe fn transition_uav(list: *mut c_void, b: &mut [u32; 8], later: &mut Vec<Later>) -> bool {
     let res = (b[2] as u64 | (b[3] as u64) << 32) as usize;
     let (before, after) = (b[5], b[6]);
     let names_uav = (before | after) & UNORDERED_ACCESS != 0;
     if res == 0 {
         return true;
     }
+    stencil::on_transition(list, res, b);
     let list_key = list as usize;
     let sub = b[4];
     let flags = b[1];
@@ -1170,6 +1240,370 @@ pub(super) unsafe fn after_barriers(list: *mut c_void, later: Vec<Later>) {
             }
             note_copy();
         }
+    }
+}
+
+// ---------------------------------------------------------------------------------------
+// in step by use (`XCL_DEPTH_UAV_SYNC`)
+// ---------------------------------------------------------------------------------------
+
+/// Whether shadows are also kept in step by use (`XCL_DEPTH_UAV_SYNC=0`: only at the title's
+/// transitions to and from UNORDERED_ACCESS).
+fn sync() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| !std::env::var("XCL_DEPTH_UAV_SYNC").is_ok_and(|v| v.trim() == "0"))
+}
+
+/// Which side of a shadow holds what the other lacks.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum Ahead {
+    #[default]
+    Neither = 0,
+    Shadow = 1,
+    Plane = 2,
+}
+
+impl Ahead {
+    fn of(v: u8) -> Self {
+        match v {
+            1 => Self::Shadow,
+            2 => Self::Plane,
+            _ => Self::Neither,
+        }
+    }
+}
+
+/// The side of a shadow a command uses: the shadow, or the depth plane.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Side {
+    Shadow,
+    Plane,
+}
+
+impl Side {
+    /// Whether a use of this side needs the other copied into it first.
+    fn behind(self, ahead: Ahead) -> bool {
+        matches!((self, ahead), (Side::Shadow, Ahead::Plane) | (Side::Plane, Ahead::Shadow))
+    }
+
+    /// The side ahead after a use of this side that changes it (`write`) or not, the copy it
+    /// needed first made (`copied`) or not.
+    fn after(self, ahead: Ahead, write: bool, copied: bool) -> Ahead {
+        match (write, self) {
+            (true, Side::Shadow) => Ahead::Shadow,
+            (true, Side::Plane) => Ahead::Plane,
+            (false, _) if copied => Ahead::Neither,
+            (false, _) => ahead,
+        }
+    }
+}
+
+/// a depth plane subresource whose state on a list is not known
+const UNKNOWN: u32 = u32::MAX;
+
+/// What one recording did with one shadow: the side it left ahead, and the state each of the
+/// depth plane's subresources is in on it (`UNKNOWN`).
+struct Use {
+    depth: usize,
+    shadow: Arc<Shadow>,
+    ahead: Ahead,
+    states: Vec<u32>,
+}
+
+impl Recording {
+    /// What the recording did with the shadow `s` of `depth`; at its first use, the side a list
+    /// that closed before it left ahead.
+    fn use_of(&mut self, depth: usize, s: &Arc<Shadow>) -> &mut Use {
+        let i = match self.uses.iter().position(|u| u.depth == depth && Arc::ptr_eq(&u.shadow, s)) {
+            Some(i) => i,
+            None => {
+                self.uses.push(Use {
+                    depth,
+                    shadow: s.clone(),
+                    ahead: Ahead::of(s.ahead.load(Ordering::Relaxed)),
+                    states: vec![UNKNOWN; (s.mips * s.slices) as usize],
+                });
+                self.uses.len() - 1
+            }
+        };
+        &mut self.uses[i]
+    }
+}
+
+/// The recording of `list` in `RECORDINGS`, begun now if it has none.
+fn recording(g: &mut Option<HashMap<usize, Recording>>, list: *mut c_void) -> &mut Recording {
+    g.get_or_insert_with(HashMap::new).entry(list as usize).or_insert_with(|| {
+        RECORDING.fetch_add(1, Ordering::AcqRel);
+        Recording::default()
+    })
+}
+
+/// The depth plane's subresource indices of the title's subresource index `sub` (all for ALL).
+fn plane_subs(s: &Shadow, sub: u32) -> Vec<u32> {
+    s.parts(sub).iter().map(|&(m, sl)| m + sl * s.mips).collect()
+}
+
+/// A depth-stencil view the title made: of which depth buffer, its subresources, and whether
+/// it only reads the depth plane.
+#[derive(Clone, Copy)]
+struct Dsv {
+    depth: usize,
+    mip: u32,
+    first: u32,
+    count: u32,
+    read_only: bool,
+}
+
+impl Dsv {
+    /// The depth plane's subresources the view names, of a depth buffer with the shadow `s`.
+    fn subs(&self, s: &Shadow) -> Vec<u32> {
+        if self.mip >= s.mips {
+            return Vec::new();
+        }
+        (self.first..self.first.saturating_add(self.count).min(s.slices)).map(|sl| self.mip + sl * s.mips).collect()
+    }
+}
+
+/// depth-stencil view handle → the view (`XCL_DEPTH_UAV_SYNC`)
+static DSVS: Mutex<Option<HashMap<usize, Dsv>>> = Mutex::new(None);
+
+fn dsv_view(handle: usize) -> Option<Dsv> {
+    DSVS.lock().unwrap().as_ref()?.get(&handle).copied()
+}
+
+/// The title makes the depth-stencil view `desc` (None: the default one) of `res` at `handle`
+/// (`real::dev_create_dsv_x`).
+pub(super) unsafe fn note_dsv(handle: usize, res: *mut c_void, desc: Option<&D3D12_DEPTH_STENCIL_VIEW_DESC>) {
+    if !sync() {
+        return;
+    }
+    let view = (|| {
+        let rd = ID3D12Resource::from_raw_borrowed(&res)?.GetDesc();
+        let (mip, first, count) = match desc {
+            None => (0, 0, u32::from(rd.DepthOrArraySize)),
+            Some(d) => match d.ViewDimension {
+                D3D12_DSV_DIMENSION_TEXTURE1D => (d.Anonymous.Texture1D.MipSlice, 0, 1),
+                D3D12_DSV_DIMENSION_TEXTURE2D => (d.Anonymous.Texture2D.MipSlice, 0, 1),
+                D3D12_DSV_DIMENSION_TEXTURE1DARRAY => {
+                    let v = d.Anonymous.Texture1DArray;
+                    (v.MipSlice, v.FirstArraySlice, v.ArraySize)
+                }
+                D3D12_DSV_DIMENSION_TEXTURE2DARRAY => {
+                    let v = d.Anonymous.Texture2DArray;
+                    (v.MipSlice, v.FirstArraySlice, v.ArraySize)
+                }
+                _ => return None,
+            },
+        };
+        let read_only = desc.is_some_and(|d| d.Flags.0 & D3D12_DSV_FLAG_READ_ONLY_DEPTH.0 != 0);
+        Some(Dsv { depth: res as usize, mip, first, count, read_only })
+    })();
+    let mut g = DSVS.lock().unwrap();
+    let m = g.get_or_insert_with(HashMap::new);
+    match view {
+        Some(v) => {
+            m.insert(handle, v);
+        }
+        None => {
+            m.remove(&handle);
+        }
+    }
+}
+
+unsafe fn list_type(list: *mut c_void) -> D3D12_COMMAND_LIST_TYPE {
+    raw::<unsafe extern "system" fn(*mut c_void) -> D3D12_COMMAND_LIST_TYPE>(list, GET_TYPE)(list)
+}
+
+/// Records on `list` (of type `ty`) the copy of the shadow `s` into the depth plane of `depth`
+/// (`to` the plane) or of the plane into the shadow, the plane's subresources moved from their
+/// `states` to the state the copy needs and back.
+unsafe fn copy_to(list: *mut c_void, ty: D3D12_COMMAND_LIST_TYPE, depth: usize, s: &Shadow, to: Side, states: &[u32]) -> Result<(), &'static str> {
+    if states.contains(&UNKNOWN) {
+        return Err("depth-state-unknown");
+    }
+    if to == Side::Plane && !s.exact && ty != D3D12_COMMAND_LIST_TYPE_DIRECT {
+        return Err("deferred-non-direct-list");
+    }
+    let held = if to == Side::Plane { out_state(s) } else { SHADER_READ };
+    let moves = |there: bool| -> Vec<[u32; 8]> {
+        states
+            .iter()
+            .enumerate()
+            .filter(|&(_, &st)| st != held)
+            .map(|(k, &st)| if there { transition(depth, k as u32, st, held) } else { transition(depth, k as u32, held, st) })
+            .collect()
+    };
+    let (go, back) = (moves(true), moves(false));
+    if !go.is_empty() {
+        barriers(list, &go);
+    }
+    let copied = match to {
+        Side::Plane => copy_out(list, s, depth, &s.parts(ALL)),
+        Side::Shadow if s.exact => copy_in_exact(list, s, depth, ALL),
+        Side::Shadow => copy_in(list, s, &s.runs(ALL)),
+    };
+    if !back.is_empty() {
+        barriers(list, &back);
+    }
+    copied?;
+    let counter = if to == Side::Plane { &USE_OUT } else { &USE_IN };
+    counter.fetch_add(1, Ordering::Relaxed);
+    static TOLD: AtomicBool = AtomicBool::new(false);
+    if !TOLD.swap(true, Ordering::Relaxed) {
+        crate::xlog_info!("D3D12.X: depth-UAV shadows kept in step by use (XCL_DEPTH_UAV_SYNC=0: only at UNORDERED_ACCESS transitions)");
+    }
+    note_copy();
+    Ok(())
+}
+
+/// A command about to be recorded on `list` uses `side` of the shadow `s` of `depth`, changing
+/// it (`write`) or not; for it the depth plane's subresources `subs` are in `state` (None: as
+/// the list left them). The side used is first copied from the other when that is ahead.
+unsafe fn use_side(list: *mut c_void, depth: usize, s: &Arc<Shadow>, side: Side, write: bool, subs: &[u32], state: Option<u32>) {
+    let ty = list_type(list);
+    if !matches!(ty, D3D12_COMMAND_LIST_TYPE_DIRECT | D3D12_COMMAND_LIST_TYPE_COMPUTE) {
+        return;
+    }
+    let states = {
+        let mut g = RECORDINGS.lock().unwrap();
+        let u = recording(&mut g, list).use_of(depth, s);
+        if let Some(st) = state {
+            for &k in subs {
+                if let Some(x) = u.states.get_mut(k as usize) {
+                    *x = st;
+                }
+            }
+        }
+        side.behind(u.ahead).then(|| u.states.clone())
+    };
+    let copied = states.is_some_and(|st| copy_to(list, ty, depth, s, side, &st).is_ok());
+    if copied {
+        mark_in_step(list, depth, ALL);
+    }
+    let mut g = RECORDINGS.lock().unwrap();
+    let u = recording(&mut g, list).use_of(depth, s);
+    u.ahead = side.after(u.ahead, write, copied);
+}
+
+/// The depth buffers with shadows whose unordered access views the tables of `layout` name in
+/// `args` (the first 64 views).
+fn named_shadows(layout: &super::console_list::Layout, args: &[u8]) -> Vec<(usize, Arc<Shadow>)> {
+    let mut out: Vec<(usize, Arc<Shadow>)> = Vec::new();
+    let mut left = 64u32;
+    for b in &layout.uavs {
+        let super::console_list::UavBinding::Table { at, first, count, .. } = *b else { continue };
+        let Some(t) = args.get(at as usize..at as usize + 4).map(|w| u32::from_le_bytes(w.try_into().unwrap())) else { continue };
+        if t == 0 {
+            continue;
+        }
+        let n = count.min(left);
+        left -= n;
+        for k in 0..n {
+            let addr = t.wrapping_add(super::console_heap::SLOT.wrapping_mul(first.wrapping_add(k)));
+            let Some(w) = super::console_heap::words_at(addr) else { break };
+            if w[3] >> 28 < 8 {
+                continue;
+            }
+            let Some(res) = super::console_heap::image_resource_at(addr, w[0]) else { continue };
+            if out.iter().any(|(d, _)| *d == res) {
+                continue;
+            }
+            if let Some(Some(s)) = known(res) {
+                out.push((res, s));
+            }
+        }
+        if left == 0 {
+            break;
+        }
+    }
+    out
+}
+
+/// A draw (`graphics`) or dispatch about to be bound on `list` with the root arguments `args`
+/// of `layout` (`bind::bind_abi`): it writes the shadows its unordered access tables name, and a
+/// draw uses the depth plane of its depth target (writes it, but through a read-only view).
+pub(super) unsafe fn before_op(list: *mut c_void, graphics: bool, layout: Option<&super::console_list::Layout>, args: &[u8]) {
+    if !active() || !sync() {
+        return;
+    }
+    if graphics {
+        if let Some(d) = super::list_x::bound_dsv(list).and_then(dsv_view) {
+            if let Some(Some(s)) = known(d.depth) {
+                use_side(list, d.depth, &s, Side::Plane, !d.read_only, &d.subs(&s), (!d.read_only).then_some(DEPTH_WRITE));
+            }
+        }
+    }
+    let Some(layout) = layout else { return };
+    for (depth, s) in named_shadows(layout, args) {
+        use_side(list, depth, &s, Side::Shadow, true, &[], None);
+    }
+}
+
+/// The title clears the depth-stencil view `handle` on `list` (`flags` 1: the depth plane).
+pub(super) unsafe fn on_clear(list: *mut c_void, handle: usize, flags: u32) {
+    if !active() || !sync() || flags & 1 == 0 {
+        return;
+    }
+    let Some(d) = dsv_view(handle) else { return };
+    let Some(Some(s)) = known(d.depth) else { return };
+    use_side(list, d.depth, &s, Side::Plane, true, &d.subs(&s), Some(DEPTH_WRITE));
+}
+
+/// The title copies (or resolves) subresource `src_sub` of `src` into `dst_sub` of `dst` on
+/// `list` (ALL: whole resources; 0 for no texture).
+pub(super) unsafe fn on_copy(list: *mut c_void, dst: usize, dst_sub: u32, src: usize, src_sub: u32) {
+    if !active() || !sync() {
+        return;
+    }
+    for (res, sub, write, state) in [(src, src_sub, false, COPY_SOURCE), (dst, dst_sub, true, COPY_DEST)] {
+        if res == 0 {
+            continue;
+        }
+        if let Some(Some(s)) = known(res) {
+            use_side(list, res, &s, Side::Plane, write, &plane_subs(&s, sub), Some(state));
+        }
+    }
+}
+
+/// `on_copy` for CopyTextureRegion's locations (a footprint names no texture).
+pub(super) unsafe fn on_copy_region(list: *mut c_void, dst: *const D3D12_TEXTURE_COPY_LOCATION, src: *const D3D12_TEXTURE_COPY_LOCATION) {
+    if !active() || !sync() {
+        return;
+    }
+    let at = |l: *const D3D12_TEXTURE_COPY_LOCATION| match l.as_ref() {
+        Some(l) if l.Type == D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX => (std::mem::transmute_copy::<_, usize>(&l.pResource), l.Anonymous.SubresourceIndex),
+        _ => (0, 0),
+    };
+    let ((d, ds), (s, ss)) = (at(dst), at(src));
+    on_copy(list, d, ds, s, ss);
+}
+
+/// `list` is about to close: the side of a shadow it left ahead of the other is copied into the
+/// other where it can be, and what is still ahead is left with the shadow for the lists after it.
+pub(super) unsafe fn before_close(list: *mut c_void) {
+    if !active() || !sync() || RECORDING.load(Ordering::Acquire) == 0 {
+        return;
+    }
+    let uses = RECORDINGS.lock().unwrap().as_mut().and_then(|m| m.get_mut(&(list as usize))).map(|r| std::mem::take(&mut r.uses)).unwrap_or_default();
+    if uses.is_empty() {
+        return;
+    }
+    let ty = list_type(list);
+    let records = matches!(ty, D3D12_COMMAND_LIST_TYPE_DIRECT | D3D12_COMMAND_LIST_TYPE_COMPUTE);
+    for u in uses {
+        let to = match u.ahead {
+            Ahead::Neither => None,
+            Ahead::Shadow => Some(Side::Plane),
+            Ahead::Plane => Some(Side::Shadow),
+        };
+        let ahead = match to {
+            Some(to) if records && copy_to(list, ty, u.depth, &u.shadow, to, &u.states).is_ok() => Ahead::Neither,
+            _ => u.ahead,
+        };
+        if ahead != Ahead::Neither {
+            USE_LEFT.fetch_add(1, Ordering::Relaxed);
+        }
+        u.shadow.ahead.store(ahead as u8, Ordering::Relaxed);
     }
 }
 
@@ -1441,6 +1875,22 @@ mod tests {
     /// put resources that are not there into the video memory records: `VRAM_TEST_LOCK`, which
     /// reading a texture back goes through)
     static GPU: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn a_use_takes_the_side_ahead_first_and_leaves_its_own_ahead_when_it_writes() {
+        assert!(Side::Shadow.behind(Ahead::Plane));
+        assert!(Side::Plane.behind(Ahead::Shadow));
+        assert!(!Side::Plane.behind(Ahead::Plane));
+        assert!(!Side::Shadow.behind(Ahead::Neither));
+        assert_eq!(Side::Shadow.after(Ahead::Plane, true, true), Ahead::Shadow);
+        assert_eq!(Side::Plane.after(Ahead::Shadow, true, true), Ahead::Plane);
+        assert_eq!(Side::Plane.after(Ahead::Shadow, false, true), Ahead::Neither);
+        assert_eq!(Side::Plane.after(Ahead::Shadow, false, false), Ahead::Shadow, "a copy not made leaves the shadow ahead");
+        assert_eq!(Side::Shadow.after(Ahead::Neither, false, false), Ahead::Neither);
+        for a in [Ahead::Neither, Ahead::Shadow, Ahead::Plane] {
+            assert_eq!(Ahead::of(a as u8), a);
+        }
+    }
 
     #[test]
     fn states_formats_and_subresources() {

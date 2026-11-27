@@ -43,6 +43,11 @@ struct State {
     /// the next dispatch's thread limits (io[`IO_THREAD_LIMIT`]: a `DispatchX` with thread
     /// dimensions), taken by the next compute `abi_views` so every other one gets 0
     limits: [u32; 3],
+    /// the next dispatch's group spread (io[`IO_GROUP_SPREAD`]: one past 65,535 groups on an axis),
+    /// taken by the next compute `abi_views` as `limits` is
+    spread: [u32; 2],
+    /// the descriptor tables bound in this recording (`recordings_live`)
+    tables: super::console_heap::Tables,
 }
 
 static STATES: Mutex<Option<HashMap<usize, State>>> = Mutex::new(None);
@@ -185,6 +190,7 @@ pub(super) fn reset(list: *mut c_void, allocator: usize, initial_pso: usize) {
         s.layout_gfx = None;
         s.args_gfx.clear();
         s.rs_gfx = 0;
+        s.tables.clear();
         (old, std::mem::take(&mut s.uma))
     });
     console_list::hold_until_reset(old, blocks);
@@ -339,13 +345,14 @@ pub(super) unsafe fn translated_indirect(this: *mut c_void, pso: usize, root: us
     io[IO_CARRY_AT] = carry_watch();
     (io[IO_TRIP_WINDOW], io[IO_TRIP_AT]) = trip_watch(this, with(this, |s| s.pso), pso, false);
     let mut owners: Vec<Lease> = Vec::new();
-    let (rows, reads) = recipe
+    let (mut rows, reads) = recipe
         .prebuilt_translated(pso, guest_root, arguments, &io, |_| false, |op, page| {
             let (meta, lease) = live::fallback(&op.resource, op.guest_address?, op.native_offset, page)?;
             owners.push(lease);
             Some(meta)
         })
         .ok_or("no proven rows for the signature or no GPU gather of its arguments and count")?;
+    rows.spread = indirect_spread(with(this, |s| s.pso), pso);
     if recipe.max == 0 {
         rows.reset_arguments(arguments);
         return Ok(());
@@ -455,13 +462,39 @@ fn put(list: *mut c_void, i: u32, offset: u32, bytes: &[u8]) {
 
 /// The descriptor table at console address `addr` is bound as parameter `i`: the heap pages
 /// it reaches by the root signature are in use (`console_heap::table_bound`; no root signature:
-/// to the heap's end).
+/// to the heap's end), and the recording keeps the table for as long as it can run
+/// (`recordings_live`) – from the start, so that a recording older than the following of tables
+/// is known as well.
 fn table_bound(list: *mut c_void, gfx: bool, i: u32, addr: u32) {
-    if !super::console_heap::tables_followed() {
+    let keeping = super::console_heap::keeping();
+    if !keeping && !super::console_heap::tables_followed() {
         return;
     }
-    let slots = with(list, |s| (if gfx { &s.layout_gfx } else { &s.layout }).as_ref().and_then(|l| l.tables.get(i as usize).copied()));
-    super::console_heap::table_bound(addr, slots.unwrap_or(u32::MAX));
+    let slots = with(list, |s| {
+        let slots = (if gfx { &s.layout_gfx } else { &s.layout }).as_ref().and_then(|l| l.tables.get(i as usize).copied()).unwrap_or(u32::MAX);
+        if keeping {
+            s.tables.note(addr, slots);
+        }
+        slots
+    });
+    super::console_heap::table_bound(addr, slots);
+}
+
+/// Lists go to a queue: once a frame (`console_heap::recordings_due`), the pages that the
+/// tables of every recording alive reach – the title's lists and bundles here, the console
+/// lists' (`console_list::tables_live`) – are in use (`console_heap::recordings_live`).
+pub(super) fn recordings_live() {
+    if !super::console_heap::recordings_due() {
+        return;
+    }
+    let (mut all, mut recordings) = console_list::tables_live();
+    if let Some(m) = STATES.lock().unwrap().as_ref() {
+        for s in m.values().filter(|s| !s.tables.is_empty()) {
+            all.join(&s.tables);
+            recordings += 1;
+        }
+    }
+    super::console_heap::recordings_live(&all, recordings);
 }
 
 /// #34 SetGraphicsRootSignature (PC #30)
@@ -1358,7 +1391,7 @@ fn note_target_dump(list: *mut c_void, kind: &'static str) {
         super::gpu_timing_stats::shaders(pso).map_or_else(String::new, |(vs, ps)| format!("vs {vs:016x} ps {ps:016x}"))
     };
     let (viewport, scissor) = if compute { (None, None) } else { super::list_x::viewport_scissor(list as usize) };
-    unsafe { super::target_dump::after_pass(list, &writes, || format!("{kind} of pipeline {pso:#x}{}{shaders}", if shaders.is_empty() { "" } else { " " })) };
+    unsafe { super::target_dump::after_pass(list, with(list, |s| s.allocator), &writes, || format!("{kind} of pipeline {pso:#x}{}{shaders}", if shaders.is_empty() { "" } else { " " })) };
     super::target_dump::record(list as usize, super::target_dump::Op { kind, pso, shaders, writes, reads, viewport, scissor });
 }
 
@@ -2310,13 +2343,24 @@ pub(super) unsafe extern "system" fn dispatch_mesh_x(this: *mut c_void, x: u32, 
 
 /// record bytes one mesh dispatch in two passes may take from unified memory
 const TWO_PASS_BYTES: u64 = 256 << 20;
-/// XCL's record memory for mesh calls in two passes (`two_pass_scratch`)
-const TWO_PASS_SCRATCH_BYTES: u64 = 32 << 20;
+/// XCL's record memory for mesh calls in two passes (`two_pass_scratch`): 32 MiB, or
+/// `XCL_TWO_PASS_SCRATCH_MB` (32 to 1024). An indirect call's commands share it, each up to the
+/// thread groups its part holds (`two_pass_indirect_plan`); the sanitiser cuts the rest.
+fn two_pass_scratch_bytes() -> u64 {
+    static BYTES: OnceLock<u64> = OnceLock::new();
+    *BYTES.get_or_init(|| {
+        let mb = std::env::var("XCL_TWO_PASS_SCRATCH_MB").ok().and_then(|v| v.trim().parse::<u64>().ok()).map_or(32, |mb| mb.clamp(32, 1024));
+        if mb != 32 {
+            crate::xlog_info!("D3D12.X: record memory for mesh calls in two passes: {mb} MiB (XCL_TWO_PASS_SCRATCH_MB)");
+        }
+        mb << 20
+    })
+}
 /// commands one indirect mesh call in two passes may hold
 const TWO_PASS_INDIRECT_COMMANDS: u32 = 64;
 
 /// The GPU address of XCL's record memory for mesh calls in two passes: one buffer of
-/// `TWO_PASS_SCRATCH_BYTES` every such call writes (its prepass) and reads (its mesh call) from
+/// `two_pass_scratch_bytes()` every such call writes (its prepass) and reads (its mesh call) from
 /// the start. The GPU runs a queue's calls in their order, and a prepass leaves no word of an
 /// earlier call for its mesh call to read (it empties its thread's primitive and its group's
 /// counts first, `emit`'s mesh entry), so the calls need no memory of their own – an indirect
@@ -2334,7 +2378,7 @@ unsafe fn two_pass_scratch() -> Result<u64, String> {
     let props = D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() };
     let desc = D3D12_RESOURCE_DESC {
         Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
-        Width: TWO_PASS_SCRATCH_BYTES,
+        Width: two_pass_scratch_bytes(),
         Height: 1,
         DepthOrArraySize: 1,
         MipLevels: 1,
@@ -2354,7 +2398,7 @@ unsafe fn two_pass_scratch() -> Result<u64, String> {
 /// Record memory for a mesh dispatch of `bytes` of records: XCL's (`two_pass_scratch`), or for
 /// more than that holds the list's unified memory.
 unsafe fn two_pass_records(this: *mut c_void, bytes: u64) -> Result<u64, String> {
-    if bytes <= TWO_PASS_SCRATCH_BYTES {
+    if bytes <= two_pass_scratch_bytes() {
         return two_pass_scratch();
     }
     let p = allocate_upload_memory(this, bytes as usize, 256);
@@ -2400,8 +2444,47 @@ unsafe fn two_pass_direct(this: *mut c_void, list: &ID3D12GraphicsCommandList, p
 fn two_pass_indirect_plan(tp: &super::real::TwoPassPso, max: u32) -> (u32, u32) {
     let split = tp.mesh_groups_per_record.max(1);
     let record = tp.record.record_dwords() as u64 * 4;
-    let groups = TWO_PASS_SCRATCH_BYTES / max.max(1) as u64 / record.max(1);
+    let groups = two_pass_scratch_bytes() / max.max(1) as u64 / record.max(1);
     ((groups as u32).clamp(1, 65535 / split), split)
+}
+
+/// Indirect mesh calls in two passes: (calls checked, commands over their room, thread groups
+/// past it, the most groups one command asked for).
+static TWO_PASS_CUTS: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+
+/// Counts the commands of an indirect mesh call in two passes whose thread groups are more than
+/// `room`, the most the sanitiser lets one run (it cuts the rest). The counts are read from the
+/// title's memory as the call is recorded: a count the GPU writes is the one its last run left
+/// there, usually the previous frame's, so this is an estimate of the cut.
+fn note_two_pass_cut(args: u64, count: Option<u64>, stride: u64, max: u32, room: u32) {
+    let commands = match count {
+        Some(at) => match crate::memmap::title_words(at as usize, 1) {
+            Some(w) => w[0].min(max),
+            None => return,
+        },
+        None => max,
+    };
+    let (mut cut, mut past) = (0u64, 0u64);
+    for k in 0..commands as u64 {
+        let Some(w) = crate::memmap::title_words((args + k * stride) as usize, 3) else { return };
+        let groups = w[0] as u64 * w[1] as u64 * w[2] as u64;
+        TWO_PASS_CUTS[3].fetch_max(groups, Ordering::Relaxed);
+        if groups > room as u64 {
+            cut += 1;
+            past += groups - room as u64;
+        }
+    }
+    let calls = TWO_PASS_CUTS[0].fetch_add(1, Ordering::Relaxed) + 1;
+    let before = TWO_PASS_CUTS[1].fetch_add(cut, Ordering::Relaxed);
+    let past = TWO_PASS_CUTS[2].fetch_add(past, Ordering::Relaxed) + past;
+    let after = before + cut;
+    let crossed = cut != 0 && (before == 0 || after.ilog2() > before.ilog2());
+    if crossed || (calls.is_power_of_two() && calls >= 64) {
+        crate::xlog_info!(
+            "D3D12.X: indirect mesh calls in two passes: {after} commands over their room of {room} thread groups so far ({past} groups cut; the most one command asked for {}; {calls} calls checked, counts as the title's memory held them when recorded)",
+            TWO_PASS_CUTS[3].load(Ordering::Relaxed)
+        );
+    }
 }
 
 /// An indirect mesh call with a two-pass pipeline. The group counts are the GPU's, so the record
@@ -2432,6 +2515,9 @@ unsafe fn two_pass_indirect(
     static TOLD: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
     if !TOLD.swap(true, Ordering::Relaxed) {
         crate::xlog_warn!("D3D12.X: an indirect mesh call runs in two passes: each of its {max} commands draws at most {} thread groups ({} KB of records); more are cut", plan.0, per_command >> 10);
+    }
+    if let Some(args_at) = guest.0 {
+        note_two_pass_cut(args_at, guest.1, stride, max, plan.0);
     }
     let (real, [io, _], layout, args, staged_io) = abi_views(this, pso, RootStage::Mesh)?;
     let res = two_pass_scratch()?;
@@ -3096,11 +3182,13 @@ fn note_named_use(title_pso: usize, pso: usize, what: &str) {
 }
 
 /// #14 Dispatch: with a translated pipeline, on XCL's ABI with the kept root arguments
-/// A dispatch of the title's `title_pso` with more than 65,535 groups on an axis: the console
-/// runs it, D3D12 allows 65,535 (D3D12_CS_DISPATCH_MAX_THREAD_GROUPS_PER_DIMENSION). Passed on as
-/// it is; logged at the 1st, 2nd, 4th ... call of a pipeline, so a run shows whether the title's
-/// lists reach the limit.
-fn note_over_limit(title_pso: usize, call: &str, groups: [u32; 3]) {
+/// A dispatch of the title's `title_pso` (translated as `pso`) with more than 65,535 groups on an
+/// axis: the console runs it, D3D12 allows 65,535 (D3D12_CS_DISPATCH_MAX_THREAD_GROUPS_PER_DIMENSION).
+/// Spread over x and y (`spread_launch`) when `XCL_DISPATCH_SPREAD` is on and the program can be;
+/// otherwise passed on as it is. Some((groups launched, io[`IO_GROUP_SPREAD`])) when spread. Logged
+/// at the 1st, 2nd, 4th ... call of a pipeline, so a run shows whether the title's lists reach the
+/// limit.
+fn note_over_limit(title_pso: usize, pso: usize, call: &str, groups: [u32; 3]) -> Option<([u32; 3], [u32; 2])> {
     static SEEN: Mutex<Option<HashMap<usize, u64>>> = Mutex::new(None);
     let n = {
         let mut g = SEEN.lock().unwrap();
@@ -3108,10 +3196,89 @@ fn note_over_limit(title_pso: usize, call: &str, groups: [u32; 3]) {
         *n += 1;
         *n
     };
+    let on = crate::gpu::recomp::dispatch_spread();
+    let able = on && super::real::spreads_groups(pso);
+    let spread = if able { spread_launch(groups) } else { None };
+    if spread.is_some() {
+        DIRECT_SPREAD.fetch_add(1, Ordering::Relaxed);
+    }
     if n.is_power_of_two() {
         let (key, _) = super::pso_async::key_of(title_pso);
-        crate::xlog_warn!("D3D12.X: {call} of pipeline {title_pso:#x} (key {key:016x}) with {}x{}x{} groups, past D3D12's 65,535 on an axis (#{n} of this pipeline); passed on as it is", groups[0], groups[1], groups[2]);
+        let how = match spread {
+            Some((l, _)) => format!("spread over x and y as {}x{}x{} groups (XCL_DISPATCH_SPREAD; {} spread so far)", l[0], l[1], l[2], DIRECT_SPREAD.load(Ordering::Relaxed)),
+            None if !on => "passed on as it is (XCL_DISPATCH_SPREAD=0)".into(),
+            None if !able => "passed on as it is: its program cannot be spread (not XCL's own translation)".into(),
+            None => "passed on as it is: z is past 65,535 or x * y past 65,535 rows of 65,535".into(),
+        };
+        crate::xlog_warn!("D3D12.X: {call} of pipeline {title_pso:#x} (key {key:016x}) with {}x{}x{} groups, past D3D12's 65,535 on an axis (#{n} of this pipeline); {how}", groups[0], groups[1], groups[2]);
     }
+    spread
+}
+
+/// direct dispatches spread over x and y so far (`note_over_limit`)
+static DIRECT_SPREAD: AtomicU64 = AtomicU64::new(0);
+
+/// What a dispatch of `groups` with more than 65,535 on an axis launches spread over x and y
+/// (`recomp::IO_GROUP_SPREAD`): its groups, `GROUP_SPREAD_WIDTH` x ceil(x * y / that) x z, and the
+/// words for io[`IO_GROUP_SPREAD`]. No groups when an axis is 0. None: it cannot be spread (z past
+/// 65,535, or x * y past 65,535 rows).
+fn spread_launch([x, y, z]: [u32; 3]) -> Option<([u32; 3], [u32; 2])> {
+    let width = u64::from(crate::gpu::recomp::GROUP_SPREAD_WIDTH);
+    let xy = u64::from(x) * u64::from(y);
+    if xy == 0 || z == 0 {
+        return Some(([0; 3], [0; 2]));
+    }
+    if u64::from(z) > width || xy > width * width {
+        return None;
+    }
+    Some(([width as u32, xy.div_ceil(width) as u32, z], [x, y]))
+}
+
+/// Per title compute pipeline of a lowered ExecuteIndirect (`indirect_spread`): its slot of
+/// `OVER_WORDS` words in `OVER_BLOCK` bytes of unified memory, and the count logged last as a
+/// power-of-two rank.
+static INDIRECT_OVER: Mutex<Option<(usize, HashMap<usize, (usize, u32)>)>> = Mutex::new(None);
+const OVER_BLOCK: usize = 64 << 10;
+const OVER_WORDS: usize = 8;
+
+/// For the rows of a lowered ExecuteIndirect of `title_pso` run with the translated `pso`: the
+/// byte offset of io[`IO_GROUP_SPREAD`] in a row when its dispatches past 65,535 groups on an axis
+/// are spread (0: capped at 65,535, as with `XCL_DISPATCH_SPREAD=0`), and the GPU address of the
+/// pipeline's counters (0: none), which XCL's LimitDispatch pass keeps: the records past 65,535 on
+/// an axis, the largest x, y and z asked, the records of them left capped. What the GPU counted by
+/// now is logged each time its count passes a power of two.
+fn indirect_spread(title_pso: usize, pso: usize) -> (u32, u64) {
+    let on = crate::gpu::recomp::dispatch_spread();
+    let able = on && super::real::spreads_groups(pso);
+    let at = if able { (crate::gpu::recomp::IO_GROUP_SPREAD[0] * 4) as u32 } else { 0 };
+    let mut g = INDIRECT_OVER.lock().unwrap();
+    let (block, slots) = g.get_or_insert_with(|| {
+        let block = crate::gpu::uma::get().and_then(|u| u.alloc_in(0, OVER_BLOCK, 256)).map_or(0, |p| p as usize);
+        if block != 0 {
+            unsafe { std::ptr::write_bytes(block as *mut u8, 0, OVER_BLOCK) };
+        }
+        (block, HashMap::new())
+    });
+    let next = slots.len();
+    if *block == 0 || (!slots.contains_key(&title_pso) && (next + 1) * OVER_WORDS * 4 > OVER_BLOCK) {
+        return (at, 0);
+    }
+    let base = *block;
+    let (slot, logged) = slots.entry(title_pso).or_insert((base + next * OVER_WORDS * 4, 0));
+    let words: [u32; 5] = std::array::from_fn(|k| unsafe { std::ptr::read_volatile((*slot as *const u32).add(k)) });
+    if words[0] != 0 && words[0].ilog2() + 1 > *logged {
+        *logged = words[0].ilog2() + 1;
+        let (key, _) = super::pso_async::key_of(title_pso);
+        let how = if able {
+            format!("spread over x and y (XCL_DISPATCH_SPREAD), {} of them left capped at 65,535 (z past 65,535 or x * y past 65,535 rows)", words[4])
+        } else if !on {
+            "capped at 65,535 on each axis (XCL_DISPATCH_SPREAD=0)".into()
+        } else {
+            "capped at 65,535 on each axis: its program cannot be spread (not XCL's own translation)".into()
+        };
+        crate::xlog_warn!("D3D12.X: ExecuteIndirect of pipeline {title_pso:#x} (key {key:016x}): {} dispatch records past D3D12's 65,535 groups on an axis so far, the largest asked per axis {}x{}x{}; {how}", words[0], words[1], words[2], words[3]);
+    }
+    (at, super::real::uma_va_of(*slot).unwrap_or(0))
 }
 
 pub(super) unsafe extern "system" fn dispatch(this: *mut c_void, x: u32, y: u32, z: u32) {
@@ -3258,12 +3425,11 @@ pub(super) unsafe fn dispatch_flags(this: *mut c_void, x: u32, y: u32, z: u32, f
     };
     let [x, y, z] = groups;
     reach(this);
-    if x.max(y).max(z) > 65535 {
-        note_over_limit(title_pso, "Dispatch", [x, y, z]);
-    }
-    with(this, |s| s.limits = limits);
-    let done = translated_dispatch(this, list, pso, x, y, z);
-    with(this, |s| s.limits = [0; 3]);
+    let spread = if x.max(y).max(z) > 65535 { note_over_limit(title_pso, pso, "Dispatch", [x, y, z]) } else { None };
+    let ([lx, ly, lz], words) = spread.unwrap_or(([x, y, z], [0; 2]));
+    with(this, |s| (s.limits, s.spread) = (limits, words));
+    let done = translated_dispatch(this, list, pso, lx, ly, lz);
+    with(this, |s| (s.limits, s.spread) = ([0; 3], [0; 2]));
     match done {
         Ok(()) => {
             count(DISPATCHES);
@@ -3464,6 +3630,7 @@ enum RootStage { Compute, Graphics, Mesh }
 unsafe fn bind_abi(this: *mut c_void, list: &ID3D12GraphicsCommandList, pso: usize, stage: RootStage, call: &'static str) -> Result<(Option<(usize, u64)>, Option<super::material_gate_views::writer::Snapshot>), String> {
     let gfx = !matches!(stage, RootStage::Compute);
     let (real, views, layout, args, io) = abi_views(this, pso, stage)?;
+    super::depth_uav::before_op(this, gfx, layout.as_deref(), &args);
     // (a graphics pipeline may be taken away for the code budget between the caller's look at it
     // and this one: its stand-in has the title's root signature, not the ABI's bound below)
     if gfx && super::real::is_standin_pso(real) {
@@ -3570,6 +3737,7 @@ unsafe fn abi_views(this: *mut c_void, pso: usize, stage: RootStage) -> Result<(
     let first = super::real::shader_window_base(&windows)?;
     let (layout, args) = with(this, |s| if gfx { (s.layout_gfx.clone(), s.args_gfx.clone()) } else { (s.layout.clone(), s.args.clone()) });
     let limits = if gfx { [0; 3] } else { with(this, |s| std::mem::take(&mut s.limits)) };
+    let spread = if gfx { [0; 2] } else { with(this, |s| std::mem::take(&mut s.spread)) };
     // 32-bit console addresses: window 0; pieces of the list's arena (not a 64 KiB grain each)
     let copy = |bytes: &[u8]| -> Result<usize, String> {
         let p = with(this, |s| s.arena.take(u, bytes.len().max(16), 256, &mut s.uma)).ok_or("unified memory is full")?;
@@ -3604,6 +3772,9 @@ unsafe fn abi_views(this: *mut c_void, pso: usize, stage: RootStage) -> Result<(
     io[crate::gpu::recomp::IO_CARRY_AT] = carry_watch();
     for (k, l) in limits.into_iter().enumerate() {
         io[crate::gpu::recomp::IO_THREAD_LIMIT[k]] = l;
+    }
+    for (k, w) in spread.into_iter().enumerate() {
+        io[crate::gpu::recomp::IO_GROUP_SPREAD[k]] = w;
     }
     (io[crate::gpu::recomp::IO_TRIP_WINDOW], io[crate::gpu::recomp::IO_TRIP_AT]) = trip_watch(this, with(this, |s| s.pso), real, gfx);
     let io_at = copy(&io.iter().flat_map(|w| w.to_le_bytes()).collect::<Vec<u8>>())?;
@@ -3678,6 +3849,36 @@ mod tests {
         // switched off: the counts are groups whatever the flags
         assert_eq!(dispatch_groups([100, 1, 1], 0x20, line, false), Some(([100, 1, 1], [0, 0, 0])));
         assert_eq!(dispatch_groups([100, 1, 1], 0x8020, None, false), Some(([100, 1, 1], [0, 0, 0])));
+    }
+
+    /// A dispatch past 65,535 groups on an axis, spread over x and y: decoded as the compute
+    /// prologue decodes io[IO_GROUP_SPREAD], the launched groups run each console group of the
+    /// x-y plane once and the rest leave; one that cannot be spread is None.
+    #[test]
+    fn a_dispatch_past_the_axis_limit_runs_each_console_group_once_spread() {
+        for dims in [[129_889, 1, 1], [85_000, 3, 2], [2, 70_000, 1], [115_200, 1, 1]] {
+            let (launched, words) = spread_launch(dims).unwrap();
+            assert!(launched.iter().all(|&n| n <= 65535), "{dims:?}: {launched:?}");
+            assert_eq!((words, launched[2]), ([dims[0], dims[1]], dims[2]));
+            let width = crate::gpu::recomp::GROUP_SPREAD_WIDTH;
+            let mut seen = vec![false; (dims[0] * dims[1]) as usize];
+            for gy in 0..launched[1] {
+                for gx in 0..launched[0] {
+                    let n = gx + width * gy;
+                    if n >= words[0] * words[1] {
+                        continue;
+                    }
+                    let (x, y) = (n % words[0], n / words[0]);
+                    let at = (y * dims[0] + x) as usize;
+                    assert!(!seen[at], "{dims:?}: group {x},{y} twice");
+                    seen[at] = true;
+                }
+            }
+            assert!(seen.iter().all(|&s| s), "{dims:?}: a console group never ran");
+        }
+        assert_eq!(spread_launch([100_000, 0, 1]), Some(([0; 3], [0; 2])));
+        assert_eq!(spread_launch([100_000, 1, 70_000]), None);
+        assert_eq!(spread_launch([u32::MAX, u32::MAX, 1]), None);
     }
 
     #[test]

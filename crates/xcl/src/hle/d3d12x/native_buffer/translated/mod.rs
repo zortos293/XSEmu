@@ -15,6 +15,10 @@ pub(crate) struct Rows {
     ops: u32,
     pub(crate) row_bytes: u32,
     reset: Vec<std::ops::Range<usize>>,
+    /// dispatches past 65,535 groups on an axis: the byte offset of io[`IO_GROUP_SPREAD`] in a row
+    /// when they are spread over x and y (0: capped), and the GPU address of the title pipeline's
+    /// counters (0: none) – `bind::indirect_spread`
+    pub(crate) spread: (u32, u64),
 }
 
 pub(crate) struct Generator {
@@ -28,6 +32,7 @@ struct Bindings {
     params: [u32; 14],
     recipe: u64,
     buffers: [u64; 4],
+    spread: (u32, u64),
 }
 
 pub(crate) struct Span<'a> {
@@ -125,7 +130,7 @@ impl Generator {
         };
         let recipe = recipe.va(model.template.len() as u64 * 4, true)?;
         let out = commands.va(u64::from(n) * u64::from(model.output_stride()), true)?;
-        Some(Bindings { params, recipe, buffers: [src, num, va, out] })
+        Some(Bindings { params, recipe, buffers: [src, num, va, out], spread: model.spread })
     }
 
     unsafe fn record(&self, list: &ID3D12GraphicsCommandList, bindings: Bindings, draws: bool) {
@@ -137,6 +142,9 @@ impl Generator {
         for (i, b) in bindings.buffers.into_iter().enumerate() {
             list.SetComputeRootUnorderedAccessView(2 + i as u32, b);
         }
+        let (spread_at, counters) = bindings.spread;
+        list.SetComputeRootUnorderedAccessView(6, if counters != 0 { counters } else { bindings.buffers[3] });
+        list.SetComputeRoot32BitConstants(0, 2, [spread_at, (counters != 0) as u32].as_ptr().cast(), 14);
         let barrier = || {
             list.ResourceBarrier(&[D3D12_RESOURCE_BARRIER {
                 Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,
@@ -242,6 +250,7 @@ impl Rows {
             ops,
             row_bytes,
             reset,
+            spread: (0, 0),
         })
     }
 

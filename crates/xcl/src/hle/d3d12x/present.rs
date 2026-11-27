@@ -80,6 +80,7 @@ unsafe fn present_x_frame(queue: *mut c_void, plane_count: u32, planes: *const u
     }
     let frames = BOUNDARIES.fetch_add(1, Ordering::Relaxed) + 1;
     if frames % 300 == 0 {
+        super::dsv_trace::log_frame();
         // the title's frame rate, for comparing runs (every 300 frames)
         static LAST: Mutex<Option<std::time::Instant>> = Mutex::new(None);
         let now = std::time::Instant::now();

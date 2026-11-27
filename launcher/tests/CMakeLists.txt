@@ -9,7 +9,8 @@ function(xsemu_test name)
     xsemu_warnings(${name})
     # -o -,txt: the plain-text log on stdout, so ctest --output-on-failure shows it on Windows too
     add_test(NAME ${name} COMMAND ${name} -o -,txt)
-    set_tests_properties(${name} PROPERTIES ENVIRONMENT "QT_QPA_PLATFORM=offscreen")
+    # no test reaches the real art proxy: lookups for fixture games fail fast on a closed port
+    set_tests_properties(${name} PROPERTIES ENVIRONMENT "QT_QPA_PLATFORM=offscreen;XSEMU_SGDB_PROXY=http://127.0.0.1:9/api/v2")
 endfunction()
 
 xsemu_test(tst_protocol)

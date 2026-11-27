@@ -1,0 +1,11 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "xsemu-sgdb",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-11-27",
+  "workers_dev": true,
+  "observability": { "enabled": true },
+  "kv_namespaces": [{ "binding": "CACHE", "id": "1778e583aaf24d8c8edf492faae01832" }],
+  "ratelimits": [{ "name": "RATE_LIMITER", "namespace_id": "4242", "simple": { "limit": 120, "period": 60 } }]
+  // SGDB_API_KEY is a secret: wrangler secret put SGDB_API_KEY
+}

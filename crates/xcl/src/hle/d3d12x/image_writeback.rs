@@ -75,9 +75,11 @@ enum Count {
     Racing,
     Unchanged,
     Untracked,
+    Own,
+    NotGuarded,
 }
 
-const NAMES: [&str; 23] = [
+const NAMES: [&str; 25] = [
     "images registered",
     "images superseded by a newer placement",
     "refused: enhanced-barrier layout image",
@@ -101,12 +103,25 @@ const NAMES: [&str; 23] = [
     "write-back raced a newer write",
     "write-backs with no texel changed since the last: the CPU's bytes kept",
     "submissions with an untracked attachment: images in a write state taken as written",
+    "guards left open without a write-back: XCL's own thread",
+    "writes not guarded: the image is over the guard size or count budget",
 ];
 
-static COUNTS: [AtomicU64; 23] = [const { AtomicU64::new(0) }; 23];
+static COUNTS: [AtomicU64; 25] = [const { AtomicU64::new(0) }; 25];
+
+#[cfg(test)]
+thread_local! {
+    /// what this thread counted: the tests compare deltas while three other tests submit in the
+    /// same process and the product's counters are shared
+    static TEST_COUNTS: std::cell::RefCell<[u64; 23]> = const { std::cell::RefCell::new([0; 23]) };
+    /// submissions this thread reported, so a test can tell whether the queue's own wrapper did it
+    static REPORTS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
 
 fn count(c: Count) {
     let n = COUNTS[c as usize].fetch_add(1, Ordering::Relaxed) + 1;
+    #[cfg(test)]
+    TEST_COUNTS.with(|t| t.borrow_mut()[c as usize] += 1);
     if n.is_power_of_two() {
         crate::xlog_info!("D3D12.X: image writeback: {} ({n} so far)", NAMES[c as usize]);
     }
@@ -163,6 +178,8 @@ struct Image {
     last: Option<(Arc<Clock>, u64)>,
     dirty: Option<Arc<Vec<QueuePageSource>>>,
     generation: u64,
+    /// the CPU has read it back: guarded whatever its size from then on
+    read: bool,
     guards: Vec<(usize, usize, u32)>,
     /// digest of every subresource as last landed (subresources order); empty: never landed
     landed: Arc<Vec<u64>>,
@@ -185,6 +202,98 @@ static GUARDED: RwLock<BTreeMap<usize, (usize, usize)>> = RwLock::new(BTreeMap::
 static LIVE: AtomicUsize = AtomicUsize::new(0);
 static CLOCKS: Mutex<BTreeMap<usize, Arc<Clock>>> = Mutex::new(BTreeMap::new());
 static FLUSH: Mutex<BTreeMap<usize, Context>> = Mutex::new(BTreeMap::new());
+
+thread_local! {
+    /// This thread is making a write-back: a page it touches must not start another one.
+    static IN_FLUSH: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// This thread is inside submitted, where the images lock is held: a page it touches must
+    /// not be flushed from here, because a flush wants that lock.
+    static IN_SUBMIT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Guest bytes of images guarded at most in all (XCL_WB_GUARD_BUDGET_MB, 64 MiB)
+static GUARDED_BYTES: AtomicUsize = AtomicUsize::new(0);
+/// Native images guarded at most in all (XCL_WB_GUARD_MAX, 4096)
+static GUARDED_IMAGES: AtomicUsize = AtomicUsize::new(0);
+/// Submissions that took 250 ms or more (counted, logged)
+static SLOW_SUBMITS: AtomicU64 = AtomicU64::new(0);
+
+fn env_usize(name: &str, default: usize) -> usize {
+    static VALUES: Mutex<BTreeMap<String, usize>> = Mutex::new(BTreeMap::new());
+    if let Some(&v) = VALUES.lock().unwrap().get(name) {
+        return v;
+    }
+    let v = std::env::var(name).ok().and_then(|t| t.trim().parse::<usize>().ok()).unwrap_or(default);
+    VALUES.lock().unwrap().insert(name.to_string(), v);
+    v
+}
+
+/// Guest bytes one image may take to be guarded (XCL_WB_GUARD_MAX_MB, 4 MiB). A title reads a
+/// small feedback texture back far more often than a material plane, and a guarded page the
+/// title never touches costs a protection change for nothing.
+fn guard_max_bytes() -> usize {
+    env_usize("XCL_WB_GUARD_MAX_MB", 4) << 20
+}
+
+/// Guest bytes guarded in all (XCL_WB_GUARD_BUDGET_MB, 64 MiB). Over it, further images keep
+/// play81 behaviour until the guarded ones are read and lifted.
+fn guard_budget_bytes() -> usize {
+    env_usize("XCL_WB_GUARD_BUDGET_MB", 64) << 20
+}
+
+/// Images guarded in all (XCL_WB_GUARD_MAX, 4096)
+fn guard_max_images() -> usize {
+    env_usize("XCL_WB_GUARD_MAX", 4096)
+}
+
+/// This thread is inside submitted: no page it touches may start a write-back (a flush wants the
+/// images lock, which submitted holds), and a submission that takes long is logged.
+struct Submission {
+    began: std::time::Instant,
+}
+
+impl Submission {
+    fn enter() -> Self {
+        IN_SUBMIT.with(|c| c.set(true));
+        Submission { began: std::time::Instant::now() }
+    }
+}
+
+impl Drop for Submission {
+    fn drop(&mut self) {
+        IN_SUBMIT.with(|c| c.set(false));
+        let ms = self.began.elapsed().as_millis();
+        if ms >= 250 {
+            let n = SLOW_SUBMITS.fetch_add(1, Ordering::Relaxed) + 1;
+            if n <= 8 || n.is_power_of_two() {
+                crate::xlog_info!(
+                    "D3D12.X: image writeback: a submission took {ms} ms with {} images guarded ({} slow submissions)",
+                    GUARDED_IMAGES.load(Ordering::Relaxed),
+                    n
+                );
+            }
+        }
+    }
+}
+
+/// Leaves the guarded pages at [at, end) open without writing them back, because this thread
+/// holds a lock a write-back wants (its own code inside a submission, or a write-back already).
+/// The image is guarded again at its next capture.
+unsafe fn open_pages(at: usize, end: usize) -> bool {
+    let mut g = GUARDED.write().unwrap_or_else(|e| e.into_inner());
+    let hit: Vec<(usize, usize)> = g.range(..end).rev().take_while(|(_, &(e, _))| e > at).map(|(&s, &(e, _))| (s, e)).collect();
+    if hit.is_empty() {
+        return false;
+    }
+    for (s, e) in hit {
+        let mut old = 0;
+        VirtualProtect(s as *const c_void, e - s, PAGE_READWRITE, &mut old);
+        g.remove(&s);
+        LIVE.fetch_sub(1, Ordering::Release);
+        count(Count::Own);
+    }
+    true
+}
 
 const COMMON: u32 = 0;
 const COPY_SOURCE: u32 = 0x800;
@@ -306,6 +415,7 @@ pub(super) unsafe fn register(native: *mut c_void, image: &GuestImage) {
         last: None,
         dirty: None,
         generation: 0,
+        read: false,
         guards: Vec::new(),
         landed: Arc::new(Vec::new()),
         full: BTreeSet::new(),
@@ -514,11 +624,19 @@ fn uav_state(img: &Image, state: u32) -> bool {
 
 /// The PC lists went to queue, in this order: the images they wrote are captured and guarded,
 /// and every image they wrote or transitioned is ordered after them.
+#[cfg(test)]
+pub(super) fn reports() -> u64 {
+    REPORTS.with(|r| r.get())
+}
+
 pub(super) unsafe fn submitted(queue: *mut c_void, lists: &[*mut c_void]) {
     if !ACTIVE.load(Ordering::Relaxed) || lists.is_empty() || super::title_textures::is_own_work() {
         return;
     }
+    #[cfg(test)]
+    REPORTS.with(|r| r.set(r.get() + 1));
     let Some(q) = ID3D12CommandQueue::from_raw_borrowed(&queue) else { return };
+    let _submission = Submission::enter();
     let notes = super::title_textures::list_transitions(lists);
     let mut writes: BTreeMap<usize, BTreeSet<u32>> = BTreeMap::new();
     let (mut work, mut untracked) = (false, NO_ATTACHMENTS.load(Ordering::Relaxed));
@@ -606,7 +724,14 @@ unsafe fn capture(key: usize, img: &mut Image) {
     }
     img.generation += 1;
     if img.guards.is_empty() {
-        guard(key, img);
+        let over = img.size > guard_max_bytes()
+            || GUARDED_IMAGES.load(Ordering::Relaxed) >= guard_max_images()
+            || GUARDED_BYTES.load(Ordering::Relaxed).saturating_add(img.size) > guard_budget_bytes();
+        if over && !img.read {
+            count(Count::NotGuarded);
+        } else {
+            guard(key, img);
+        }
     }
 }
 
@@ -644,6 +769,8 @@ unsafe fn guard(key: usize, img: &mut Image) {
         g.insert(at, (at + len, key));
     }
     LIVE.fetch_add(img.guards.len(), Ordering::Release);
+    GUARDED_IMAGES.fetch_add(1, Ordering::Relaxed);
+    GUARDED_BYTES.fetch_add(img.size, Ordering::Relaxed);
     count(Count::Guarded);
 }
 
@@ -658,6 +785,8 @@ unsafe fn unguard(img: &mut Image) {
         g.remove(&at);
         LIVE.fetch_sub(1, Ordering::Release);
     }
+    GUARDED_IMAGES.fetch_sub(1, Ordering::Relaxed);
+    GUARDED_BYTES.fetch_sub(img.size, Ordering::Relaxed);
 }
 
 /// The images guarded in [at, end).
@@ -675,13 +804,18 @@ pub(crate) unsafe fn fault(at: usize) -> bool {
     if LIVE.load(Ordering::Acquire) == 0 {
         return false;
     }
+    if IN_FLUSH.with(|c| c.get()) || IN_SUBMIT.with(|c| c.get()) {
+        return open_pages(at, at + 1);
+    }
     let images = guarded_in(at, at + 1);
     if images.is_empty() {
         return false;
     }
+    IN_FLUSH.with(|c| c.set(true));
     for key in images {
         flush(key);
     }
+    IN_FLUSH.with(|c| c.set(false));
     true
 }
 
@@ -689,6 +823,10 @@ pub(crate) unsafe fn fault(at: usize) -> bool {
 /// there are written back first.
 pub(crate) fn before_read(at: usize, len: usize) {
     if LIVE.load(Ordering::Acquire) == 0 || len == 0 {
+        return;
+    }
+    if IN_FLUSH.with(|c| c.get()) || IN_SUBMIT.with(|c| c.get()) {
+        unsafe { open_pages(at, at.saturating_add(len)) };
         return;
     }
     for key in guarded_in(at, at.saturating_add(len)) {
@@ -714,11 +852,21 @@ struct Snapshot {
 /// Writes image key back into its captured pages, again while a newer write raced it (four
 /// times at most), and lifts its guard.
 unsafe fn flush(key: usize) {
+    let began = std::time::Instant::now();
+    flush_inner(key);
+    let ms = began.elapsed().as_millis();
+    if ms >= 100 {
+        crate::xlog_info!("D3D12.X: image writeback: a write-back took {ms} ms (image {key:#x}, {} guards open)", LIVE.load(Ordering::Acquire));
+    }
+}
+
+unsafe fn flush_inner(key: usize) {
     let mut contexts = FLUSH.lock().unwrap_or_else(|e| e.into_inner());
     for _ in 0..4 {
         let snap = {
             let mut g = IMAGES.lock().unwrap();
             let Some(img) = g.get_mut(&key) else { return };
+            img.read = true;
             if img.guards.is_empty() {
                 return;
             }
@@ -1017,7 +1165,7 @@ unsafe fn read_back(contexts: &mut BTreeMap<usize, Context>, res: &ID3D12Resourc
 
 #[cfg(test)]
 fn counted(name: &str) -> u64 {
-    NAMES.iter().position(|n| *n == name).map_or(0, |i| COUNTS[i].load(Ordering::Relaxed))
+    NAMES.iter().position(|n| *n == name).map_or(0, |i| TEST_COUNTS.with(|t| t.borrow()[i]))
 }
 
 #[cfg(test)]

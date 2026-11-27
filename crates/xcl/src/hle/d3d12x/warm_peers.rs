@@ -276,13 +276,15 @@ mod tests {
         let parent = std::process::id() ^ 0x5a5b_0000;
         let table = Peers::create(parent).unwrap();
         let (a, b) = (Peers::open(parent, 2).unwrap(), Peers::open(parent, 3).unwrap());
+        let ballast = vec![1u8; 256 << 20];
         let now = private_bytes(std::process::id()).unwrap();
         let grown = now / 2;
         a.lock().publish(Usage { running: 1, giants: 1, reserved: 4 << 30 });
         a.lock().publish_giants(4 << 30, now - grown);
         let seen = b.lock().others_giants();
+        std::hint::black_box(&ballast);
         assert_eq!(seen.reserved, 4 << 30);
-        assert!(grown > 0 && seen.used >= grown && seen.used < grown + (256 << 20), "in use: {} MiB of {} grown", seen.used >> 20, grown >> 20);
+        assert!(grown >= 128 << 20 && seen.used + (16 << 20) >= grown && seen.used < grown + (256 << 20), "in use: {} MiB of {} grown", seen.used >> 20, grown >> 20);
         assert_eq!(seen.largest.map(|(slot, pid, est, _)| (slot, pid, est)), Some((2, std::process::id(), 4 << 30)));
         assert_eq!(a.lock().others_giants(), PeerGiants::default(), "its own giants are no peer's");
         assert_eq!(b.lock().others(), Usage { running: 1, giants: 1, reserved: 4 << 30 }, "the counts stay");

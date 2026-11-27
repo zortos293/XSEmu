@@ -21,6 +21,7 @@ serde_json = "1"
 toml = "1"
 windows-core = "0.62"
 xcl-bcpack = { path = "../xcl-bcpack" }
+xcl-cgbj = { path = "../xcl-cgbj" }
 xcl-dxil = { path = "../xcl-dxil" }
 
 [dependencies.windows]

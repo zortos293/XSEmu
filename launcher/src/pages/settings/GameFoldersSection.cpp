@@ -72,7 +72,8 @@ bool inFolder(const QString& path, const QString& folder)
 
 // Folders: AppSettings::gameFolders, scanned and watched by Library. Rescan: Library::rescan. The
 // library always rescans at start and watches its folders, so those two rows say so. Cover art: the
-// SteamGridDB key and the art lookups switch (CoverArtService); Test does a real search request.
+// art downloads switch, clearing downloaded art, and the optional personal SteamGridDB key
+// (CoverArtService); Test does a real search request with it.
 QWidget* SettingsSections::gameFolders(Services& s, std::function<void()> addFolder)
 {
     const SettingsKit::Section sec = SettingsKit::makeSection(
@@ -208,15 +209,27 @@ QWidget* SettingsSections::gameFolders(Services& s, std::function<void()> addFol
     SettingsKit::onShow(sec.page, refreshRunners);
 
     sec.caps(QStringLiteral("Cover art"));
+    auto* lookups = new Toggle;
+    lookups->setChecked(s.settings.artLookups());
+    QObject::connect(lookups, &Toggle::toggled, &s.settings, &AppSettings::setArtLookups);
+    sec.row(QStringLiteral("Download game art"),
+            QStringLiteral("On by default. XSEmu looks each game up on SteamGridDB by its name and downloads its cover, banner, logo and icon, "
+                           "then keeps them on this PC. No key needed. Off: nothing is downloaded and games show the No cover art tile."),
+            lookups);
+    auto* clearArt = new Button(QStringLiteral("Clear"), Button::Variant::Secondary, Button::Size::Small);
+    QObject::connect(clearArt, &Button::clicked, clearArt, [&s] { s.covers.clearCache(); });
+    sec.row(QStringLiteral("Downloaded art"), QStringLiteral("Deletes the art downloaded so far and looks every game up again. Images you chose yourself stay."), clearArt);
+
     auto* key = new QLineEdit(s.settings.steamGridDbKey());
     key->setProperty("framed", true);
     key->setEchoMode(QLineEdit::Password);
-    key->setPlaceholderText(QStringLiteral("API key"));
+    key->setPlaceholderText(QStringLiteral("Optional"));
     key->setFixedWidth(200);
     auto* test = new Button(QStringLiteral("Test"), Button::Variant::Secondary, Button::Size::Small);
     auto* clearKey = new Button(QStringLiteral("Clear"), Button::Variant::Ghost, Button::Size::Small);
-    SettingsKit::Row* keyRow = sec.row(QStringLiteral("SteamGridDB API key"),
-                                       QStringLiteral("Covers are fetched from SteamGridDB with your own key and cached on this PC. XSEmu ships no game art."));
+    SettingsKit::Row* keyRow = sec.row(QStringLiteral("Personal SteamGridDB key"),
+                                       QStringLiteral("Advanced. With a key of your own (steamgriddb.com, Preferences, API) XSEmu asks SteamGridDB directly "
+                                                      "instead of going through XSEmu's art service. Leave it empty to use the service."));
     keyRow->addControl(key);
     keyRow->addControl(test);
     keyRow->addControl(clearKey);
@@ -240,7 +253,7 @@ QWidget* SettingsSections::gameFolders(Services& s, std::function<void()> addFol
             return;
         }
         s.settings.setSteamGridDbKey(k);
-        QNetworkRequest req(CoverArtService::searchUrl(QStringLiteral("test")));
+        QNetworkRequest req(CoverArtService::searchUrl(QUrl(QString::fromLatin1(CoverArtService::kApiBase)), QStringLiteral("test")));
         req.setRawHeader("Authorization", "Bearer " + k.toUtf8());
         req.setTransferTimeout(10000);
         test->setEnabled(false);
@@ -265,10 +278,6 @@ QWidget* SettingsSections::gameFolders(Services& s, std::function<void()> addFol
             }
         });
     });
-    auto* lookups = new Toggle;
-    lookups->setChecked(s.settings.artLookups());
-    QObject::connect(lookups, &Toggle::toggled, &s.settings, &AppSettings::setArtLookups);
-    sec.row(QStringLiteral("Art lookups"), QStringLiteral("Off by default. On, with your key: XSEmu asks SteamGridDB for cover and banner art. Off: it never contacts SteamGridDB and shows the No cover art tile."), lookups);
     sec.finish();
     return sec.page;
 }
