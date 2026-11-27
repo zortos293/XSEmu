@@ -82,8 +82,12 @@ fn launcher_uses_configured_exe_in_an_ambiguous_folder() {
     let record = title.join("cache").join("boot.json");
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
     let boot = loop {
+        // Only a record that parses is a record: the writer creates the file before its contents are
+        // in it, and half of one would fail the test that this poll is here to make determinate.
         if let Ok(text) = std::fs::read_to_string(&record) {
-            break Ok(text);
+            if serde_json::from_str::<serde_json::Value>(&text).is_ok() {
+                break Ok(text);
+            }
         }
         if let Ok(Some(status)) = child.try_wait() {
             break Err(format!("the run exited ({status}) without writing {}", record.display()));

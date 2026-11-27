@@ -812,20 +812,10 @@ pub fn register(obj: usize, n: u32, pc_cpu: u64, pc_gpu: u64, inc: u32, sampler:
     } else if let Some(addr) = u.is_sparse_window(0).then(|| unsafe { super::sparse::alloc_in(0, bytes as usize, 256) }).flatten() {
         (addr.0 as *mut u8, Memory::Sparse)
     } else {
-        // Window 0 first (a table's 32-bit console address names it), then anywhere XCL has committed
-        // memory: when the windows are sparse and this adapter could not open them, window 0 keeps no
-        // committed space, and a heap somewhere is still better than no descriptor heap at all.
-        let p = match u.alloc_in(0, bytes as usize, 256) {
-            Some(p) => p,
-            None => {
-                let Some(p) = u.alloc(bytes as usize, 256) else { return false };
-                static SAID_WINDOW: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-                if !SAID_WINDOW.swap(true, std::sync::atomic::Ordering::Relaxed) {
-                    crate::xlog_warn!("console descriptor heaps: no room in window 0, so heaps are kept in another committed window; a console 32-bit table address cannot name them");
-                }
-                p
-            }
-        };
+        // Window 0 only: a descriptor table reaches its slots through a 32-bit console address, and
+        // translation resolves that in window 0. A heap anywhere else would be one the title cannot
+        // name, so a machine without window-0 storage has no console heap (and says so below).
+        let Some(p) = u.alloc_in(0, bytes as usize, 256) else { return false };
         unsafe { std::ptr::write_bytes(p, 0, bytes as usize) };
         if u.is_sparse_window(0) {
             // The adapter could not make the 4 GiB sparse windows (a software adapter cannot), so the
