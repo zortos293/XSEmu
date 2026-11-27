@@ -53,6 +53,8 @@ private slots:
     void parsers_data();
     void parsers();
     void installsReleaseAsset();
+    void cancellingLeavesNoFailure();
+    void aFailedDownloadIsRetried();
     void rejectsWrongHash();
     void buildsFromSource();
     void stepProgramsUseTheStepsPath();
@@ -320,6 +322,67 @@ void TestRunners::installsReleaseAsset()
     QCOMPARE(m.status(id).state, RunnerManager::State::NotInstalled);
 }
 
+void TestRunners::cancellingLeavesNoFailure()
+{
+    if (!QFileInfo::exists(m_zip))
+        QSKIP("no zip tool on this machine");
+    RunnerManager m;
+    const QString id = QStringLiteral("kelvaroq");
+    const QDir dir(Paths::runnerDir(id));
+    QCOMPARE(m.status(id).state, RunnerManager::State::NotInstalled);
+    for (int round = 0; round < 2; ++round) {
+        QSignalSpy done(&m, &RunnerManager::installFinished);
+        QString error;
+        QVERIFY2(m.install(id, &error), qPrintable(error));
+        QCOMPARE(m.status(id).state, RunnerManager::State::Installing);
+        m.cancel();
+        QVERIFY(done.count() == 1 || done.wait(10000));
+        QVERIFY(!done.first().at(1).toBool());
+        QCOMPARE(done.first().at(2).toString(), QStringLiteral("Cancelled."));
+        // stopped, not failed: not installed, no reason to show, and nothing remembered for a restart
+        const RunnerManager::Status s = m.status(id);
+        QCOMPARE(s.state, RunnerManager::State::NotInstalled);
+        QVERIFY2(s.error.isEmpty(), qPrintable(s.error));
+        QVERIFY(!QFileInfo::exists(RunnerInstall::failurePath(id)));
+        QVERIFY(!QFileInfo::exists(dir.filePath(QStringLiteral("staging"))));
+        QVERIFY(!QFileInfo::exists(dir.filePath(QStringLiteral("runner.json"))));
+        // and another attempt starts at once: cancelling does not keep the manager busy
+        QVERIFY(m.busyId().isEmpty());
+    }
+
+    // the runner still installs normally afterwards
+    QSignalSpy done(&m, &RunnerManager::installFinished);
+    QString error;
+    QVERIFY2(m.install(id, &error), qPrintable(error));
+    QVERIFY(done.wait(30000));
+    QVERIFY2(done.first().at(1).toBool(), qPrintable(done.first().at(2).toString()));
+    QCOMPARE(m.status(id).state, RunnerManager::State::Installed);
+    QSignalSpy gone(&m, &RunnerManager::uninstalled);
+    QVERIFY(m.uninstall(id, &error));
+    QVERIFY(gone.wait(10000));
+    QVERIFY(gone.first().at(1).toBool());
+}
+
+void TestRunners::aFailedDownloadIsRetried()
+{
+    // a source that is not there: every attempt fails, and the last one fails the install
+    RunnerSpec spec = *Runners::find(QStringLiteral("kelvaroq"));
+    spec.id = QStringLiteral("kelvaroq-retried");
+    spec.assetUrl = QUrl::fromLocalFile(m_dir.filePath(QStringLiteral("missing.zip"))).toString();
+    RunnerInstall install(spec);
+    QSignalSpy finished(&install, &RunnerInstall::finished);
+    install.start();
+    QVERIFY(finished.wait(30000));
+    QVERIFY(!finished.first().at(0).toBool());
+    QVERIFY2(finished.first().at(1).toString().contains(QStringLiteral("failed")), qPrintable(finished.first().at(1).toString()));
+    QFile log(RunnerInstall::logPath(spec.id));
+    QVERIFY(log.open(QIODevice::ReadOnly));
+    const QString text = QString::fromUtf8(log.readAll());
+    QCOMPARE(text.count(QStringLiteral("GET ") + spec.downloadUrl()), RunnerInstall::kDownloadAttempts);
+    QCOMPARE(text.count(QStringLiteral("trying again")), RunnerInstall::kDownloadAttempts - 1);
+    QVERIFY(!QFileInfo::exists(spec.installDir()));
+}
+
 void TestRunners::rejectsWrongHash()
 {
     if (!QFileInfo::exists(m_zip))
@@ -336,6 +399,10 @@ void TestRunners::rejectsWrongHash()
     QVERIFY(s.executable.isEmpty());
     QVERIFY(!QFileInfo::exists(Runners::find(id)->installDir()));
     QVERIFY(QFileInfo::exists(m.installLogPath(id)));
+    // a download whose bytes are not the pinned ones is not retried: the SHA-256 is the answer
+    QFile log(m.installLogPath(id));
+    QVERIFY(log.open(QIODevice::ReadOnly));
+    QCOMPARE(QString::fromUtf8(log.readAll()).count(QStringLiteral("GET ")), 1);
 
     // a restart still says Failed, with the reason, never Not installed
     RunnerManager restarted;

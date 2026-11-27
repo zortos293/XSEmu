@@ -62,8 +62,11 @@ RunnerManager::RunnerManager(QObject* parent)
 
 RunnerManager::~RunnerManager()
 {
-    if (m_task)
+    if (m_task) {
+        // no finished() into a half-destroyed manager (m_settings may be gone already)
+        m_task->disconnect(this);
         m_task->cancel();
+    }
 }
 
 void RunnerManager::setSettings(AppSettings* settings)
@@ -387,7 +390,10 @@ bool RunnerManager::install(const QString& id, QString* error)
     m_task = new RunnerInstall(*spec, this);
     connect(m_task, &RunnerInstall::progressChanged, this, [this, id] { emit changed(id); });
     connect(m_task, &RunnerInstall::finished, this, [this, id](bool ok, const QString& why) {
-        if (!ok)
+        // stopping it ourselves is not a failure: nothing to remember, and the status that follows is
+        // the one the runner had before (NotInstalled, or the installed version with its update)
+        const bool cancelled = m_task && m_task->cancelled();
+        if (!ok && !cancelled)
             m_errors.insert(id, why);
         m_task->deleteLater();
         m_task.clear();
@@ -401,9 +407,10 @@ bool RunnerManager::install(const QString& id, QString* error)
             } else {
                 // the old copy still works: keep running it from where it was
                 m_settings->setRunnerLocation(id, rebuild.previous);
-                m_errors.insert(id, QStringLiteral("%1 It still runs from %2.").arg(why, QDir::toNativeSeparators(rebuild.oldDir)));
+                if (!cancelled)
+                    m_errors.insert(id, QStringLiteral("%1 It still runs from %2.").arg(why, QDir::toNativeSeparators(rebuild.oldDir)));
             }
-            emit relocated(id, ok, ok ? QString() : m_errors.value(id));
+            emit relocated(id, ok, ok || cancelled ? QString() : m_errors.value(id));
         }
         emit changed(id);
         emit stateChanged(id);

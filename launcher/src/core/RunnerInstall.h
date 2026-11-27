@@ -31,6 +31,13 @@ public:
     void start();
     void cancel();
     RunnerManager::Progress progress() const { return m_progress; }
+    // A person stopped this install (cancel()): finished(false, "Cancelled.") follows, but it is not a
+    // failure and nothing is recorded as one.
+    bool cancelled() const { return m_cancelled; }
+
+    // A download is tried this many times in all, so a dropped connection costs a retry rather than the
+    // whole install; a SHA-256 that does not match is never retried.
+    static constexpr int kDownloadAttempts = 3;
 
     // The unpack command for an archive (Windows: the system tar.exe, which reads zip; elsewhere
     // unzip for .zip and tar for the rest), tested.
@@ -55,7 +62,7 @@ private:
     void next();
     void fail(const QString& error);
     void setStep(const QString& detail = {});
-    void download(const QString& url, const QString& to, const QString& sha256);
+    void download(const QString& url, const QString& to, const QString& sha256, int attempt = 0);
     // then (when set) gets whether it exited 0 instead of the run going on or failing
     void runProcess(const QStringList& command, const QString& workDir, const QString& parser, std::function<void(bool)> then = {});
     void fetchFrom(const QString& src, int remote, QStringList refused);
