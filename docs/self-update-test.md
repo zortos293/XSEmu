@@ -35,6 +35,7 @@ $to   = 'v0.1.1-pre.3'
 $root = "$env:TEMP\xsemu-selfupdate-test"
 $app  = "$root\app"; $env:XSEMU_LAUNCHER_DATA = "$root\data"
 Remove-Item -Recurse -Force $root -ErrorAction SilentlyContinue
+New-Item -ItemType Directory -Force $root | Out-Null
 
 # 1. the from-release, unpacked into the scratch folder
 $base = "https://github.com/zortos293/XSEmu/releases/download"
