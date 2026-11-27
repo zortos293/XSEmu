@@ -62,6 +62,7 @@ private slots:
     void moveKeepsTheInstall();
     void moveCopiesAcrossDrives();
     void rebuildThere();
+    void closingDuringARebuildKeepsTheOldLocation();
     void refusesWhileBusy();
     void runnersFolderKeepsInstalledRunners();
     void freeSpaceWarning();
@@ -675,6 +676,33 @@ void TestRunners::rebuildThere()
     QVERIFY(m.uninstall(id));
     QVERIFY(gone.wait(10000));
     QVERIFY(m.relocate(id, Paths::runnersDir(), RunnerManager::Relocation::Move));
+    resetLocations();
+}
+
+void TestRunners::closingDuringARebuildKeepsTheOldLocation()
+{
+    if (!m_haveGit)
+        QSKIP("git is not installed");
+    QTemporaryDir dir;
+    AppSettings settings(dir.filePath(QStringLiteral("settings.ini")));
+    const QString id = QStringLiteral("victory-dexnom");
+    const QString elsewhere = dir.filePath(QStringLiteral("I"));
+    {
+        RunnerManager m;
+        m.setSettings(&settings);
+        ensureBuilt(m, id);
+        QString error;
+        QVERIFY2(m.relocate(id, elsewhere, RunnerManager::Relocation::Rebuild, &error), qPrintable(error));
+        // a rebuild writes the new folder down before it builds; the launcher closes while it builds
+        QCOMPARE(settings.runnerLocations().value(id), QDir::cleanPath(elsewhere));
+    }
+    // the build never finished, so the copy that works is the old one and the settings point there again
+    QVERIFY2(settings.runnerLocations().value(id).isEmpty(), qPrintable(settings.runnerLocations().value(id)));
+    RunnerManager m;
+    m.setSettings(&settings);
+    QCOMPARE(Runners::find(id)->dataDir(), QDir(Paths::runnersDir()).filePath(id));
+    QCOMPARE(m.status(id).state, RunnerManager::State::Installed);
+    QVERIFY(m.isRunnable(id));
     resetLocations();
 }
 

@@ -66,6 +66,12 @@ RunnerManager::~RunnerManager()
         // no finished() into a half-destroyed manager (m_settings may be gone already)
         m_task->disconnect(this);
         m_task->cancel();
+        // a move-and-rebuild writes the new folder before it builds: stopping here must put the runner
+        // back where its working copy is, or a restart looks for it in a folder that never got one
+        if (m_rebuild && m_settings) {
+            m_settings->disconnect(this);
+            m_settings->setRunnerLocation(m_rebuild->id, m_rebuild->previous);
+        }
     }
 }
 
