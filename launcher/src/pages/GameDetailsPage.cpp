@@ -734,7 +734,7 @@ void GameDetailsPage::refresh()
         b->setToolTip(heldReason);
     }
     if (held) {
-        stateText = tooOld ? QStringLiteral("XSEmu build too old") : QStringLiteral("Emulator busy");
+        stateText = tooOld ? QStringLiteral("XSEmu Core build too old") : QStringLiteral("Emulator busy");
         tone = tooOld ? Theme::Tone::Danger : Theme::Tone::Warning;
     }
     m_state->setText(stateText);
@@ -837,7 +837,7 @@ void GameDetailsPage::refreshRunProfile()
     const QString applies = own ? QStringLiteral("Play and Warm-up for %1 use this profile instead of the one in Settings.").arg(m_game.title())
                                 : QStringLiteral("Play and Warm-up use the profile in Settings, Run profile (%1).")
                                       .arg(global == 1 ? QStringLiteral("1 variable") : QStringLiteral("%1 variables").arg(global));
-    m_profileNote->setText(runner.isBuiltIn() ? applies : applies + QStringLiteral(" It applies when the game runs with XSEmu; %1 keeps its own environment.").arg(runner.name));
+    m_profileNote->setText(runner.isBuiltIn() ? applies : applies + QStringLiteral(" It applies when the game runs with XSEmu Core; %1 keeps its own environment.").arg(runner.name));
 }
 
 void GameDetailsPage::refreshOverrides()
@@ -905,7 +905,7 @@ void GameDetailsPage::refreshOverrides()
             Label* note = nullptr;
             if (!spec.backed) {
                 seg->setEnabled(false);
-                note = new Label(QStringLiteral("Not in this XSEmu build yet"), Label::Style::Caption, Theme::Role::Text3);
+                note = new Label(QStringLiteral("Not in this XSEmu Core build yet"), Label::Style::Caption, Theme::Role::Text3);
             }
             const QString tip = spec.launcherSide ? QString() : QStringLiteral("%1 in xcl.toml").arg(spec.key);
             m_overrides->addRow(spec.label, seg, note, {}, Qt::AlignLeft)->setToolTip(tip);
@@ -956,5 +956,5 @@ void GameDetailsPage::refreshOverrides()
                                          : runner.isBuiltIn()
                                          ? QStringLiteral("Console, display mode, raytracing, keyboard and mouse and log level are written to %1 when the game starts.%2")
                                                .arg(QDir::toNativeSeparators(tomlPath), profileWins(m_s.settings, id))
-                                         : QStringLiteral("%1 gets the console when the game starts; the other choices apply when it runs with XSEmu.").arg(runner.name));
+                                         : QStringLiteral("%1 gets the console when the game starts; the other choices apply when it runs with XSEmu Core.").arg(runner.name));
 }

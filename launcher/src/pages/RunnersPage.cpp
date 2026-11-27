@@ -255,7 +255,7 @@ public:
         fh->setContentsMargins(0, 4, 0, 0);
         fh->setSpacing(6);
         fh->addWidget(new IconView(QStringLiteral("info"), Theme::Role::Text3, 12), 0, Qt::AlignTop);
-        auto* footText = new Label(QStringLiteral("Runs in the background; you can keep using XSEmu."), Label::Style::Caption, Theme::Role::Text3);
+        auto* footText = new Label(QStringLiteral("Runs in the background; you can keep using XSEmu Launcher."), Label::Style::Caption, Theme::Role::Text3);
         footText->setWordWrap(true);
         fh->addWidget(footText, 1);
         sv->addWidget(m_foot);
@@ -419,7 +419,7 @@ RunnersPage::RunnersPage(Services& services, QWidget* parent)
     why->setWordWrap(true);
     page.content->addSpacing(12);
     page.content->addWidget(why);
-    auto* foot = new Label(QStringLiteral("Pick a runner per game in its details. Community runners are projects by their authors, run as separate programs; XSEmu installs the pinned version and never updates past it."),
+    auto* foot = new Label(QStringLiteral("Pick a runner per game in its details. Community runners are projects by their authors, run as separate programs; XSEmu Launcher installs the pinned version and never updates past it."),
                            Label::Style::Caption, Theme::Role::Text3);
     foot->setWordWrap(true);
     page.content->addSpacing(4);

@@ -29,7 +29,7 @@ QComboBox* xclDropdown(Services& s, const QString& key, const QList<QPair<QStrin
 QWidget* SettingsSections::graphics(Services& s)
 {
     const SettingsKit::Section sec = SettingsKit::makeSection(
-        QStringLiteral("Graphics"), QStringLiteral("How the launcher looks and how the game image reaches the screen. XSEmu renders with Direct3D 12."));
+        QStringLiteral("Graphics"), QStringLiteral("How the launcher looks and how the game image reaches the screen. XSEmu Core renders with Direct3D 12."));
     sec.caps(QStringLiteral("Launcher"));
     auto* theme = new SegmentedControl({QStringLiteral("System"), QStringLiteral("Light"), QStringLiteral("Dark")});
     theme->setCurrentIndex(int(s.settings.theme()));
@@ -46,7 +46,7 @@ QWidget* SettingsSections::graphics(Services& s)
     sec.caps(QStringLiteral("Image"));
     auto* scaling = new SegmentedControl({QStringLiteral("Letterbox"), QStringLiteral("Stretch")});
     sec.row(QStringLiteral("Scaling"), QStringLiteral("Keep the 16:9 image and fill the rest with black, or stretch it to the window."), scaling)
-        ->setUnavailable(QStringLiteral("XSEmu always keeps 16:9 with black bars. Stretching is not in this XSEmu build yet."));
+        ->setUnavailable(QStringLiteral("XSEmu Core always keeps 16:9 with black bars. Stretching is not in this XSEmu Core build yet."));
     auto* mode = xclDropdown(s, QStringLiteral("display_mode"),
                              {{QStringLiteral("Auto"), QStringLiteral("auto")},
                               {QStringLiteral("This display"), QStringLiteral("host")},
@@ -78,7 +78,7 @@ QWidget* SettingsSections::graphics(Services& s)
     if (storedAdapter.isValid() && std::none_of(adapters.cbegin(), adapters.cend(), [&](const auto& a) { return a.second == storedAdapter; }))
         adapters.append({storedAdapter.toString(), storedAdapter});
     auto* adapter = xclDropdown(s, QStringLiteral("d3d12_adapter"), adapters, sec.page, 260);
-    SettingsKit::Row* adapterRow = sec.row(QStringLiteral("D3D12 adapter"), QStringLiteral("The GPU XSEmu renders on."), adapter);
+    SettingsKit::Row* adapterRow = sec.row(QStringLiteral("D3D12 adapter"), QStringLiteral("The GPU XSEmu Core renders on."), adapter);
     // the hardware is read in the background when the launcher starts; fill it in when it lands
     const auto showHardware = [&s, gpu, gpuRow, adapter] {
         const HardwareInfo& hw = s.hardware.info();

@@ -27,6 +27,8 @@ private slots:
     void runProfileValidation();
     void titleConfigAtLaunch();
     void warmupClassification();
+    void warmupResume();
+    void warmupCheckpointRoundTrip();
     void formats();
 };
 
@@ -357,24 +359,138 @@ void TestSettings::warmupClassification()
 {
     WarmupController::Progress last;
     last.targets = 100;
-    Protocol::WarmupDone done{98, 2, 0, 12.5, true, false, 0};
-    WarmupRun r = WarmupController::classify(0, false, done, last, {}, false);
+    last.passDone = 60;
+    const auto done = [](qint64 built, qint64 failed, qint64 left, bool complete, bool cancelled, int code) {
+        return Protocol::WarmupDone{built, failed, left, 0, 12.5, complete, cancelled, code};
+    };
+    WarmupRun r = WarmupController::classify(0, false, done(98, 2, 2, true, false, 0), last, {}, false);
     QCOMPARE(r.result, WarmupRun::Result::Finished);
     QCOMPARE(r.done, 100);
     QCOMPARE(r.failed, 2);
-    done = {40, 0, 0, 5, false, true, 4};
-    QCOMPARE(WarmupController::classify(4, false, done, last, {}, true).result, WarmupRun::Result::Cancelled);
-    done = {40, 0, 0, 5, false, false, 0};
+    QCOMPARE(r.left, 2);
+    // exit code 1 only says some builds failed: the pass still went through every target it meant to,
+    // and what it left is what a later pass goes on with
+    r = WarmupController::classify(1, false, done(90, 10, 10, true, false, 1), last, {}, false);
+    QCOMPARE(r.result, WarmupRun::Result::Finished);
+    QCOMPARE(r.left, 10);
+    QCOMPARE(WarmupController::classify(4, false, done(40, 0, 60, false, true, 4), last, {}, true).result, WarmupRun::Result::Cancelled);
     last.pausedForRam = true;
-    r = WarmupController::classify(0, false, done, last, {}, false);
+    r = WarmupController::classify(0, false, done(40, 0, 60, false, false, 0), last, {}, false);
     QCOMPARE(r.result, WarmupRun::Result::StoppedPartWay);
     QVERIFY(r.stoppedForRam);
-    r = WarmupController::classify(3, false, std::nullopt, last, QStringLiteral("another XSEmu process is running"), false);
+    QCOMPARE(r.left, 60);
+    last.pausedForRam = false;
+    // a crash has no done line: what the pass built is what its last progress line said, and what it
+    // left is unknown rather than zero
+    r = WarmupController::classify(3, true, std::nullopt, last, QStringLiteral("the driver compile crashed"), false);
     QCOMPARE(r.result, WarmupRun::Result::Failed);
     QCOMPARE(r.exitCode, 3);
+    QCOMPARE(r.done, 60);
+    QCOMPARE(r.left, qint64(-1));
+    QCOMPARE(r.message, QStringLiteral("the driver compile crashed"));
+    r = WarmupController::classify(3, false, std::nullopt, last, QStringLiteral("another XSEmu process is running"), false);
+    QCOMPARE(r.result, WarmupRun::Result::Failed);
     QCOMPARE(r.message, QStringLiteral("another XSEmu process is running"));
     QCOMPARE(WarmupController::classify(9, true, std::nullopt, last, {}, true).result, WarmupRun::Result::Cancelled);
     QCOMPARE(WarmupController::phaseIndex(QStringLiteral("compute_blobs")), 4);
+}
+
+void TestSettings::warmupResume()
+{
+    // what Continue runs: the pass the newest unfinished run was running, and only that one
+    const auto run = [](WarmupRun::Result result, qint64 done, qint64 left, bool full = false, const QString& profile = {}) {
+        WarmupRun r;
+        r.titleId = QStringLiteral("NorthwindInteractive.SignalGarden");
+        r.runnerId = QString();
+        r.result = result;
+        r.done = done;
+        r.left = left;
+        r.full = full;
+        r.profile = profile;
+        return r;
+    };
+    const QString id = QStringLiteral("NorthwindInteractive.SignalGarden");
+    const auto resumable = [&](const QList<WarmupRun>& runs, const std::optional<WarmupCheckpoint>& inFlight, const QString& profile = {}) {
+        return WarmupController::resumable(runs, inFlight, id, QString(), profile);
+    };
+    QVERIFY(!resumable({}, std::nullopt).has_value());
+    QVERIFY(!resumable({run(WarmupRun::Result::Finished, 3120, 0)}, std::nullopt).has_value());
+    QVERIFY(!resumable({run(WarmupRun::Result::NothingToBuild, 0, -1)}, std::nullopt).has_value());
+    // a pass that finished can still leave builds it could not make, and those are Continue's
+    std::optional<WarmupController::Resume> r = resumable({run(WarmupRun::Result::Finished, 3120, 16)}, std::nullopt);
+    QVERIFY(r.has_value());
+    QCOMPARE(r->left, 16);
+    // a failed build is not built: the count Continue names leaves it to the leftovers
+    WarmupRun someFailed = run(WarmupRun::Result::Cancelled, 100, 20);
+    someFailed.failed = 10;
+    r = resumable({someFailed}, std::nullopt);
+    QVERIFY(r.has_value());
+    QCOMPARE(r->built, 90);
+    QCOMPARE(r->left, 20);
+    // a crash that built something: Continue goes on from it, with the same pass and no count at all,
+    // because progress counts pipelines the pass dealt with instead of pipelines it built
+    r = resumable({run(WarmupRun::Result::Failed, 2180, -1), run(WarmupRun::Result::Finished, 3120, 0)}, std::nullopt);
+    QVERIFY(r.has_value());
+    QCOMPARE(r->built, qint64(-1));
+    QCOMPARE(r->left, qint64(-1));
+    QVERIFY(!r->full);
+    // a refusal before the pass started left nothing to continue
+    QVERIFY(!resumable({run(WarmupRun::Result::Failed, 0, -1)}, std::nullopt).has_value());
+    // a full pass stopped by its budget keeps --full: the next pass is the one it was
+    r = resumable({run(WarmupRun::Result::StoppedPartWay, 1000, 400, true)}, std::nullopt);
+    QVERIFY(r.has_value());
+    QVERIFY(r->full);
+    QCOMPARE(r->left, 400);
+    // a changed run profile means its keys are not this profile's keys
+    QVERIFY(!resumable({run(WarmupRun::Result::Cancelled, 100, 20, false, QStringLiteral("a|b"))}, std::nullopt, QStringLiteral("c|d")).has_value());
+    QVERIFY(resumable({run(WarmupRun::Result::Cancelled, 100, 20, false, QStringLiteral("a|b"))}, std::nullopt, QStringLiteral("a|b")).has_value());
+    QVERIFY(resumable({run(WarmupRun::Result::Cancelled, 100, 20, false, QString())}, std::nullopt, QStringLiteral("a|b")).has_value());
+    // another game's run is not this game's
+    WarmupRun other = run(WarmupRun::Result::Cancelled, 100, 20);
+    other.titleId = QStringLiteral("Other.Title");
+    QVERIFY(!resumable({other}, std::nullopt).has_value());
+    // a pass the launcher did not see the end of (it closed or died) beats the recorded runs, and the
+    // phase it had reached is all it can say
+    WarmupCheckpoint pass;
+    pass.titleId = id;
+    pass.full = true;
+    pass.phase = QStringLiteral("bound");
+    pass.startedAt = QDateTime::currentDateTime();
+    r = resumable({run(WarmupRun::Result::Cancelled, 100, 20)}, pass);
+    QVERIFY(r.has_value());
+    QCOMPARE(r->built, qint64(-1));
+    QCOMPARE(r->phase, QStringLiteral("bound"));
+    QVERIFY(r->full);
+}
+
+void TestSettings::warmupCheckpointRoundTrip()
+{
+    QTemporaryDir dir;
+    QVERIFY(dir.isValid());
+    const QString path = dir.filePath(QStringLiteral("settings.ini"));
+    {
+        AppSettings settings(path);
+        QVERIFY(!settings.warmupInFlight().has_value());
+        WarmupCheckpoint pass;
+        pass.titleId = QStringLiteral("NorthwindInteractive.SignalGarden");
+        pass.titleName = QStringLiteral("Signal Garden");
+        pass.profile = QStringLiteral("lockhart|hlsl");
+        pass.full = true;
+        pass.phase = QStringLiteral("bound");
+        pass.startedAt = QDateTime::currentDateTime();
+        settings.setWarmupInFlight(pass);
+        // a new launcher process reads it back: that is what makes Continue survive a restart
+        AppSettings again(path);
+        const auto back = again.warmupInFlight();
+        QVERIFY(back.has_value());
+        QCOMPARE(back->titleId, pass.titleId);
+        QCOMPARE(back->phase, QStringLiteral("bound"));
+        QCOMPARE(back->profile, QStringLiteral("lockhart|hlsl"));
+        QVERIFY(back->full);
+        QCOMPARE(back->startedAt.toSecsSinceEpoch(), pass.startedAt.toSecsSinceEpoch());
+        again.setWarmupInFlight(std::nullopt);
+        QVERIFY(!again.warmupInFlight().has_value());
+    }
 }
 
 void TestSettings::formats()

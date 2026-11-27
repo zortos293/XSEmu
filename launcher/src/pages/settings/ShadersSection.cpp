@@ -49,15 +49,15 @@ bool isShaderCacheFolder(const QDir& dir)
 QWidget* SettingsSections::shaders(Services& s)
 {
     const SettingsKit::Section sec = SettingsKit::makeSection(
-        QStringLiteral("Shaders"), QStringLiteral("XSEmu translates console shaders to DXIL and keeps the result, so each one compiles once."));
+        QStringLiteral("Shaders"), QStringLiteral("XSEmu Core translates console shaders to DXIL and keeps the result, so each one compiles once."));
     sec.caps(QStringLiteral("Warm-up"));
     auto* onChange = new Toggle;
     sec.row(QStringLiteral("Warm up when the translator changes"),
-            QStringLiteral("Runs the blocking warm-up before launch after an XSEmu update. Skipped when nothing changed."), onChange)
-        ->setUnavailable(QStringLiteral("XSEmu doesn't report its translator version to the launcher yet."));
+            QStringLiteral("Runs the blocking warm-up before launch after an XSEmu Core update. Skipped when nothing changed."), onChange)
+        ->setUnavailable(QStringLiteral("XSEmu Core doesn't report its translator version to the launcher yet."));
     sec.row(QStringLiteral("RAM floor"), QStringLiteral("Compiles wait while less than this is free, in the warm-up and in games."),
             SettingsKit::status(QStringLiteral("1 GB free"), Theme::Role::Text));
-    sec.add(new InfoNote(QStringLiteral("XSEmu uses as much memory as it needs. Each compile starts when its estimated peak fits in free RAM minus the 1 GB floor, and waits in a queue until memory frees otherwise. There is no fixed limit on giant compiles.")), 12);
+    sec.add(new InfoNote(QStringLiteral("XSEmu Core uses as much memory as it needs. Each compile starts when its estimated peak fits in free RAM minus the 1 GB floor, and waits in a queue until memory frees otherwise. There is no fixed limit on giant compiles.")), 12);
 
     sec.caps(QStringLiteral("Cache"));
     auto* pathRow = new QWidget;
@@ -121,7 +121,7 @@ QWidget* SettingsSections::shaders(Services& s)
         if (dir.isEmpty())
             return;
         if (!isShaderCacheFolder(QDir(dir))) {
-            pathNote->setText(QStringLiteral("Pick an empty folder or an existing XSEmu shader cache."));
+            pathNote->setText(QStringLiteral("Pick an empty folder or an existing XSEmu Core shader cache."));
             pathNote->show();
             return;
         }
@@ -181,7 +181,7 @@ QWidget* SettingsSections::shaders(Services& s)
                         return;
                     }
                     if (!cleared.kept.isEmpty()) {
-                        driver->setText(QStringLiteral("Cleared. These aren't XSEmu's, so they were kept: %1.").arg(cleared.kept.join(QStringLiteral(", "))));
+                        driver->setText(QStringLiteral("Cleared. These aren't XSEmu Core's, so they were kept: %1.").arg(cleared.kept.join(QStringLiteral(", "))));
                         driver->setRole(Theme::Role::Text2);
                         confirm->hide();
                         cancel->setText(QStringLiteral("Close"));

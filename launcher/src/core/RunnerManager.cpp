@@ -133,7 +133,7 @@ bool RunnerManager::relocate(const QString& id, const QString& folder, Relocatio
     };
     const RunnerSpec* spec = Runners::find(id);
     if (!spec || spec->isBuiltIn())
-        return refuse(QStringLiteral("XSEmu comes with the launcher; it has no folder of its own to move."));
+        return refuse(QStringLiteral("XSEmu Core comes with the launcher; it has no folder of its own to move."));
     if (!m_settings)
         return refuse(QStringLiteral("Runner locations need the launcher settings."));
     if (const QString busy = busyReason(id); !busy.isEmpty())
@@ -382,7 +382,7 @@ bool RunnerManager::install(const QString& id, QString* error)
     };
     const RunnerSpec* spec = Runners::find(id);
     if (!spec || spec->isBuiltIn())
-        return refuse(QStringLiteral("XSEmu comes with the launcher and has nothing to install."));
+        return refuse(QStringLiteral("XSEmu Core comes with the launcher and has nothing to install."));
     if (!spec->isPinned())
         return refuse(QStringLiteral("%1 is not available yet: no release is pinned for this launcher version.").arg(spec->name));
     if (m_task) {
@@ -439,7 +439,7 @@ bool RunnerManager::uninstall(const QString& id, QString* error)
     const RunnerSpec* spec = Runners::find(id);
     if (!spec || spec->isBuiltIn()) {
         if (error)
-            *error = QStringLiteral("XSEmu comes with the launcher and cannot be uninstalled here.");
+            *error = QStringLiteral("XSEmu Core comes with the launcher and cannot be uninstalled here.");
         return false;
     }
     if (const QString busy = busyReason(id); !busy.isEmpty()) {

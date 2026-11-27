@@ -154,6 +154,7 @@ Event parse(const QByteArray& raw)
         WarmupDone d;
         d.built = toInt(o, "built");
         d.failed = toInt(o, "failed");
+        d.left = optInt(o, "left").value_or(-1);
         d.tooBig = toInt(o, "too_big");
         d.tookS = optDouble(o, "took_s").value_or(0);
         d.complete = flag(o, "complete");

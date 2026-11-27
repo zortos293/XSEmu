@@ -53,13 +53,13 @@ FloatingBar::FloatingBar(Services& services)
     , m_title(new Label({}, Label::Style::SmallStrong, Theme::Role::HudText))
     , m_runner(new Label({}, Label::Style::Small, Theme::Role::HudText))
     , m_time(new Label({}, Label::Style::Small, Theme::Role::HudText2))
-    , m_show(new Button(QStringLiteral("Show XSEmu"), Button::Variant::OnArt, Button::Size::Tiny, QStringLiteral("back")))
+    , m_show(new Button(QStringLiteral("Show XSEmu Launcher"), Button::Variant::OnArt, Button::Size::Tiny, QStringLiteral("back")))
     , m_stop(new Button(QStringLiteral("Stop"), Button::Variant::DangerGhost, Button::Size::Tiny, QStringLiteral("stop")))
 {
     setObjectName(QStringLiteral("floatingBar"));
     setAttribute(Qt::WA_TranslucentBackground);
     setAttribute(Qt::WA_ShowWithoutActivating);
-    setWindowTitle(QStringLiteral("XSEmu"));
+    setWindowTitle(QStringLiteral("XSEmu Launcher"));
     m_show->setObjectName(QStringLiteral("floatingShow"));
     m_stop->setObjectName(QStringLiteral("floatingStop"));
 

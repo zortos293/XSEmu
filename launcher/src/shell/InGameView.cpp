@@ -429,8 +429,8 @@ public:
             break;
         case K::Error:
             m_title->setText(QStringLiteral("%1 couldn't start").arg(title));
-            body = QStringLiteral("XSEmu stopped before the game showed a frame (exit code %1). Nothing was changed, and the memory is free again.").arg(code);
-            caption = QStringLiteral("XSEmu's log for this game. Stays on this PC, nothing is uploaded.");
+            body = QStringLiteral("XSEmu Core stopped before the game showed a frame (exit code %1). Nothing was changed, and the memory is free again.").arg(code);
+            caption = QStringLiteral("XSEmu Core's log for this game. Stays on this PC, nothing is uploaded.");
             relaunch->setText(QStringLiteral("Try again"));
             report->setText(QStringLiteral("Open log"));
             break;
@@ -439,10 +439,10 @@ public:
         case K::TitleExit:
             m_title->setText(QStringLiteral("%1 stopped").arg(title));
             if (!info.sawExitLine)
-                body = QStringLiteral("XSEmu ended without saying why, with code %1%2%3. The launcher is fine, %4the memory is free again.")
+                body = QStringLiteral("XSEmu Core ended without saying why, with code %1%2%3. The launcher is fine, %4the memory is free again.")
                            .arg(code, name.isEmpty() ? QString() : QStringLiteral(" (%1)").arg(name), after, saved);
             else
-                body = QStringLiteral("XSEmu exited with code %1%2%3. The launcher is fine, %4the memory is free again.")
+                body = QStringLiteral("XSEmu Core exited with code %1%2%3. The launcher is fine, %4the memory is free again.")
                            .arg(code, name.isEmpty() ? QString() : QStringLiteral(" (%1)").arg(name), after, saved);
             relaunch->setText(QStringLiteral("Relaunch"));
             report->setText(QStringLiteral("Open crash report"));
