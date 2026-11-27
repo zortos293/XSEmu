@@ -99,6 +99,13 @@ public:
     bool restorePreviousCore(QString* error);
     QString previousCoreDir() const;
 
+    // A test lever for the released build, read from XSEMU_UPDATE_TEST once at start: "install" takes
+    // whatever a check finds (the Core first, then the launcher) and "restore" puts the previous Core
+    // back and quits. It exists so the release's self-update can be tested end to end on a machine
+    // nobody is clicking at; it is unreachable from the UI, does nothing unless the variable is set,
+    // and records every step in update-test.log beside the settings.
+    void armTestLever(const QString& lever);
+
     // Re-read the installed versions and the kept previous copy (no network).
     void refresh();
 
@@ -130,6 +137,8 @@ private:
     // The Core program is not the build the launcher asked about any more.
     void forgetCoreAnswer() const;
     void runInstall(Part part, const ReleasePart& releasePart);
+    void stepTestInstall();
+    void noteTestLever(const QString& line);
     bool applyCore(const QString& staged, const ReleasePart& part, const QString& updateDir, QString* error);
     QString writeUpdaterScript(QString* error) const;
 
@@ -142,6 +151,9 @@ private:
     Status m_status;
     bool m_manual = false;
     bool m_simulated = false;
+    QString m_testLever;
+    bool m_testInstalledCore = false;
+    bool m_testInstalledLauncher = false;
     QThread* m_thread = nullptr;
     std::atomic<bool> m_cancel{false};
 };

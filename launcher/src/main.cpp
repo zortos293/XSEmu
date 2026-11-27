@@ -48,6 +48,12 @@ int main(int argc, char** argv)
     }
 #endif
 
+    // A test lever for the released build, off unless XSEMU_UPDATE_TEST names one. It is armed before
+    // the window opens so a restore leaves no window behind, and it is what lets the release's
+    // self-update be tested on a machine nobody is clicking at.
+    const QString testLever = qEnvironmentVariable("XSEMU_UPDATE_TEST");
+    services.updates.armTestLever(testLever);
+
     window.resize(Metrics::WindowWidth, 800);
     window.show();
 
@@ -55,7 +61,10 @@ int main(int argc, char** argv)
     // needed. An update found a few seconds in, so the library is usable at once, and nothing is ever
     // installed without the user asking for it.
     QObject::connect(&services.emulator, &EmulatorController::helloReceived, &services.updates, &UpdateService::noteEmulatorStarted);
-    if (services.settings.checkForUpdates() && services.settings.firstLaunchDone())
+    // The lever's install half checks whether or not the user's settings ask for checks: the point of
+    // the lever is to run the whole path in a scratch folder with a settings file it wrote itself.
+    if (testLever == QLatin1String("install")
+        || (services.settings.checkForUpdates() && services.settings.firstLaunchDone()))
         QTimer::singleShot(6000, &services.updates, [&services] { services.updates.check(false); });
     // The launcher's files are staged and its updater script runs: quit so it can replace them.
     QObject::connect(&services.updates, &UpdateService::launcherUpdateReady, &app, &QCoreApplication::quit);
