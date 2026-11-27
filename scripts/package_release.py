@@ -168,9 +168,17 @@ def release_notes(manifest: dict, with_redist: bool) -> str:
         "",
         "## Source and licence",
         "",
-        "The source is this repository at tag `%s`: GPL-3.0-or-later. The launcher ships Qt 6 under "
-        "the LGPL-3.0 and Microsoft's DXC (`dxcompiler.dll`, `dxil.dll`) under its own licence. No game "
-        "files, keys or saves are included, and none are downloaded." % manifest["tag"],
+        "The source is this repository at tag `%s`: **GPL-3.0-or-later** (`LICENSE`), and every file "
+        "the project took from elsewhere, with its licence and how it is used, is listed in "
+        "`THIRD_PARTY.md`. Of those, the GPL-3.0 units that ship inside XSEmu Core are "
+        "`crates/xcl-cgbj/` (CGBJ's shader translator, copied at `f4b48ad`, GPL-3.0-or-later, with "
+        "`PROVENANCE.md` and `PROVENANCE.sha256`) and the parts of the D3D12 runtime ported from "
+        "VIctory and its forks (`title_gta6.rs`, `title_gta6_ambient.rs`, `image_writeback.rs`, "
+        "`pso_manifest.rs`, `pso_sched.rs`, `warm_children.rs`, each file's header naming its source "
+        "commit), plus the XMA2 decoder after FFmpeg's `wmaprodec.c` under the LGPL-2.1. The launcher "
+        "ships Qt 6 under the LGPL-3.0 and Microsoft's DXC (`dxcompiler.dll`, `dxil.dll`) under its "
+        "own licence. The corresponding source for everything GPL is this repository at the tag "
+        "above. No game files, keys or saves are included, and none are downloaded." % manifest["tag"],
         "",
     ])
 
