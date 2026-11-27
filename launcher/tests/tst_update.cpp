@@ -22,7 +22,11 @@
 #include <QTemporaryDir>
 #include <QTest>
 
+#include <cstdio>
+#include <cstdlib>
+#include <chrono>
 #include <functional>
+#include <thread>
 
 namespace {
 
@@ -415,12 +419,21 @@ private slots:
         updates.check(true);
         QVERIFY(waitFor([&] { return !updates.status().busy(); }));
         QVERIFY(updates.status().coreUpdate);
+        const QDateTime placedAt = QFileInfo(f.coreProgram()).lastModified();
         updates.install(UpdateService::Part::Core);
         QVERIFY(waitFor([&] { return !updates.status().busy(); }));
         QCOMPARE(updates.installedCoreVersion(), QStringLiteral("0.1.1-pre.1"));
 
         QString error;
         QVERIFY2(updates.restorePreviousCore(&error), qPrintable(error));
+        // A copy of the same size can land on the same modification time as the file it replaced
+        // (a coarse file time, a fast filesystem), and the launcher must not answer with the build
+        // that was asked about before: the runner's Windows job caught exactly that.
+        {
+            QFile back(f.coreProgram());
+            QVERIFY(back.open(QIODevice::ReadWrite));
+            QVERIFY(back.setFileTime(placedAt, QFileDevice::FileModificationTime));
+        }
         QCOMPARE(shaOf(bytesOf(f.coreProgram())), shaOf(handPlaced));
         QVERIFY2(!QFileInfo::exists(QDir(f.coreDir).filePath(QStringLiteral("version.json"))),
                  "the version file the update brought says nothing about the Core that is back");
@@ -590,5 +603,23 @@ private:
     };
 };
 
-QTEST_GUILESS_MAIN(TestUpdate)
+// A stall outside waitFor - a file operation or a probe that never returns on this platform - would
+// otherwise hang until the harness' timeout with the output still in a pipe buffer, which reads as
+// nothing at all. Flush what ran and give up instead, so the last test named is where it stalled.
+static void abortIfStalled()
+{
+    std::this_thread::sleep_for(std::chrono::seconds(90));
+    std::fflush(stdout);
+    std::fprintf(stderr, "FAIL!  : TestUpdate made no progress for 90 s (the last test above is where it stalled)\n");
+    std::fflush(stderr);
+    std::_Exit(3);
+}
+
+int main(int argc, char** argv)
+{
+    std::thread(abortIfStalled).detach();
+    QCoreApplication app(argc, argv);
+    TestUpdate tc;
+    return QTest::qExec(&tc, argc, argv);
+}
 #include "tst_update.moc"

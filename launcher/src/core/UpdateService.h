@@ -127,6 +127,8 @@ private:
     void setState(State state, const QString& message);
 
     void runCheck(const CheckInputs& in);
+    // The Core program is not the build the launcher asked about any more.
+    void forgetCoreAnswer() const;
     void runInstall(Part part, const ReleasePart& releasePart);
     bool applyCore(const QString& staged, const ReleasePart& part, const QString& updateDir, QString* error);
     QString writeUpdaterScript(QString* error) const;

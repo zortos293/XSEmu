@@ -242,6 +242,8 @@ QString UpdateService::installedCoreVersion() const
     return v;
 }
 
+void UpdateService::forgetCoreAnswer() const { EmulatorBuild::forget(m_settings.emulatorPath()); }
+
 QString UpdateService::previousCoreDir() const { return m_coreDir + QLatin1String(".old"); }
 
 void UpdateService::simulateForScreenshot(const Status& status)
@@ -710,12 +712,14 @@ bool UpdateService::applyCore(const QString& staged, const ReleasePart& part, co
         if (!QFile::copy(join(staged, f.name), to) || fileSha256(to).compare(f.sha256, Qt::CaseInsensitive) != 0) {
             if (restore()) {
                 removeTree(recent);
+                forgetCoreAnswer();
                 return fail(QStringLiteral("Could not put %1 in place; the Core that was there is back.").arg(f.name));
             }
             return fail(QStringLiteral("Could not put %1 in place, and the Core that was there could not be put back: its files are kept in %2.")
                             .arg(f.name, QDir::toNativeSeparators(recent)));
         }
     }
+    forgetCoreAnswer();
     return true;
 }
 
@@ -853,6 +857,7 @@ bool UpdateService::restorePreviousCore(QString* error)
     if (QFileInfo::exists(join(m_coreDir, QString::fromLatin1(kCoreVersionFile))) && !kept.contains(QString::fromLatin1(kCoreVersionFile)))
         QFile::remove(join(m_coreDir, QString::fromLatin1(kCoreVersionFile)));
     removeTree(previous);
+    forgetCoreAnswer();
     refresh();
     m_status.message = QStringLiteral("The previous XSEmu Core (%1) is back.")
                            .arg(m_status.installedCore.isEmpty() ? QStringLiteral("version unknown") : m_status.installedCore);
