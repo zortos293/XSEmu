@@ -407,7 +407,7 @@ void TestCoverArt::failedImageDownloadKeepsTheOldArt()
     qputenv("XSEMU_SGDB_PROXY", api.base().toUtf8());
     api.routes[QStringLiteral("/api/v2/search/autocomplete/Kept")] = {{200, "application/json", "{\"success\":true,\"data\":[{\"id\":21,\"name\":\"Kept\"}]}", {}}};
     api.routes[QStringLiteral("/api/v2/grids/game/21?dimensions=600x900&types=static")] = {{200, "application/json", images(api.imageUrl(QStringLiteral("k.png")), QStringLiteral("Di")), {}}};
-    api.routes[QStringLiteral("/img/k.png")] = {{200, "image/png", "kept-cover", {}}, {503, "text/plain", "busy", {}}};
+    api.routes[QStringLiteral("/img/k.png")] = {{200, "image/png", "kept-cover", {}}, {503, "text/plain", "busy", {}}, {200, "text/html", "<html>oops</html>", {}}};
     QTemporaryDir dir;
     AppSettings settings(dir.filePath(QStringLiteral("settings.ini")));
     CoverArtService covers(settings, dir.filePath(QStringLiteral("covers")));
@@ -423,6 +423,11 @@ void TestCoverArt::failedImageDownloadKeepsTheOldArt()
     QVERIFY(cover.open(QIODevice::ReadOnly));
     QCOMPARE(cover.readAll(), QByteArray("kept-cover"));
     QVERIFY(!covers.lastError(g.titleId()).isEmpty());
+
+    covers.refresh(g); // a 200 that is not an image fails the lookup too
+    QTRY_COMPARE_WITH_TIMEOUT(failed.size(), 2, 10000);
+    QCOMPARE(covers.cache().entry(g.titleId()).fetchedAt, fetched);
+    QVERIFY(QFile::exists(covers.artPath(g.titleId(), CoverCache::Kind::Grid)));
 }
 
 void TestCoverArt::replacingACustomImageIsSafe()

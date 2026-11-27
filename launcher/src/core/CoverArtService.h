@@ -156,7 +156,7 @@ private:
     void downloadImage(CoverCache::Kind kind, const Image& image, std::function<void()> next);
     bool holdOnRateLimit(QNetworkReply* reply);
     void finishCurrent();
-    void failCurrent(QNetworkReply* reply);
+    void failCurrent(const QString& message);
     QNetworkReply* apiGet(const QUrl& url);
     QNetworkAccessManager* net();
 

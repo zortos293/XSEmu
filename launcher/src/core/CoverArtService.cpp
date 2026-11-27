@@ -463,13 +463,20 @@ bool CoverArtService::setCustomImage(const QString& titleId, CoverCache::Kind ki
         QFile::remove(part);
         return false;
     }
-    if (!e.customFile(kind).isEmpty() && e.customFile(kind) != name)
-        QFile::remove(dir.filePath(e.customFile(kind)));
-    QFile::remove(dest);
-    if (!QFile::rename(part, dest)) {
+    const QString backup = dest + QStringLiteral(".old");
+    QFile::remove(backup);
+    if (QFile::exists(dest) && !QFile::rename(dest, backup)) {
         QFile::remove(part);
         return false;
     }
+    if (!QFile::rename(part, dest)) {
+        QFile::rename(backup, dest);
+        QFile::remove(part);
+        return false;
+    }
+    QFile::remove(backup);
+    if (!e.customFile(kind).isEmpty() && e.customFile(kind) != name)
+        QFile::remove(dir.filePath(e.customFile(kind)));
     e.customFile(kind) = name;
     m_cache.put(titleId, e);
     emit artChanged(titleId);
@@ -546,7 +553,7 @@ void CoverArtService::startSearch()
         if (holdOnRateLimit(reply))
             return;
         if (httpStatus(reply) != 200) {
-            failCurrent(reply);
+            failCurrent(errorMessage(reply, reply->readAll()));
             return;
         }
         const QList<Match> matches = parseSearch(reply->readAll());
@@ -584,7 +591,7 @@ void CoverArtService::fetchKind(size_t index)
             return;
         const int status = httpStatus(reply);
         if (status != 200 && status != 404) {
-            failCurrent(reply);
+            failCurrent(errorMessage(reply, reply->readAll()));
             return;
         }
         const Image image = status == 200 ? parseFirstImage(reply->readAll(), base) : Image();
@@ -607,20 +614,31 @@ void CoverArtService::downloadImage(CoverCache::Kind kind, const Image& image, s
         reply->deleteLater();
         const int status = httpStatus(reply);
         if (status == 0 || status == 429 || status >= 500) {
-            failCurrent(reply);
+            failCurrent(errorMessage(reply, reply->readAll()));
+            return;
+        }
+        if (status >= 400) {
+            next();
             return;
         }
         const QByteArray bytes = reply->readAll();
-        const bool isImage = reply->header(QNetworkRequest::ContentTypeHeader).toString().startsWith(QLatin1String("image/"));
-        if (reply->error() == QNetworkReply::NoError && isImage && !bytes.isEmpty() && bytes.size() <= kMaxImageBytes) {
-            const QString name = CoverCache::fileName(m_job.game.titleId(), kind, QFileInfo(image.url.path()).suffix());
-            QDir().mkpath(m_cache.dir());
-            QSaveFile f(QDir(m_cache.dir()).filePath(name));
-            if (f.open(QIODevice::WriteOnly) && f.write(bytes) == bytes.size() && f.commit()) {
-                m_found.file(kind) = name;
-                m_found.authors[size_t(kind)] = image.author;
-            }
+        if (reply->error() != QNetworkReply::NoError) {
+            failCurrent(reply->errorString());
+            return;
         }
+        if (!reply->header(QNetworkRequest::ContentTypeHeader).toString().startsWith(QLatin1String("image/")) || bytes.isEmpty() || bytes.size() > kMaxImageBytes) {
+            failCurrent(QStringLiteral("SteamGridDB's image server sent something that is not an image."));
+            return;
+        }
+        const QString name = CoverCache::fileName(m_job.game.titleId(), kind, QFileInfo(image.url.path()).suffix());
+        QDir().mkpath(m_cache.dir());
+        QSaveFile f(QDir(m_cache.dir()).filePath(name));
+        if (!f.open(QIODevice::WriteOnly) || f.write(bytes) != bytes.size() || !f.commit()) {
+            failCurrent(QStringLiteral("Couldn't save the art: %1").arg(f.errorString()));
+            return;
+        }
+        m_found.file(kind) = name;
+        m_found.authors[size_t(kind)] = image.author;
         next();
     });
 }
@@ -646,10 +664,9 @@ void CoverArtService::finishCurrent()
     pump();
 }
 
-void CoverArtService::failCurrent(QNetworkReply* reply)
+void CoverArtService::failCurrent(const QString& message)
 {
     const QString id = m_job.game.titleId();
-    const QString message = errorMessage(reply, reply->readAll());
     m_failures.insert(id, {QDateTime::currentDateTimeUtc(), message});
     m_busy = false;
     if (std::none_of(m_queue.cbegin(), m_queue.cend(), [&](const Job& j) { return j.game.titleId() == id; }))
