@@ -110,6 +110,8 @@ thread_local! {
     /// what this thread counted: the tests compare deltas while three other tests submit in the
     /// same process and the product's counters are shared
     static TEST_COUNTS: std::cell::RefCell<[u64; 23]> = const { std::cell::RefCell::new([0; 23]) };
+    /// submissions this thread reported, so a test can tell whether the queue's own wrapper did it
+    static REPORTS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
 fn count(c: Count) {
@@ -523,10 +525,17 @@ fn uav_state(img: &Image, state: u32) -> bool {
 
 /// The PC lists went to queue, in this order: the images they wrote are captured and guarded,
 /// and every image they wrote or transitioned is ordered after them.
+#[cfg(test)]
+pub(super) fn reports() -> u64 {
+    REPORTS.with(|r| r.get())
+}
+
 pub(super) unsafe fn submitted(queue: *mut c_void, lists: &[*mut c_void]) {
     if !ACTIVE.load(Ordering::Relaxed) || lists.is_empty() || super::title_textures::is_own_work() {
         return;
     }
+    #[cfg(test)]
+    REPORTS.with(|r| r.set(r.get() + 1));
     let Some(q) = ID3D12CommandQueue::from_raw_borrowed(&queue) else { return };
     let notes = super::title_textures::list_transitions(lists);
     let mut writes: BTreeMap<usize, BTreeSet<u32>> = BTreeMap::new();

@@ -2037,9 +2037,9 @@ mod tests {
             assert!(called.get());
             before_close(raw);
             list.Close().unwrap();
-            submit(first.as_raw(), &[raw], || {
-                first.ExecuteCommandLists(&executable)
-            });
+            // The queue's own wrapper reports a submission (XCL's ExecuteCommandLists goes through
+            // `submit`), so wrapping it here as well counted the same submission twice.
+            first.ExecuteCommandLists(&executable);
             let first_id = queue_token(first.as_raw()).unwrap();
             let (fence, value) = fence_of(first_id, index);
             crate::gpu::fence::wait(&fence, value, &dev, None, 5_000).unwrap();
@@ -2049,9 +2049,7 @@ mod tests {
 
             let unblock = Unblock(gate.clone());
             replay.Wait(&gate, 1).unwrap();
-            submit(replay.as_raw(), &[raw], || {
-                replay.ExecuteCommandLists(&executable)
-            });
+            replay.ExecuteCommandLists(&executable);
             let replay_id = queue_token(replay.as_raw()).unwrap();
             let (fence, value) = fence_of(replay_id, index);
             assert_ne!(first_id, replay_id);

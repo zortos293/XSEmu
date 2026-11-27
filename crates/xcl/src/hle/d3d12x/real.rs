@@ -12956,6 +12956,11 @@ mod device_abi_tests {
         use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_SAMPLE_DESC};
 
         assert_eq!(super::super::backend(), super::super::Backend::Real);
+        // A console mesh program becomes a host mesh shader through the DX compiler: without it the
+        // build misses and creation answers E_INVALIDARG (it goes to the background in a launcher).
+        if let Err(e) = crate::gpu::recomp::dxc::location() {
+            return crate::gpu::recomp::runner::skip_test(&format!("no DX compiler: {e}"));
+        }
         let mut psv = [0u8; 56];
         psv[..4].copy_from_slice(&48u32.to_le_bytes());
         psv[16..18].copy_from_slice(&3u16.to_le_bytes());
@@ -12974,16 +12979,6 @@ mod device_abi_tests {
             ID3D12Device::from_raw_borrowed(&device_raw()).is_some_and(|d| crate::gpu::recomp::pso::mesh_native_split(&d).is_some())
         };
         for tag in [D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_AS] {
-            if tag == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_AS {
-                // A console stream with only an AS has nothing to become: the host pipeline needs a
-                // mesh program, and the stream has none (its MS is the subobject the other iteration
-                // builds, and that is the pair a title really makes). The emulator should hand such a
-                // title a stand-in whose draws are skipped, as it does for a program it cannot
-                // translate; it answers E_INVALIDARG today, which is what this names.
-                crate::gpu::recomp::runner::skip_test(
-                    "a console AS-only mesh stream has no host mesh pipeline yet, so it is refused");
-                continue;
-            }
             let mut stream = StreamOut::default();
             stream.shader(tag, &ms);
             stream.shader(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS, ps);
