@@ -24,6 +24,7 @@
 
 #include <cstdio>
 #include <cstdlib>
+#include <atomic>
 #include <chrono>
 #include <functional>
 #include <thread>
@@ -162,11 +163,23 @@ QJsonObject manifestJson(const QString& tag, const QJsonObject& launcher, const 
                        {QStringLiteral("core"), core}};
 }
 
+// Progress of the run, in milliseconds: a test starting or waitFor still waiting moves it, and the
+// watchdog at the end of this file gives up only when it stops moving.
+static std::atomic<long long> g_progress{0};
+
+static long long nowMs()
+{
+    return std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+
+static void noteProgress() { g_progress.store(nowMs()); }
+
 bool waitFor(const std::function<bool()>& done, int timeoutMs = 30000)
 {
     QElapsedTimer clock;
     clock.start();
     while (clock.elapsed() < timeoutMs) {
+        noteProgress();
         QCoreApplication::processEvents(QEventLoop::AllEvents, 20);
         if (done())
             return true;
@@ -217,6 +230,8 @@ class TestUpdate : public QObject {
     Q_OBJECT
 
 private slots:
+    void init() { noteProgress(); }
+
     void versions_data()
     {
         QTest::addColumn<QString>("candidate");
@@ -419,20 +434,22 @@ private slots:
         updates.check(true);
         QVERIFY(waitFor([&] { return !updates.status().busy(); }));
         QVERIFY(updates.status().coreUpdate);
-        const QDateTime placedAt = QFileInfo(f.coreProgram()).lastModified();
         updates.install(UpdateService::Part::Core);
         QVERIFY(waitFor([&] { return !updates.status().busy(); }));
         QCOMPARE(updates.installedCoreVersion(), QStringLiteral("0.1.1-pre.1"));
+        // The launcher asks the installed program which build it is (the About page, a game start) and
+        // keeps the answer under its path, size and modification time. The Core put back below has the
+        // same size by definition, so on a filesystem with a coarse file time it can carry the same
+        // time too: a kept answer must not survive the rollback.
+        const QDateTime installedAt = QFileInfo(f.coreProgram()).lastModified();
+        QVERIFY(EmulatorBuild::probe(f.coreProgram()).found);
 
         QString error;
         QVERIFY2(updates.restorePreviousCore(&error), qPrintable(error));
-        // A copy of the same size can land on the same modification time as the file it replaced
-        // (a coarse file time, a fast filesystem), and the launcher must not answer with the build
-        // that was asked about before: the runner's Windows job caught exactly that.
         {
             QFile back(f.coreProgram());
             QVERIFY(back.open(QIODevice::ReadWrite));
-            QVERIFY(back.setFileTime(placedAt, QFileDevice::FileModificationTime));
+            QVERIFY(back.setFileTime(installedAt, QFileDevice::FileModificationTime));
         }
         QCOMPARE(shaOf(bytesOf(f.coreProgram())), shaOf(handPlaced));
         QVERIFY2(!QFileInfo::exists(QDir(f.coreDir).filePath(QStringLiteral("version.json"))),
@@ -606,17 +623,24 @@ private:
 // A stall outside waitFor - a file operation or a probe that never returns on this platform - would
 // otherwise hang until the harness' timeout with the output still in a pipe buffer, which reads as
 // nothing at all. Flush what ran and give up instead, so the last test named is where it stalled.
+// Progress is a test starting or waitFor still waiting, so a suite that is merely slow keeps going.
 static void abortIfStalled()
 {
-    std::this_thread::sleep_for(std::chrono::seconds(90));
-    std::fflush(stdout);
-    std::fprintf(stderr, "FAIL!  : TestUpdate made no progress for 90 s (the last test above is where it stalled)\n");
-    std::fflush(stderr);
-    std::_Exit(3);
+    constexpr long long stalledMs = 60'000;
+    for (;;) {
+        std::this_thread::sleep_for(std::chrono::seconds(5));
+        if (nowMs() - g_progress.load() < stalledMs)
+            continue;
+        std::fflush(stdout);
+        std::fprintf(stderr, "FAIL!  : TestUpdate made no progress for 60 s (the last test above is where it stalled)\n");
+        std::fflush(stderr);
+        std::_Exit(3);
+    }
 }
 
 int main(int argc, char** argv)
 {
+    noteProgress();
     std::thread(abortIfStalled).detach();
     QCoreApplication app(argc, argv);
     TestUpdate tc;
