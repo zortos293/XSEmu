@@ -26,6 +26,7 @@ private slots:
     void runProfileSettingsOwnedKeysWin();
     void runProfileValidation();
     void titleConfigAtLaunch();
+    void qualityPresets();
     void warmupClassification();
     void warmupResume();
     void warmupCheckpointRoundTrip();
@@ -353,6 +354,62 @@ void TestSettings::titleConfigAtLaunch()
     TitleConfig(Paths::xclToml(other)).set(QStringLiteral("device_type"), QStringLiteral("anaconda"));
     s.clearGameOverride(other, QStringLiteral("device_type"));
     QCOMPARE(LaunchConfig::deviceType(s, other), QStringLiteral("lockhart"));
+}
+
+void TestSettings::qualityPresets()
+{
+    QTemporaryDir dir;
+    qputenv("XCL_DATA_ROOT", dir.filePath(QStringLiteral("xcl")).toUtf8());
+    const QString ini = dir.filePath(QStringLiteral("s.ini"));
+    const QString id = QStringLiteral("Northwind.Title");
+    AppSettings s(ini);
+
+    // Clear: neither switch, and no budget the launcher would have to explain
+    QVERIFY(!LaunchConfig::qualityPreset(s, id));
+    QCOMPARE(LaunchConfig::titleValues(s, id), (QVariantMap{{QStringLiteral("device_type"), QStringLiteral("lockhart")}}));
+    QProcessEnvironment env = LaunchConfig::runEnvironment(QProcessEnvironment(), s, id);
+    QVERIFY(!env.contains(QStringLiteral("XCL_UPSCALER")));
+    QVERIFY(!env.contains(QStringLiteral("XCL_DLSS_MODE")));
+
+    // each preset sets its DLSS mode and its title budget (the Series S standard is 8192 MiB)
+    const QList<QPair<QString, QPair<QString, qint64>>> presets{
+        {QStringLiteral("quality"), {QStringLiteral("quality"), 8192}},
+        {QStringLiteral("balanced"), {QStringLiteral("balanced"), 6144}},
+        {QStringLiteral("performance"), {QStringLiteral("performance"), 4096}},
+    };
+    for (const auto& [key, expected] : presets) {
+        s.setGameOverride(id, QStringLiteral("qualityPreset"), key);
+        env = LaunchConfig::runEnvironment(QProcessEnvironment(), s, id);
+        QCOMPARE(env.value(QStringLiteral("XCL_UPSCALER")), QStringLiteral("dlss"));
+        QCOMPARE(env.value(QStringLiteral("XCL_DLSS_MODE")), expected.first);
+        QCOMPARE(LaunchConfig::titleValues(s, id).value(QStringLiteral("title_memory_mb")).toLongLong(), expected.second);
+    }
+
+    // the choice survives a restart, and prepareTitle writes the budget into xcl.toml
+    AppSettings reread(ini);
+    QVERIFY(LaunchConfig::qualityPreset(reread, id));
+    QCOMPARE(LaunchConfig::titleValues(reread, id).value(QStringLiteral("title_memory_mb")).toLongLong(), 4096);
+    QCOMPARE(LaunchConfig::runEnvironment(QProcessEnvironment(), reread, id).value(QStringLiteral("XCL_DLSS_MODE")), QStringLiteral("performance"));
+    QVERIFY(LaunchConfig::prepareTitle(reread, id));
+    QCOMPARE(TitleConfig(Paths::xclToml(id)).value(QStringLiteral("title_memory_mb")).toLongLong(), 4096);
+
+    // a run profile line naming a switch is the more specific choice and wins over the preset
+    reread.setRunProfile({QStringLiteral("XCL_DLSS_MODE=ultra-performance")});
+    env = LaunchConfig::runEnvironment(QProcessEnvironment(), reread, id);
+    QCOMPARE(env.value(QStringLiteral("XCL_UPSCALER")), QStringLiteral("dlss"));
+    QCOMPARE(env.value(QStringLiteral("XCL_DLSS_MODE")), QStringLiteral("ultra-performance"));
+
+    // a title_memory_mb the user set on purpose beats the preset's number
+    reread.setGameOverride(id, QStringLiteral("title_memory_mb"), 2048);
+    QCOMPARE(LaunchConfig::titleValues(reread, id).value(QStringLiteral("title_memory_mb")).toLongLong(), 2048);
+    reread.clearGameOverride(id, QStringLiteral("title_memory_mb"));
+
+    // an unknown stored value is Clear, not a crash or half a preset
+    reread.resetRunProfile();
+    reread.setGameOverride(id, QStringLiteral("qualityPreset"), QStringLiteral("ultra"));
+    QVERIFY(!LaunchConfig::qualityPreset(reread, id));
+    env = LaunchConfig::runEnvironment(QProcessEnvironment(), reread, id);
+    QVERIFY(!env.contains(QStringLiteral("XCL_UPSCALER")) && !env.contains(QStringLiteral("XCL_DLSS_MODE")));
 }
 
 void TestSettings::warmupClassification()

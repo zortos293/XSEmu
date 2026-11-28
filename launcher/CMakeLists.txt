@@ -51,6 +51,7 @@ add_library(xsemu_core STATIC
     src/core/Format.cpp src/core/Format.h
     src/core/Game.cpp src/core/Game.h
     src/core/GameManifest.cpp src/core/GameManifest.h
+    src/core/GraphicsPreset.cpp src/core/GraphicsPreset.h
     src/core/HardwareInfo.cpp src/core/HardwareInfo.h
     src/core/LaunchConfig.cpp src/core/LaunchConfig.h
     src/core/NativeWindow.cpp src/core/NativeWindow.h

@@ -65,6 +65,7 @@ private:
     RunProfileEditor* m_profileEditor;
     Label* m_profileNote;
     QList<SegmentedControl*> m_overrideSegs; // one per override row, built on the first refresh
+    Label* m_presetNote = nullptr;           // what the active quality preset sets
     Label* m_overrideCount = nullptr;
     Button* m_overrideReset = nullptr;
     QString m_runLog; // the log the Last run card links to; empty when none
