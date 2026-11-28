@@ -846,7 +846,7 @@ pub fn backend() -> String {
 // ---------------------------------------------------------------------------------------
 //
 // Not distributed with XCL (like DXC): `opus.dll` – libopus (BSD-3-Clause), built for Windows – is
-// looked for in `%XCL_OPUS_DIR%`, then next to XSEmu.exe (`opus.dll`, `libopus.dll`, `libopus-0.dll`).
+// looked for in `%XCL_OPUS_DIR%`, then next to xcl.exe (`opus.dll`, `libopus.dll`, `libopus-0.dll`).
 // Windows' own decoder is used first when the system has it. Only the decoder is used.
 
 type OpusDecoderCreateFn = unsafe extern "C" fn(i32, i32, *mut i32) -> *mut c_void;
@@ -908,7 +908,7 @@ fn libopus() -> Result<&'static LibOpus, String> {
                     });
                 }
             }
-            Err("no opus.dll (libopus) in %XCL_OPUS_DIR% or next to XSEmu.exe".to_string())
+            Err("no opus.dll (libopus) in %XCL_OPUS_DIR% or next to xcl.exe".to_string())
         })
         .as_ref()
         .map_err(|e| e.clone())

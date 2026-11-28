@@ -319,6 +319,31 @@ impl<'a> Lower<'a> {
         (out, int)
     }
 
+    // xsemu: from fxceless/victory-fork d4b786f (PR 927, gpu/half-views) crates/victory-gpu/src/descriptor/host.rs (half_view, half_format), GPL-3.0
+    /// The unsigned format of the same layout where a d16 access's 16 bits move unchanged
+    /// (`XCL_RECOMP_D16_HALF_BITS`): a 16-bit float format whose view has every channel the
+    /// access names and picks them without a DST_SEL constant. The format itself otherwise.
+    pub(super) fn x_d16_twin(&mut self, f: V, swizzle: Option<V>, channels: u32) -> V {
+        let (seven, four, ch) = (self.xi(7), self.xi(4), self.xi(channels));
+        let has = self.xb(Bin::And, f, seven);
+        let mut ok = self.xc(pred::IUGE, has, ch);
+        if let Some(d3) = swizzle {
+            for k in 0..channels {
+                let sel = self.x_field(d3, 3 * k, 7);
+                let ident = self.xc(pred::IUGE, sel, four);
+                ok = self.xb(Bin::And, ok, ident);
+            }
+        }
+        let (k11, k27, k69, k13, k29, k73) = (self.xi(11), self.xi(27), self.xi(69), self.xi(13), self.xi(29), self.xi(73));
+        let e13 = self.xc(pred::EQ, f, k13);
+        let e29 = self.xc(pred::EQ, f, k29);
+        let e73 = self.xc(pred::EQ, f, k73);
+        let t = self.xs(e73, k69, f);
+        let t = self.xs(e29, k27, t);
+        let t = self.xs(e13, k11, t);
+        self.xs(ok, t, f)
+    }
+
     /// Loaded components `xs` as halves, two to a register and the low half first: an
     /// integer format's low 16 bits, any other as a half float. With `high` (the register's
     /// value) the one half goes above that value's low half.

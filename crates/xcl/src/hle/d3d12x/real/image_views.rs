@@ -43,6 +43,8 @@ pub(crate) struct Slice {
 }
 
 #[derive(Clone, Debug)]
+// View generations are not read yet; kept for the next fix.
+#[allow(dead_code)]
 pub(crate) struct View {
     pub resource: ID3D12Resource, pub slice: Slice, pub generation: u64,
     pub mips: u32, pub layers: u32,
@@ -119,17 +121,23 @@ pub(super) fn forget_resource(owner: usize) {
 pub(super) fn note_twin(native: usize, original: usize) {
     if enabled() { TABLE.lock().unwrap().twins.insert(native,original); }
 }
+// The shadow-image plan path has no caller yet; kept for the next fix.
+#[allow(dead_code)]
 pub(crate) fn shadow_origin(actual_native: &ID3D12Resource) -> Result<Option<ID3D12Resource>,Error> {
     let t = TABLE.lock().unwrap();
     let Some(&origin) = t.twins.get(&(actual_native.as_raw() as usize)) else {return Ok(None)};
     unsafe { super::try_reference_depth_capture(origin) }.map(Some).ok_or("depth shadow owner retiring")
 }
 
+// The shadow-image plan path has no caller yet; kept for the next fix.
+#[allow(dead_code)]
 pub(crate) struct Operand {
     pub native:ID3D12Resource, pub tag_owner:ID3D12Resource, pub image:GuestImage,
     pub sub:u32, pub guest_plane:u32, pub is_twin:bool,
 }
 
+// The shadow-image plan path has no caller yet; kept for the next fix.
+#[allow(dead_code)]
 pub(crate) unsafe fn operand(actual:&ID3D12Resource, role:ImageUse, sub:u32)->Result<Operand,Error>{
     let origin=shadow_origin(actual)?;
     let rd=actual.GetDesc();
@@ -264,6 +272,8 @@ pub(crate) enum Event {
     End,
 }
 #[derive(Clone, Copy, Debug)]
+// Clear(Color) is not read by the pass layer yet; kept for the next fix.
+#[allow(dead_code)]
 pub(crate) enum Clear { Color([f32;4]), DepthStencil {depth:Option<f32>, stencil:Option<u8>} }
 
 pub(super) unsafe fn bind(n:u32,handles:*const usize,single:i32,ds:*const usize)->Result<Event,Error>{

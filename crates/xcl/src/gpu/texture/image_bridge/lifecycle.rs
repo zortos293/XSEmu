@@ -9,9 +9,13 @@ use std::sync::Arc;
 use windows::core::{IUnknown, Interface};
 use windows::Win32::Graphics::Direct3D12::*;
 
+// The native-operation lifecycle is not scheduled yet; kept for the next fix.
+#[allow(dead_code)]
 type Result<T> = std::result::Result<T, String>;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+// The native-operation lifecycle is not scheduled yet; kept for the next fix.
+#[allow(dead_code)]
 pub(crate) enum Access {
     Read,
     PartialWrite,
@@ -19,6 +23,8 @@ pub(crate) enum Access {
     Discard,
 }
 
+// The native-operation lifecycle is not scheduled yet; kept for the next fix.
+#[allow(dead_code)]
 pub(crate) struct Operand {
     pub image: GuestImage,
     pub native: ID3D12Resource,
@@ -36,11 +42,15 @@ pub(crate) struct Operand {
 /// Retains every binding and temporary referenced by the native operation.
 /// Record the one original operation on the provided fresh list, never submit
 /// here. Resolve only against the retained descriptor/run snapshot.
+// The native-operation lifecycle is not scheduled yet; kept for the next fix.
+#[allow(dead_code)]
 pub(crate) trait NativeOperation: Send + Sync {
     unsafe fn record(&self, list: &ID3D12GraphicsCommandList) -> Result<()>;
     fn pin(&self, image: &GuestImage, vpn: u32, location: Location) -> std::result::Result<Arc<PinnedPage>, &'static str>;
 }
 
+// The native-operation lifecycle is not scheduled yet; kept for the next fix.
+#[allow(dead_code)]
 pub(crate) struct Epoch {
     pub directory: Directory,
     pub heap: ID3D12DescriptorHeap,
@@ -48,6 +58,8 @@ pub(crate) struct Epoch {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+// The native-operation lifecycle is not scheduled yet; kept for the next fix.
+#[allow(dead_code)]
 pub(crate) enum Progress {
     WaitingCapture,
     WaitingOwnership,
@@ -56,6 +68,8 @@ pub(crate) enum Progress {
     Complete,
 }
 
+// The native-operation lifecycle is not scheduled yet; kept for the next fix.
+#[allow(dead_code)]
 struct Use {
     states: States,
     evidence: PayloadEvidence,
@@ -64,12 +78,16 @@ struct Use {
     discard: bool,
 }
 
+// The native-operation lifecycle is not scheduled yet; kept for the next fix.
+#[allow(dead_code)]
 struct Group {
     plane: Plane,
     capture: usize,
     uses: BTreeMap<u32, Use>,
 }
 
+// The native-operation lifecycle is not scheduled yet; kept for the next fix.
+#[allow(dead_code)]
 struct Capture {
     image: GuestImage,
     pages: CapturedPages,
@@ -77,10 +95,14 @@ struct Capture {
     topology: Option<CapturedTopology>,
 }
 
+// The native-operation lifecycle is not scheduled yet; kept for the next fix.
+#[allow(dead_code)]
 fn same_image(a: &GuestImage, b: &GuestImage) -> bool {
     a.va == b.va && a.desc == b.desc && a.host == b.host && a.initial == b.initial
 }
 
+// The native-operation lifecycle is not scheduled yet; kept for the next fix.
+#[allow(dead_code)]
 fn describe_use(op: &Operand, desc: D3D12_RESOURCE_DESC, kind: D3D12_COMMAND_LIST_TYPE) -> Result<Use> {
     if !op.image.permits(op.role) || (matches!(op.role, ImageUse::Sample) && op.access != Access::Read) {
         return Err("guest image does not permit native operation role".into());
@@ -120,6 +142,8 @@ fn describe_use(op: &Operand, desc: D3D12_RESOURCE_DESC, kind: D3D12_COMMAND_LIS
     })
 }
 
+// The native-operation lifecycle is not scheduled yet; kept for the next fix.
+#[allow(dead_code)]
 enum Stage {
     Start,
     Capture,
@@ -129,6 +153,8 @@ enum Stage {
     Failed(String),
 }
 
+// The native-operation lifecycle is not scheduled yet; kept for the next fix.
+#[allow(dead_code)]
 struct Inner {
     stage: Stage,
     dev: ID3D12Device,
@@ -149,11 +175,15 @@ struct Inner {
 }
 
 #[must_use]
+// The native-operation lifecycle is not scheduled yet; kept for the next fix.
+#[allow(dead_code)]
 pub(crate) struct Operation(Option<Box<Inner>>);
 
 impl Operation {
     /// Call at actual execution readiness. The epoch and all raw requests must
     /// describe this same reserved queue position, not guest recording time.
+    // The native-operation lifecycle is not scheduled yet; kept for the next fix.
+    #[allow(dead_code)]
     pub(crate) unsafe fn new(
         queue: &ID3D12CommandQueue,
         epoch: Epoch,
@@ -276,6 +306,8 @@ impl Operation {
         }))))
     }
 
+    // The native-operation lifecycle is not scheduled yet; kept for the next fix.
+    #[allow(dead_code)]
     pub(crate) unsafe fn poll(&mut self) -> Result<Progress> {
         let Some(s) = self.0.as_mut() else {
             return Ok(Progress::Complete);
@@ -295,6 +327,8 @@ impl Operation {
 }
 
 impl Inner {
+    // The native-operation lifecycle is not scheduled yet; kept for the next fix.
+    #[allow(dead_code)]
     unsafe fn advance(&mut self) -> Result<Progress> {
         match self.stage {
             Stage::Start => {

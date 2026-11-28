@@ -719,6 +719,11 @@ impl<'a> Lanes<'a> {
                     && !self.scc_every.contains(&scc)
                     && let Some(&(writer, index)) = self.defs.get(&scc)
                     && p.blocks[writer].insts[index].write(Reg::S(EXEC)).is_none()
+                    // xsemu: not a pixel program's discard idiom on the XCL binding's retry
+                    // (`crate::emit::xcl::per_lane_discard`)
+                    && !(crate::emit::xcl::per_lane_discard()
+                        && p.blocks[writer].insts[index].name() == "s_andn2_b32"
+                        && p.blocks[writer].insts[index].read(Reg::S(EXEC)).is_some())
                 {
                     self.wave_scc.insert(b);
                 }

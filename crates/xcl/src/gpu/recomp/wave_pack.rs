@@ -21,7 +21,7 @@ pub(super) fn lane_code(code: &str, upper: bool) -> String {
             let lane_local = token.as_bytes().get(1).is_some_and(u8::is_ascii_digit)
                 && (token.starts_with('t') || token.starts_with('v'))
                 || token.starts_with("xcl_ov") || token.starts_with("scr_")
-                || matches!(token, "xcl_on" | "xcl_op" | "xcl_slot" | "xcl_scratch");
+                || matches!(token, "xcl_on" | "xcl_op" | "xcl_slot" | "xcl_thread" | "xcl_scratch");
             if upper && lane_local {
                 out.push_str("hi_");
             }

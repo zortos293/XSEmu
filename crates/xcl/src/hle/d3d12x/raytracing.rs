@@ -28,6 +28,9 @@
 //! themselves. VIctory forks' `--no-rt` (DexNom RayTime: builder, ray bins, activation, traversal
 //! and resolve left out) is the same selection; GTA VI never asks for the ray-tracing tier
 //! (play-92 logs no `OPTIONS5` query), so its non-RT path cannot be chosen through a capability.
+//! Ray-tracing pipelines - those whose shaders traverse acceleration structures and the title's
+//! ray passes, under either gate - can be built in a queue of their own, `pso_sched::RT_AT_ONCE`
+//! of them at a time, after every other build (`XCL_RT_COMPILE_QUEUE=1`; off by default).
 
 use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
@@ -173,11 +176,34 @@ pub fn left_out<'a>(compute: bool, builder: bool, shaders: impl Iterator<Item = 
     why
 }
 
+/// A pipeline whose console compute shaders traverse acceleration structures (`traces_rays`) or
+/// are one of the title's ray passes (`title_gta6::miss_ray_pass`): the ray-tracing class, whatever
+/// the ray-tracing setting – built and run with every ray a miss (`miss_pass`), tracing rays with
+/// ray tracing on. Its builds go in a queue of their own, `pso_sched::RT_AT_ONCE` at a time
+/// (`pso_async::rt_pass_last`, `pso_sched::rt_compile_queue`).
+pub(super) fn rt_pipeline<'a>(compute: bool, shaders: impl Iterator<Item = &'a [u8]>) -> bool {
+    if !compute {
+        return false;
+    }
+    static SEEN: Mutex<Option<HashMap<u64, bool>>> = Mutex::new(None);
+    shaders.into_iter().any(|s| {
+        let id = crate::gpu::shader::fnv64(s);
+        if let Some(&found) = SEEN.lock().unwrap().as_ref().and_then(|m| m.get(&id)) {
+            return found;
+        }
+        let found = traces_rays(s) || super::title_gta6::miss_ray_pass(s).is_some();
+        SEEN.lock().unwrap().get_or_insert_with(HashMap::new).insert(id, found);
+        found
+    })
+}
+
 /// Ray tracing off with every ray a miss (`XCL_RT_GATE=miss`): a pipeline of these console shaders
-/// traverses acceleration structures or is one of the title's ray passes, so it is built and runs,
-/// but behind every other build (`pso_async::rt_pass_last`; `XCL_RT_PASS_LAST=0`: in its place). Its
-/// output with every ray a miss is never what a world pass waits for: play-101 queued ~1,070 of
-/// them (999 CS_RaytracingResolve permutations) beside the pipelines the frame drew with.
+/// traverses acceleration structures or is one of the title's ray passes (`rt_pipeline`), so it is
+/// built and runs, but behind every other build (`pso_async::rt_pass_last`;
+/// `XCL_RT_PASS_LAST=0`: in its place). Its output with every ray a miss is never what a world
+/// pass waits for: play-101 queued ~1,070 of them (999 CS_RaytracingResolve permutations) beside
+/// the pipelines the frame drew with, and play-128 built hundreds of them beside the frame
+/// (`pso_sched::RT_AT_ONCE` of them at once).
 pub fn miss_pass<'a>(compute: bool, shaders: impl Iterator<Item = &'a [u8]>) -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     let on = *ON.get_or_init(|| {
@@ -187,19 +213,10 @@ pub fn miss_pass<'a>(compute: bool, shaders: impl Iterator<Item = &'a [u8]>) -> 
         }
         on
     });
-    if !compute || !on || !off() || !crate::gpu::recomp::rt_all_miss() {
+    if !on || !off() || !crate::gpu::recomp::rt_all_miss() {
         return false;
     }
-    static SEEN: Mutex<Option<HashMap<u64, bool>>> = Mutex::new(None);
-    let found = shaders.into_iter().any(|s| {
-        let id = crate::gpu::shader::fnv64(s);
-        if let Some(&found) = SEEN.lock().unwrap().as_ref().and_then(|m| m.get(&id)) {
-            return found;
-        }
-        let found = traces_rays(s) || super::title_gta6::miss_ray_pass(s).is_some();
-        SEEN.lock().unwrap().get_or_insert_with(HashMap::new).insert(id, found);
-        found
-    });
+    let found = rt_pipeline(compute, shaders);
     if found {
         let n = MISS_PASSES.fetch_add(1, Ordering::Relaxed) + 1;
         if n == 1 || (n.is_power_of_two() && n >= 64) {

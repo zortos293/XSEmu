@@ -97,7 +97,7 @@ pub(super) fn take_capture(pso: usize) -> Option<(u64, u32)> {
     if TAKEN.load(Ordering::Relaxed) >= limit || SHADERS.lock().unwrap().as_ref()?.get(&pso) != Some(&hash) {
         return None;
     }
-    let index = TAKEN.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |i| (i < limit).then_some(i + 1)).ok()?;
+    let index = TAKEN.try_update(Ordering::Relaxed, Ordering::Relaxed, |i| (i < limit).then_some(i + 1)).ok()?;
     Some((hash, index + 1))
 }
 

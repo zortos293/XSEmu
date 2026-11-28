@@ -1,5 +1,5 @@
-//! The switches of the CGBJ compute emitter. Parsing is pure: `parse` takes a lookup so tests
-//! can feed it values without touching the environment.
+//! The switches of the CGBJ emitter. Parsing is pure: `parse` takes a lookup so tests can feed
+//! it values without touching the environment.
 
 /// Which translator a shader stage asks for (`XCL_SHADER_EMITTER`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -17,16 +17,19 @@ pub enum Refused {
     Skip,
 }
 
-/// The stages `XCL_SHADER_EMITTER` names. Only `cs` is honoured for now.
+/// The stages `XCL_SHADER_EMITTER` names. `cs` and `ps` are honoured.
 pub const STAGES: [&str; 4] = ["cs", "ps", "vs", "ms"];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Switches {
     pub compute: Emitter,
-    /// Stages other than compute that asked for CGBJ, which they cannot have yet.
+    pub pixel: Emitter,
+    /// Stages other than compute and pixel that asked for CGBJ, which they cannot have yet.
     pub unavailable: Vec<&'static str>,
     /// `XCL_SHADER_EMITTER_ONLY`: CGBJ only for these blob hashes.
     pub only: Option<Vec<u64>>,
+    /// `XCL_SHADER_EMITTER_ONLY_PS`: the same for pixel programs alone; unset, `only` applies
+    pub only_pixel: Option<Vec<u64>>,
     /// `XCL_SHADER_EMITTER_SKIP`: never CGBJ for these blob hashes. Wins over `only`.
     pub skip: Vec<u64>,
     pub refused: Refused,
@@ -39,17 +42,30 @@ pub struct Switches {
 impl Switches {
     pub const OFF: Switches = Switches {
         compute: Emitter::Xcl,
+        pixel: Emitter::Xcl,
         unavailable: Vec::new(),
         only: None,
+        only_pixel: None,
         skip: Vec::new(),
         refused: Refused::Xcl,
         wave_exact: true,
         validate: true,
     };
 
-    /// Whether the compute program with this blob hash goes to CGBJ.
-    pub fn wants(&self, hash: u64) -> bool {
-        self.compute == Emitter::Cgbj && !self.skip.contains(&hash) && self.only.as_ref().is_none_or(|only| only.contains(&hash))
+    /// Whether the program with this blob hash goes to CGBJ, its stage asking for `emitter`.
+    pub fn wants(&self, emitter: Emitter, hash: u64) -> bool {
+        self.wants_with(emitter, self.only.as_ref(), hash)
+    }
+
+    /// Whether the pixel program with this blob hash goes to CGBJ: the pixel stage asking
+    /// for it, under `XCL_SHADER_EMITTER_ONLY_PS` when that is set and `XCL_SHADER_EMITTER_ONLY`
+    /// otherwise.
+    pub fn wants_pixel(&self, hash: u64) -> bool {
+        self.wants_with(self.pixel, self.only_pixel.as_ref().or(self.only.as_ref()), hash)
+    }
+
+    fn wants_with(&self, emitter: Emitter, only: Option<&Vec<u64>>, hash: u64) -> bool {
+        emitter == Emitter::Cgbj && !self.skip.contains(&hash) && only.is_none_or(|only| only.contains(&hash))
     }
 }
 
@@ -74,8 +90,10 @@ pub fn parse(get: impl Fn(&str) -> Option<String>) -> Result<Switches, String> {
     };
     Ok(Switches {
         compute: stages[0],
-        unavailable: STAGES.iter().zip(stages).skip(1).filter(|(_, e)| *e == Emitter::Cgbj).map(|(s, _)| *s).collect(),
+        pixel: stages[1],
+        unavailable: STAGES.iter().zip(stages).skip(2).filter(|(_, e)| *e == Emitter::Cgbj).map(|(s, _)| *s).collect(),
         only: hashes("XCL_SHADER_EMITTER_ONLY")?.filter(|h| !h.is_empty()),
+        only_pixel: hashes("XCL_SHADER_EMITTER_ONLY_PS")?.filter(|h| !h.is_empty()),
         skip: hashes("XCL_SHADER_EMITTER_SKIP")?.unwrap_or_default(),
         refused: if choice("XCL_CGBJ_REFUSED", ["xcl", "skip"])? { Refused::Xcl } else { Refused::Skip },
         wave_exact: choice("XCL_CGBJ_WAVE", ["exact", "approx"])?,
@@ -133,7 +151,7 @@ mod tests {
     fn unset_is_off_and_reads_nothing_else() {
         assert_eq!(with(&[]), Ok(Switches::OFF));
         assert_eq!(with(&[("XCL_SHADER_EMITTER", "xcl"), ("XCL_CGBJ_WAVE", "bogus")]), Ok(Switches::OFF));
-        assert!(!Switches::OFF.wants(1));
+        assert!(!Switches::OFF.wants(Switches::OFF.compute, 1) && !Switches::OFF.wants(Switches::OFF.pixel, 1));
     }
 
     #[test]
@@ -152,19 +170,28 @@ mod tests {
     #[test]
     fn other_stages_are_noted_as_unavailable() {
         let s = with(&[("XCL_SHADER_EMITTER", "cgbj")]).unwrap();
-        assert_eq!(s.compute, Emitter::Cgbj);
-        assert_eq!(s.unavailable, vec!["ps", "vs", "ms"]);
+        assert_eq!((s.compute, s.pixel), (Emitter::Cgbj, Emitter::Cgbj));
+        assert_eq!(s.unavailable, vec!["vs", "ms"]);
         let s = with(&[("XCL_SHADER_EMITTER", "cs:xcl,vs:cgbj")]).unwrap();
-        assert_eq!(s.compute, Emitter::Xcl);
+        assert_eq!((s.compute, s.pixel), (Emitter::Xcl, Emitter::Xcl));
         assert_eq!(s.unavailable, vec!["vs"]);
-        assert!(!s.wants(1));
+        assert!(!s.wants(s.compute, 1) && !s.wants(s.pixel, 1));
+    }
+
+    #[test]
+    fn pixel_and_compute_are_chosen_apart() {
+        let s = with(&[("XCL_SHADER_EMITTER", "ps:cgbj")]).unwrap();
+        assert_eq!((s.compute, s.pixel, s.unavailable.clone()), (Emitter::Xcl, Emitter::Cgbj, vec![]));
+        assert!(s.wants(s.pixel, 1) && !s.wants(s.compute, 1));
+        let s = with(&[("XCL_SHADER_EMITTER", "cs:cgbj, ps:cgbj")]).unwrap();
+        assert_eq!((s.compute, s.pixel), (Emitter::Cgbj, Emitter::Cgbj));
     }
 
     #[test]
     fn defaults_when_on() {
         let s = with(&[("XCL_SHADER_EMITTER", "cs:cgbj")]).unwrap();
         assert_eq!((s.refused, s.wave_exact, s.validate, s.only.clone(), s.skip.clone()), (Refused::Xcl, true, true, None, vec![]));
-        assert!(s.wants(0x1234));
+        assert!(s.wants(s.compute, 0x1234) && !s.wants(s.pixel, 0x1234));
     }
 
     #[test]
@@ -185,11 +212,25 @@ mod tests {
     }
 
     #[test]
+    fn only_pixel_is_the_pixel_stages_own_list() {
+        let s = with(&[("XCL_SHADER_EMITTER", "cs:cgbj,ps:cgbj"), ("XCL_SHADER_EMITTER_ONLY", "1,2"), ("XCL_SHADER_EMITTER_ONLY_PS", "3")]).unwrap();
+        assert!(s.wants(s.compute, 1) && s.wants(s.compute, 2) && !s.wants(s.compute, 3));
+        assert!(s.wants_pixel(3) && !s.wants_pixel(1) && !s.wants_pixel(2));
+        let s = with(&[("XCL_SHADER_EMITTER", "cs:cgbj,ps:cgbj"), ("XCL_SHADER_EMITTER_ONLY_PS", "3")]).unwrap();
+        assert_eq!(s.only, None);
+        assert!(s.wants(s.compute, 1) && s.wants_pixel(3) && !s.wants_pixel(1));
+        let s = with(&[("XCL_SHADER_EMITTER", "cs:cgbj,ps:cgbj"), ("XCL_SHADER_EMITTER_ONLY", "1"), ("XCL_SHADER_EMITTER_ONLY_PS", " ")]).unwrap();
+        assert!(s.wants(s.compute, 1) && !s.wants(s.compute, 2) && s.wants_pixel(2));
+    }
+
+    #[test]
     fn only_and_skip() {
         let s = with(&[("XCL_SHADER_EMITTER", "cgbj"), ("XCL_SHADER_EMITTER_ONLY", "1,2"), ("XCL_SHADER_EMITTER_SKIP", "2")]).unwrap();
-        assert!(s.wants(1));
-        assert!(!s.wants(2));
-        assert!(!s.wants(3));
+        assert!(s.wants(s.compute, 1) && s.wants(s.pixel, 1));
+        assert!(!s.wants(s.compute, 2));
+        assert!(!s.wants(s.compute, 3));
+        // a pixel program follows the shared list when no pixel list is set
+        assert!(s.wants_pixel(1) && !s.wants_pixel(2) && !s.wants_pixel(3));
         let s = with(&[("XCL_SHADER_EMITTER", "cgbj"), ("XCL_SHADER_EMITTER_ONLY", " ")]).unwrap();
         assert_eq!(s.only, None);
         assert!(with(&[("XCL_SHADER_EMITTER", "cgbj"), ("XCL_SHADER_EMITTER_SKIP", "nope")]).unwrap_err().contains("XCL_SHADER_EMITTER_SKIP"));

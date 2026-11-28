@@ -13,7 +13,7 @@ use windows::Win32::Graphics::Dxgi::Common::*;
 use windows::Win32::Graphics::Dxgi::{CreateDXGIFactory1, IDXGIFactory4, DXGI_ADAPTER_FLAG_SOFTWARE, DXGI_ERROR_NOT_FOUND};
 
 use super::super::{real, title_textures};
-use super::{Budget, State};
+use super::{Budget, Relief, State};
 
 const WIDTH: u32 = 32;
 const HEIGHT: u32 = 16;
@@ -491,13 +491,13 @@ fn evicted_local_buffer_and_texture_keep_contents() {
         gpu.q.Wait(&gate, 1).unwrap();
         gpu.q.Signal(&*submitted, 1).unwrap();
         super::stamp(&mut state.opaque_last, &submitted, 1);
-        let trimmed_while_pending = state.trim(&dev, 0);
+        let trimmed_while_pending = state.trim(&dev, 0, Relief::pressure());
         gate.Signal(1).unwrap();
         crate::gpu::fence::wait(&submitted, 1, &dev, None, 10_000).unwrap();
         assert!(!trimmed_while_pending, "an opaque list pins all reachable memory until its queue completes");
         assert!(state.objects[&buffer].resident && state.objects[&texture].resident);
 
-        assert!(state.trim(&dev, 0), "evicting the older buffer should bring usage under budget");
+        assert!(state.trim(&dev, 0, Relief::pressure()), "evicting the older buffer should bring usage under budget");
         assert!(!state.objects[&buffer].resident && state.objects[&texture].resident, "LRU should evict only the buffer");
         state.restore(&dev, &[buffer]).expect("restore the buffer heap");
         assert!(state.objects[&buffer].resident && !state.objects[&texture].resident, "the texture should make room for the buffer");
@@ -519,7 +519,7 @@ fn low_budget_spills_buffer_and_texture_to_l0_without_changing_contents() {
         state.budget = Budget::default();
         state.budget_override = Some(1);
         let fixture = Fixture::new(&dev, |desc| {
-            let local_fit = state.trim(&dev, desc.SizeInBytes);
+            let local_fit = state.trim(&dev, desc.SizeInBytes, Relief::pressure());
             assert!(!local_fit, "heap unexpectedly fit in a one-byte local budget");
             let mut spill_error = None;
             let l0 = super::spill_properties(&dev, desc.Properties, desc.Flags).expect("discrete adapter has an L0 spill heap type");

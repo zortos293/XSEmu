@@ -2,6 +2,7 @@
 
 The launcher (`launcher/`, Qt 6) and the emulator (`XSEmu.exe`, crate `xcl`) are separate
 processes. XSEmu.exe keeps every behaviour it has today when none of the options below are given.
+In a tree where the binary is still `xcl` the exe is `xcl.exe`; the options and messages are the same.
 
 ## Command lines
 
@@ -82,8 +83,8 @@ Emulator → launcher (stdout):
 |---|---|
 | `{"ev":"warmup_start","total":41906,"full":false,"threads":16}` | Once the target list is known. `total`: the kept pipelines this pass builds (after `--full` resume and the stale filter); the giants and compute blobs are found when their phases start. |
 | `{"ev":"warmup_progress","done":27292,"total":41906,"keys_per_s":243.0,"eta_s":60,"ram_free_mb":12288,"giants_compiling":2,"in_flight":5,"failed":0,"phase":"bound","paused_for_ram":false}` | At most once a second, plus at the end. The same numbers as the existing progress window and console line. `done`/`total` count the current `phase` and start again at 0 of the next phase's total; `phase` is, in order, `starting`, `giants`, `bound`, `compute`, `compute_blobs`, `rest`. `keys_per_s` is the phase's average since it started and `eta_s` the rest of the phase at that rate, left out while the rate is 0. `failed` counts all phases so far. `giants_compiling` is the giants (1 MB of DXIL and up) among the `in_flight` driver compiles; there is no fixed number of giants at once, so no maximum is sent: every compile, giants included, starts when its expected peak fits in the RAM available less the peaks of those running and a 1 GB floor, and in the commit headroom (commit limit less commit charge, less the same peaks) with 1 GB kept. `paused_for_ram` is true when, since the last line, a compile was held back by either of those two memory tests; compiles held for other reasons (a bind waiting, the background limit, memory falling fast) do not set it. |
-| `{"ev":"warmup_done","built":41890,"failed":16,"left":16,"too_big":0,"took_s":812.4,"complete":true,"cancelled":false,"code":0}` | Last line, printed even when the pass failed builds (exit code 1) or was stopped. `complete` false when a budget or cancel stopped it part way. `left` counts the pipelines this pass did not build: those that failed, those too big for the memory limits, the giants a budgeted pass leaves for a full one, and those not started when a budget or cancel stopped it (`built + left` is what the pass went through). A pass that stopped without this line built nothing the next run will not try again: the driver blobs and the `--full` record stay on disk, so running the same command again goes on from there and builds only what `left` named. Exit codes: 0 done, 1 some pipelines failed to build, 2 no D3D12 device, 3 another XSEmu process is running, 4 cancelled. |
-| `{"ev":"error","message":"another XSEmu process is running (XSEmu.exe 1234)"}` | Refused or failed before starting (exit code 3 for the one-process refusal, 2 for no D3D12 device). |
+| `{"ev":"warmup_done","built":41890,"failed":16,"too_big":0,"took_s":812.4,"complete":true,"cancelled":false,"code":0}` | Last line. `complete` false when a budget or cancel stopped it part way. |
+| `{"ev":"error","message":"another XCL process is running (xcl.exe 1234)"}` | Refused or failed before starting (exit code 3 for the one-process refusal, 2 for no D3D12 device). |
 
 Launcher → emulator (stdin): `{"cmd":"cancel"}`. The warm-up stops starting new compiles (one still waiting for
 its memory slot gives up), lets the ones in flight finish, keeps everything already built (blobs and the `--full` resume record), prints

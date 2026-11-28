@@ -2,15 +2,18 @@ use std::{ffi::c_void, mem::ManuallyDrop, sync::OnceLock};
 use windows::{core::Interface, Win32::{Foundation::RECT, Graphics::{Direct3D12::*, Dxgi::Common::DXGI_FORMAT}}};
 
 mod lifecycle;
-pub(crate) use lifecycle::{ExecutionFacts, FootprintBinding};
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum RecordingPoint {
     Adopted,
+    // List-X texture-op scaffolding has no caller yet; kept for the next fix.
+    #[allow(dead_code)]
     Console { chunk: usize, dword: usize },
 }
 
 #[derive(Clone, Copy)]
+// List-X texture-op scaffolding has no caller yet; kept for the next fix.
+#[allow(dead_code)]
 pub(crate) struct Site {
     pub list: usize,
     pub point: RecordingPoint,
@@ -60,6 +63,8 @@ impl Location {
 
     /// Native plane dimensions, including planar subsampling; not the parent
     /// texture's mip-zero shape. Used when no source box/rect was specified.
+    // List-X texture-op scaffolding has no caller yet; kept for the next fix.
+    #[allow(dead_code)]
     pub(crate) unsafe fn extent(&self) -> Result<[u32; 3], String> {
         let f = match self.layout {
             Layout::Footprint { native, .. } => native.Footprint,
@@ -88,6 +93,8 @@ impl Location {
 #[derive(Clone)]
 pub(crate) enum Operation {
     Copy { dst: Location, origin: [u32; 3], src: Location, source_box: Option<D3D12_BOX>, flags: u32 },
+    // List-X texture-op scaffolding has no caller yet; kept for the next fix.
+    #[allow(dead_code)]
     Resolve { dst: Location, src: Location, format: DXGI_FORMAT, region: Option<(u32, u32, Option<RECT>, D3D12_RESOLVE_MODE)> },
 }
 
@@ -112,6 +119,8 @@ impl Operation {
         }
     }
 
+    // List-X texture-op scaffolding has no caller yet; kept for the next fix.
+    #[allow(dead_code)]
     pub(crate) unsafe fn regions(&self) -> Result<(D3D12_BOX,D3D12_BOX),String> {
         let (src, origin, specified) = match self {
             Self::Copy { src, origin, source_box, .. } => (src, *origin, *source_box),
@@ -149,6 +158,8 @@ impl Operation {
     /// Replay only on a fresh, unpatched native list at the certified cut:
     /// outside a pass, unpredicated, both endpoints already in their exact
     /// required states. The scheduler must retain the operation through fence completion.
+    // List-X texture-op scaffolding has no caller yet; kept for the next fix.
+    #[allow(dead_code)]
     pub(crate) unsafe fn issue(&self, list: &ID3D12GraphicsCommandList) -> Result<(), String> {
         if super::real::is_adopted(list.as_raw()) || !self.permits(list.GetType()) {
             return Err("unsupported native texture replay list or copy flags".into());
@@ -182,6 +193,8 @@ pub(crate) unsafe trait OperationCuts: Sync {
 
 static CUTS: OnceLock<&'static dyn OperationCuts> = OnceLock::new();
 
+// List-X texture-op scaffolding has no caller yet; kept for the next fix.
+#[allow(dead_code)]
 pub(crate) fn install(cuts: &'static dyn OperationCuts) -> bool { CUTS.set(cuts).is_ok() }
 pub(crate) fn installed() -> bool { CUTS.get().is_some() }
 

@@ -36,6 +36,8 @@ struct RawView {
     _run: Option<physical_import::ImportedRun>,
 }
 
+// Physical-directory accessor and telemetry have no caller yet; kept for the next fix.
+#[allow(dead_code)]
 pub(super) struct PageBinding {
     view: Arc<RawView>,
     /// the page's bytes into the view
@@ -48,6 +50,8 @@ impl PageBinding {
     pub(super) fn token(&self) -> usize {
         self.page.id()
     }
+    // Physical-directory accessor and telemetry have no caller yet; kept for the next fix.
+    #[allow(dead_code)]
     pub(super) fn resource(&self) -> &ID3D12Resource {
         self.run.resource()
     }
@@ -77,6 +81,8 @@ pub(super) struct Topology {
 pub(super) enum PageLookup {
     Absent,
     Unmapped,
+    // Physical-directory accessor and telemetry have no caller yet; kept for the next fix.
+    #[allow(dead_code)]
     Mapped {
         binding: Arc<PageBinding>,
         offset: u32,
@@ -277,21 +283,12 @@ pub(super) unsafe fn init(device: &ID3D12Device) -> bool {
         .is_some_and(|b| b.dev.as_raw() == device.as_raw())
 }
 
-/// The physical directory is one per process and its tests are not: each one maps pages, publishes a
-/// topology and then reads the index it landed on, so two of them running at once on `cargo test`'s
-/// four threads read each other's indexes. Every test that touches it holds this for its whole run.
-/// A test that panics poisons the lock; the next one takes it anyway, because what it guards is order,
-/// not the directory's integrity.
-#[cfg(test)]
-pub(crate) fn test_serial() -> std::sync::MutexGuard<'static, ()> {
-    static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
-    SERIAL.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
-}
-
 pub(super) fn current_topology() -> Option<Arc<Topology>> {
     Some(Arc::clone(&BACKEND.get()?.head.lock().unwrap()))
 }
 
+// Physical-directory accessor and telemetry have no caller yet; kept for the next fix.
+#[allow(dead_code)]
 pub(super) fn root_index() -> u32 {
     current_topology().map_or(0, |t| t.index())
 }
@@ -471,6 +468,8 @@ pub(super) fn remap_pending(va: u64, len: u64) -> bool {
 }
 
 /// (reads, writes) counted by `note_native_texture_access`.
+// Physical-directory accessor and telemetry have no caller yet; kept for the next fix.
+#[allow(dead_code)]
 pub(super) fn pending_native_texture_hits() -> (u64, u64) {
     (
         PENDING_HITS[0].load(std::sync::atomic::Ordering::Relaxed),

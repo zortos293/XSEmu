@@ -9,6 +9,8 @@ const VIEWS: usize = 8192;
 const CLEARS: usize = 1024;
 
 #[derive(Debug, Clone, Copy)]
+// Recorded with each depth clear; only some of these fields are reported yet.
+#[allow(dead_code)]
 pub(super) struct DepthClear {
     pub(super) depth: f32,
     pub(super) uptime: f64,

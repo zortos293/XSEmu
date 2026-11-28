@@ -142,6 +142,9 @@ fn map_image_ex(path: &Path, is_main: bool, origin: LoadOrigin) -> Result<Arc<Ma
     }
 
     let exports = OwnedExports::from_pe(&pe).unwrap_or_default();
+    // the title's own upscaler dispatch is behind the export table this crate just built, so a
+    // switch that needs its per-frame jitter (XCL_UPSCALER=dlss) hooks it here, before any call
+    crate::hle::d3d12x::fidelityfx::install_if_ffx(&name, base, &exports);
     let module = Arc::new(MappedModule {
         name: name.clone(),
         path: path.to_path_buf(),
@@ -411,7 +414,7 @@ pub fn run_main(m: &Arc<MappedModule>) -> u32 {
     }
 }
 
-/// Called from XSEmu.exe's own TLS callback for every thread event in the process.
+/// Called from xcl.exe's own TLS callback for every thread event in the process.
 pub fn on_tls_event(reason: u32) {
     match reason {
         2 => unsafe {

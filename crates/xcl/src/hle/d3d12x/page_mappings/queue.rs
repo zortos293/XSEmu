@@ -151,12 +151,16 @@ pub(super) unsafe fn publish(raw: *mut c_void, update: Update) {
 }
 
 /// Execution-time captures of lists handed to a queue later (a list may be reset before).
+// The recordings holder has no caller yet; kept for the next fix.
+#[allow(dead_code)]
 pub(crate) struct Recordings {
     by_list: HashMap<usize, Arc<Captured>>,
     _submitted: Vec<ID3D12CommandList>,
 }
 
 impl Recordings {
+    // The recordings holder has no caller yet; kept for the next fix.
+    #[allow(dead_code)]
     pub(crate) unsafe fn hold(mapped: &[*mut c_void], original: &[*mut c_void]) -> Arc<Self> {
         let by_list = mapped.iter().map(|&p| (p as usize, Arc::new(recordings::capture(&[p])))).collect();
         let _submitted = original.iter().filter_map(|p| ID3D12CommandList::from_raw_borrowed(p).cloned()).collect();
@@ -165,6 +169,8 @@ impl Recordings {
 }
 
 /// Native Execute of `lists` on `raw`, ordered by the lane when they carry locators.
+// The recordings holder has no caller yet; kept for the next fix.
+#[allow(dead_code)]
 pub(crate) unsafe fn reader(raw: *mut c_void, lists: &[*mut c_void], held: Option<&Recordings>) {
     let members = match held {
         Some(h) => Captured::for_execution(&lists.iter().filter_map(|p| h.by_list.get(&(*p as usize))).map(Arc::as_ref).collect::<Vec<_>>()),

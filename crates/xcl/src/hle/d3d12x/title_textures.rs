@@ -862,6 +862,7 @@ unsafe fn refresh_once(queue: *mut c_void) {
     if !sparse && TEXTURES_LEN.load(Ordering::Relaxed) == 0 {
         return;
     }
+    rearm_gated();
     recheck_gpu_view_sources();
     let watch_t0 = std::time::Instant::now();
     let mut page = 0x1000u32;
@@ -977,6 +978,32 @@ unsafe fn refresh_once(queue: *mut c_void) {
     upload_all(todo);
 }
 
+/// The textures `texture_gate` held back while the local segment was at its cap, uploaded again
+/// now that it is back under it: `vram::note_content` then maps the mips the gate refused and the
+/// copy of the same batch fills them. The content remembered from their last upload is dropped
+/// with it – their bytes did not change, only the memory under them was missing, and the "same as
+/// at its last upload" skip would leave them out (`texture_gate::ready` keeps one the gate refuses
+/// again, so a texture stays here until it has its memory or goes).
+fn rearm_gated() {
+    let ready = super::texture_gate::ready();
+    if ready.is_empty() {
+        return;
+    }
+    let mut t = TEXTURES.lock().unwrap();
+    let mut last = LAST_CONTENT.lock().unwrap();
+    for res in ready {
+        last.remove(&res);
+        let Some(e) = t.get_mut(res) else {
+            super::texture_gate::forget(res);
+            continue;
+        };
+        if !e.pending && !e.gpu_written {
+            e.pending = true;
+            PENDING.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+}
+
 /// texture → `content_hash` of its memory at its last upload
 static LAST_CONTENT: Mutex<BTreeMap<usize, u64>> = Mutex::new(BTreeMap::new());
 static UNCHANGED: AtomicU64 = AtomicU64::new(0);
@@ -991,6 +1018,19 @@ fn unchanged_skip() -> bool {
 /// content from here on (the caller uploads it when this is false).
 fn same_as_last_upload(res: usize, h: u64) -> bool {
     LAST_CONTENT.lock().unwrap().insert(res, h) == Some(h)
+}
+
+/// (`XCL_MIPS_FULL`) The mips of texture `res` that waited for video memory have it now
+/// (`vram::complete_wanted`): its upload is made again at this submit, and the "the same bytes
+/// as at its last upload" note is dropped so that it is.
+pub(super) fn upload_again(res: usize) {
+    LAST_CONTENT.lock().unwrap().remove(&res);
+    let mut t = TEXTURES.lock().unwrap();
+    // (an active entry: a shadowed one is uploaded when the texture over it goes)
+    if let Some(e) = t.by_res.get_mut(&res).filter(|e| !e.pending && !e.gpu_written) {
+        e.pending = true;
+        PENDING.fetch_add(1, Ordering::Relaxed);
+    }
 }
 
 /// A 64-bit hash of `b` for "the same bytes as before" (four lanes of multiply-rotate over
@@ -1072,7 +1112,11 @@ unsafe fn upload_all(todo: Vec<(ID3D12Resource, Upload)>) {
             }
             // video memory under the mips that have texels, before the copies into them
             if !subs.is_empty() && super::vram::wants_content(r.as_raw() as usize) {
-                super::vram::note_content(&r, &with_texels(va, &tex, super::vram::zero_is_unmapped(r.GetDesc().Format), &subs));
+                if super::vram::note_content(&r, &with_texels(va, &tex, super::vram::zero_is_unmapped(r.GetDesc().Format), &subs)) {
+                    // (`XCL_MIPS_FULL`) a mip waited for room: this copy is made again once it
+                    // has its memory, so the "the same bytes as at its last upload" note goes
+                    LAST_CONTENT.lock().unwrap().remove(&(r.as_raw() as usize));
+                }
             }
             batch.push((r, subs, states));
         }
@@ -1085,10 +1129,17 @@ unsafe fn upload_all(todo: Vec<(ID3D12Resource, Upload)>) {
                 continue;
             }
         };
-        match own_work(|| {
+        // the copies are not part of a tracked submission: what backs each texture stays
+        // resident until the batch has completed (it waits)
+        let hold: Vec<super::residency::Hold> = batch.iter()
+            .map(|(r, ..)| super::residency::hold(r.as_raw() as usize))
+            .collect();
+        let uploaded = own_work(|| {
             super::vram::before_execute(&queue);
             texture::upload_batch(dev, &queue, &batch)
-        }) {
+        });
+        drop(hold);
+        match uploaded {
             Ok(failed) => {
                 for (_, e) in failed {
                     warn(&e);
@@ -1156,6 +1207,8 @@ pub unsafe fn probe_gpu_content(res: usize) {
 }
 
 pub(super) unsafe fn read_gpu_subresource(dev: &ID3D12Device, r: &ID3D12Resource, subresource: u32, state: D3D12_RESOURCE_STATES) -> Result<Vec<u8>, String> {
+    // a readback is not part of a tracked submission: the texture's memory stays resident
+    let _hold = super::residency::hold(r.as_raw() as usize);
     let rd = r.GetDesc();
     let mut fp = D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default();
     let (mut rows, mut row_bytes, mut total) = (0u32, 0u64, 0u64);

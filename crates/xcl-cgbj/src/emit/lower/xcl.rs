@@ -22,7 +22,7 @@ use super::{Lower, Parts, Val, Why};
 use crate::gfx10::{Fields, NULL, Operand};
 use crate::ir::{Inst, Program, Reg, Value};
 use crate::resource::{Site, Source};
-use crate::xcl::{XclConfig, XclStats};
+use crate::xcl::{d16_half_bits, XclConfig, XclStats};
 
 #[path = "xcl_formats.rs"]
 mod formats;
@@ -45,10 +45,8 @@ struct Memory {
     views: V,
     /// High dword of window 0's addresses.
     uma_base: V,
-    /// Heap index of the page directory's root, or 0.
-    table: V,
-    /// `table != 0`.
-    has_table: V,
+    /// The root's handle, made once in the entry block.
+    root: V,
     /// Heap index of the null view.
     null: V,
 }
@@ -61,7 +59,10 @@ struct Base<T> {
     lo: T,
     hi: T,
     soffset: Option<T>,
-    /// A V#'s base (`s_buffer_load_*`): the high dword is the second word's low 16 bits.
+    /// A buffer load's lane offset (`buffer_load_dword*`), the VGPR the instruction names.
+    voff: Option<T>,
+    /// A V#'s base (`s_buffer_load_*`, `buffer_load_*`): the high dword is the second
+    /// word's low 16 bits.
     buffer: bool,
     /// The constant offset from bit 16 up.
     upper: i32,
@@ -82,6 +83,10 @@ struct Group {
     handles: [V; 2],
     /// The byte of the second page's first dword in its view.
     next: V,
+    /// The second page's first three dwords, read once where the group is resolved when the
+    /// program has no access past the caches (scalar loads may give an older value there).
+    /// Otherwise each member reads them itself.
+    over: Option<[V; 3]>,
 }
 
 /// The page groups of a program.
@@ -141,10 +146,66 @@ fn smem_base(inst: &Inst) -> Option<(Base<Value>, u32)> {
         lo: inst.read(Reg::S(*code))?,
         hi: inst.read(Reg::S(code + 1))?,
         soffset,
+        voff: None,
         buffer,
         upper: offset >> 16,
     };
     Some((base, low))
+}
+
+/// The base of a `buffer_load_dword*` that can be a member of a page group, the low 16 bits
+/// of its offset, and whether it reads several dwords: the descriptor's base is a value, the
+/// lane's offset another, and the instruction's a constant on a dword whose last dword
+/// starts below 64 KiB.
+fn buffer_base(inst: &Inst) -> Option<(Base<Value>, u32, bool)> {
+    let Fields::Buffer {
+        addr,
+        rsrc,
+        soffset,
+        offset,
+        offen,
+        idxen,
+        lds,
+        tfe,
+        ..
+    } = &inst.fields
+    else {
+        return None;
+    };
+    if *lds || *tfe || *idxen || !*offen {
+        return None;
+    }
+    let count = match inst.name() {
+        "buffer_load_dword" => 1,
+        "buffer_load_dwordx2" => 2,
+        "buffer_load_dwordx3" => 3,
+        "buffer_load_dwordx4" => 4,
+        _ => return None,
+    };
+    let Operand::Scalar { code: rs, .. } = *rsrc else {
+        return None;
+    };
+    let Operand::Vector { reg: areg, .. } = *addr else {
+        return None;
+    };
+    let off = u32::from(*offset);
+    if off % 4 != 0 || off + 4 * (count - 1) > 0xfffc {
+        return None;
+    }
+    let soffset = match soffset {
+        Operand::Scalar { code: NULL, .. } | Operand::Const(128) => None,
+        Operand::Scalar { code, .. } => Some(inst.read(Reg::S(*code))?),
+        _ => return None,
+    };
+    let base = Base {
+        lo: inst.read(Reg::S(rs))?,
+        hi: inst.read(Reg::S(rs + 1))?,
+        soffset,
+        voff: Some(inst.read(Reg::V(areg))?),
+        buffer: true,
+        upper: 0,
+    };
+    Some((base, off, count > 1))
 }
 
 impl Groups {
@@ -154,11 +215,20 @@ impl Groups {
         let mut loads: HashMap<Base<Value>, u32> = HashMap::new();
         let mut g = Groups::default();
         for inst in p.blocks.iter().flat_map(|b| &b.insts) {
-            let Some((base, _)) = smem_base(inst) else { continue };
+            // (a buffer load of one dword is served by its own resolver, which walks one
+            // page where a group walks two)
+            let base = match smem_base(inst) {
+                Some((base, _)) => base,
+                None => match buffer_base(inst) {
+                    Some((base, _, true)) => base,
+                    _ => continue,
+                },
+            };
             let n = loads.entry(base).or_insert(0);
             *n += 1;
             if *n == 2 {
-                for v in [Some(base.lo), Some(base.hi), base.soffset].into_iter().flatten() {
+                let terms = [Some(base.lo), Some(base.hi), base.soffset, base.voff];
+                for v in terms.into_iter().flatten() {
                     let at = g.by_value.entry(v).or_default();
                     if at.last() != Some(&g.wanted.len()) {
                         at.push(g.wanted.len());
@@ -334,14 +404,16 @@ impl<'a> Lower<'a> {
         let first = self.s.entry;
         let io = self.s.root_uav_handle(0);
         self.x_state().io = Some(io);
-        if !cfg.thread_limits && !memory {
+        // (only a compute program has thread limits)
+        let limits = cfg.thread_limits && self.s.threads.is_some();
+        if !limits && !memory {
             return;
         }
-        let (i32t, zero) = (self.s.t.i32, self.s.m.i32(0));
+        let zero = self.s.m.i32(0);
         // The locator and the three thread limits are consecutive dwords.
         let at = self.s.m.i32(4 * IO_PHYSICAL_TABLE);
         let w = self.x_raw(first, io, at, 4);
-        if cfg.thread_limits {
+        if limits {
             // A thread at or past a limit that is not 0 runs with its EXEC bit clear, as on
             // the console: it stores nothing, but a program that sets EXEC wider can read its
             // registers. The launch mask of the lane structure is this test (`crate::structure::Atom::Launch`).
@@ -363,19 +435,18 @@ impl<'a> Lower<'a> {
             let k = self.s.m.i32(WINDOWS);
             let null = self.s.m.bin(head, Bin::Add, views, k);
             // The directory's root index is the first dword of the view the locator names.
-            // Heap index 0 is not known to be a raw view, so the read is behind a branch.
+            // Without a locator, and when the locator names no root, the index is the null
+            // view's, whose dwords are 0. Both reads are then valid, so the root is made
+            // here once and every access walks the directory: the null root answers "no
+            // entry" for every page, which is the window rule's own answer.
             let located = self.s.m.cmp(head, pred::NE, w[0], zero);
-            let (read, join) = (self.s.m.new_block(), self.s.m.new_block());
-            self.s.m.terminate(head, Term::CondBr(located, read, join));
-            self.cur = read;
-            let h = self.x_heap(w[0], false, false, (11, 0));
-            let found = self.x_raw(read, h, zero, 1)[0];
-            self.s.m.terminate(read, Term::Br(join));
-            let table = self.s.m.phi(join, i32t);
-            self.s.m.set_phi(table, vec![(zero, head), (found, read)]);
-            let has_table = self.s.m.cmp(join, pred::NE, table, zero);
-            self.s.entry = join;
-            self.x_state().words = Some(Memory { views, uma_base, table, has_table, null });
+            let index = self.s.m.select(head, located, w[0], null);
+            let locator = self.x_heap(index, false, false, (11, 0));
+            let found = self.x_raw(head, locator, zero, 1)[0];
+            let named = self.s.m.cmp(head, pred::NE, found, zero);
+            let index = self.s.m.select(head, named, found, null);
+            let root = self.x_heap(index, false, false, (11, 0));
+            self.x_state().words = Some(Memory { views, uma_base, root, null });
         }
         self.cur = self.s.entry;
     }
@@ -542,39 +613,34 @@ impl<'a> Lower<'a> {
         }
     }
 
-    /// The page directory's entry for the 64 KiB page of address `lo`, `hi` (`hi` at most
-    /// 0xffff), 0 when it has none. `table` is the heap index of the directory's root and is
-    /// not 0. The only place that knows the directory's layout: a root of two leaf indices per
-    /// high dword, and leaves of one dword per page. The second leaf is asked when the first
-    /// has no entry, by the same code: a loop of at most two rounds. A leaf index of 0 reads
-    /// the root instead and drops what it read. Goes on in another block.
-    fn x_directory(&mut self, lo: V, hi: V, table: V) -> V {
-        let (i32t, i1t) = (self.s.t.i32, self.s.t.i1);
-        let (zero, no, yes) = (self.xi(0), self.s.m.bool(false), self.s.m.bool(true));
-        let root = self.x_heap(table, false, false, (11, 0));
+    /// The page directory's entry for the 64 KiB page of address `lo`, `hi`, 0 when it has
+    /// none. A `hi` past 0xffff (an access the caller drops) reads some root entry or, past
+    /// the root's 512 KiB, 0: the leaf indices it gives are still the directory's own.
+    /// `root` is its handle, made once in the entry block, and `null` the heap index of the
+    /// null view, whose dwords are 0. The only place that knows the directory's layout: a
+    /// root of two leaf indices per high dword, and leaves of one dword per page. The second
+    /// leaf counts when the first has no entry. Both are read, in one block: a loop or a
+    /// branch per access costs the driver's compiler more than the read. A leaf index of 0
+    /// reads the null view instead, which answers 0, the directory's "no entry".
+    fn x_directory(&mut self, lo: V, hi: V, null: V, root: V) -> V {
+        let zero = self.xi(0);
         let k3 = self.xi(3);
         let at = self.xb(Bin::Shl, hi, k3);
         let leaves = self.x_raw(self.cur, root, at, 2);
         let (k16, k2) = (self.xi(16), self.xi(2));
         let page = self.xb(Bin::LShr, lo, k16);
         let at = self.xb(Bin::Shl, page, k2);
-        let pre = self.cur;
-        let (round, done) = (self.s.m.new_block(), self.s.m.new_block());
-        self.s.m.terminate(pre, Term::Br(round));
-        self.cur = round;
-        let (leaf, last) = (self.s.m.phi(round, i32t), self.s.m.phi(round, i1t));
-        self.s.m.set_phi(leaf, vec![(leaves[0], pre), (leaves[1], round)]);
-        self.s.m.set_phi(last, vec![(no, pre), (yes, round)]);
-        let none = self.xc(pred::EQ, leaf, zero);
-        let index = self.xs(none, table, leaf);
-        let h = self.x_heap(index, false, true, (11, 0));
-        let entry = self.x_raw(round, h, at, 1)[0];
-        let entry = self.xs(none, zero, entry);
-        let found = self.xc(pred::NE, entry, zero);
-        let stop = self.xb(Bin::Or, found, last);
-        self.s.m.terminate(round, Term::CondBr(stop, done, round));
-        self.cur = done;
-        entry
+        let entries: Vec<V> = leaves
+            .into_iter()
+            .map(|leaf| {
+                let none = self.xc(pred::EQ, leaf, zero);
+                let index = self.xs(none, null, leaf);
+                let h = self.x_heap(index, false, true, (11, 0));
+                self.x_raw(self.cur, h, at, 1)[0]
+            })
+            .collect();
+        let found = self.xc(pred::NE, entries[0], zero);
+        self.xs(found, entries[0], entries[1])
     }
 
     /// The raw view (a heap index) and the byte in it of the dword at 64-bit address `lo`,
@@ -588,7 +654,7 @@ impl<'a> Lower<'a> {
         } else {
             stats.resolves_single += 1;
         }
-        let (i32t, zero) = (self.s.t.i32, self.xi(0));
+        let zero = self.xi(0);
         let bad = self.x_bad(hi, origin, kill);
         // A 32-bit pointer lies in window 0.
         let hi = match origin {
@@ -602,18 +668,8 @@ impl<'a> Lower<'a> {
         let k = self.xi(WINDOWS);
         let inside = self.xc(pred::IULT, w, k);
         let window = self.xb(Bin::Add, m.views, w);
-        // The directory, when there is one.
-        let head = self.cur;
-        let (walk, join) = (self.s.m.new_block(), self.s.m.new_block());
-        self.s.m.terminate(head, Term::CondBr(m.has_table, walk, join));
-        self.cur = walk;
-        let safe = self.xs(bad, zero, hi);
-        let found = self.x_directory(lo, safe, m.table);
-        let tail = self.cur;
-        self.s.m.terminate(tail, Term::Br(join));
-        self.cur = join;
-        let entry = self.s.m.phi(join, i32t);
-        self.s.m.set_phi(entry, vec![(zero, head), (found, tail)]);
+        // The directory, when there is one: the null root answers "no entry" when there is not.
+        let entry = self.x_directory(lo, hi, m.null, m.root);
         // An entry: 0 absent (the window rule), else bit 31 set, bits 30:27 zero, the page's
         // place in the view in bits 26:20 and the view's heap index in bits 19:0. An index of
         // 0 is unmapped: the null view, as anything else is.
@@ -655,54 +711,57 @@ impl<'a> Lower<'a> {
         (crosses, first, lo2, hi2)
     }
 
-    /// `n` dwords of title memory from the address `lo`, `hi` (on a dword) on. Each dword
-    /// is resolved on its own: an access that crosses a 64 KiB page takes a second pass with
-    /// the next page's view, through the same resolver code. Goes on in another block.
+    /// `n` dwords of title memory from the address `lo`, `hi` (on a dword) on. The page of
+    /// the first dword and the page after it are both resolved, in one block: an access of
+    /// `n` dwords lies in those two at most, and dword j is in the second when its offset
+    /// reaches the first page's end. The dwords are read four at a time, from the page of the
+    /// first of the four, and those of a four that lie past the page's end from one more read
+    /// of the next page's dwords there.
     fn x_load(&mut self, lo: V, hi: V, origin: Origin, kill: Option<V>, n: u32) -> Vec<V> {
         if n == 1 {
             let (view, byte) = self.x_resolve(lo, hi, origin, kill, false);
             let h = self.x_data(view);
             return self.x_raw(self.cur, h, byte, 1);
         }
-        let (i32t, i1t) = (self.s.t.i32, self.s.t.i1);
-        let (zero, no, yes) = (self.xi(0), self.s.m.bool(false), self.s.m.bool(true));
-        let (crosses, first, lo2, hi2) = self.x_pages(lo, hi, n);
-        let pre = self.cur;
-        let head = self.s.m.new_block();
-        self.s.m.terminate(pre, Term::Br(head));
-        self.cur = head;
-        let (lo_now, hi_now, second) = (self.s.m.phi(head, i32t), self.s.m.phi(head, i32t), self.s.m.phi(head, i1t));
-        let kept: Vec<V> = (0..n).map(|_| self.s.m.phi(head, i32t)).collect();
-        let (view, byte) = self.x_resolve(lo_now, hi_now, origin, kill, true);
-        let h = self.x_data(view);
-        // The second pass has the next page's first byte: dword j is 4j minus the first
-        // page's bytes from it.
-        let back = self.xs(second, first, zero);
-        let at = self.xb(Bin::Sub, byte, back);
-        let mut out = Vec::new();
-        for j in 0..n as usize {
-            let off = self.xi(4 * j as u32);
-            let a = if j == 0 { at } else { self.xb(Bin::Add, at, off) };
-            // A call for each dword. In the second pass a dword of the first page is at a
-            // byte below the next page's first, which wraps when that is the view's byte 0.
-            // A call for several dwords from there on is not known to read the others.
-            let read = self.x_raw(self.cur, h, a, 1)[0];
-            // (the second pass keeps the dwords before the next page)
-            let old = if j == 0 { second } else { self.xc(pred::IULT, off, back) };
-            out.push(self.xs(old, kept[j], read));
+        let (_, first, lo2, hi2) = self.x_pages(lo, hi, n);
+        let (view, byte) = self.x_resolve(lo, hi, origin, kill, true);
+        let (next, next_byte) = self.x_resolve(lo2, hi2, origin, kill, true);
+        let (h, h2) = (self.x_data(view), self.x_data(next));
+        // The next page's first byte, less the first page's bytes from it: dword j of the
+        // second page is at this plus 4j.
+        let at2 = self.xb(Bin::Sub, next_byte, first);
+        let mut out = Vec::with_capacity(n as usize);
+        for c in (0..n).step_by(4) {
+            let m = (n - c).min(4);
+            let off = self.xi(4 * c);
+            let at = self.xb(Bin::Add, byte, off);
+            let read = self.x_raw(self.cur, h, at, m);
+            // Dword 0 is in the first page (the crossing needs an offset of 4 at least).
+            // Later dwords of the four read the next page's dword of the same offset: from
+            // its byte `at2` on, one `c` further in for a four that does not start at 0.
+            let over: Vec<V> = match (c, m) {
+                (0, 1) => Vec::new(),
+                (0, _) => {
+                    let four = self.xi(4);
+                    let at = self.xb(Bin::Add, at2, four);
+                    self.x_raw(self.cur, h2, at, m - 1)
+                }
+                (_, _) => {
+                    let at = self.xb(Bin::Add, at2, off);
+                    self.x_raw(self.cur, h2, at, m)
+                }
+            };
+            let skip = usize::from(c == 0);
+            for k in 0..m as usize {
+                if c == 0 && k == 0 {
+                    out.push(read[0]);
+                    continue;
+                }
+                let at = self.xi(4 * (c as usize + k) as u32);
+                let second = self.xc(pred::IUGE, at, first);
+                out.push(self.xs(second, over[k - skip], read[k]));
+            }
         }
-        let fresh = self.xb(Bin::Xor, second, yes);
-        let again = self.xb(Bin::And, crosses, fresh);
-        let tail = self.cur;
-        let done = self.s.m.new_block();
-        self.s.m.terminate(tail, Term::CondBr(again, head, done));
-        self.s.m.set_phi(lo_now, vec![(lo, pre), (lo2, tail)]);
-        self.s.m.set_phi(hi_now, vec![(hi, pre), (hi2, tail)]);
-        self.s.m.set_phi(second, vec![(no, pre), (yes, tail)]);
-        for j in 0..n as usize {
-            self.s.m.set_phi(kept[j], vec![(zero, pre), (out[j], tail)]);
-        }
-        self.cur = done;
         out
     }
 
@@ -737,15 +796,17 @@ impl<'a> Lower<'a> {
                 _ => None,
             };
             let (Some(lo), Some(hi)) = (known(base.lo), known(base.hi)) else { continue };
-            let soffset = match base.soffset.map(known) {
-                Some(None) => continue,
-                Some(s) => s,
-                None => None,
+            let term = |v: Option<Value>| match v.map(known) {
+                Some(None) => Err(()),
+                Some(s) => Ok(s),
+                None => Ok(None),
             };
+            let (Ok(soffset), Ok(voff)) = (term(base.soffset), term(base.voff)) else { continue };
             let key = Base {
                 lo,
                 hi,
                 soffset,
+                voff,
                 buffer: base.buffer,
                 upper: base.upper,
             };
@@ -758,18 +819,18 @@ impl<'a> Lower<'a> {
     }
 
     /// The page group of `base`: the page of the base plus the offset's upper bits, and the
-    /// next page, through one resolver that runs twice. Goes on in another block.
+    /// next page, through one resolver that runs twice. Goes on in another block. A scalar
+    /// load and a buffer load never share one: their origins differ.
     fn x_group(&mut self, base: Base<V>) -> Group {
         self.x_state().stats.page_groups += 1;
-        let (i32t, i1t) = (self.s.t.i32, self.s.t.i1);
-        let (zero, no, yes) = (self.xi(0), self.s.m.bool(false), self.s.m.bool(true));
+        let (i32t, zero) = (self.s.t.i32, self.xi(0));
         let (hi, origin) = if base.buffer {
             let (hi, _) = self.x_buffer_words(base.hi);
             (hi, Origin::Read(hi, true))
         } else {
             (base.hi, Origin::Read(base.hi, false))
         };
-        let terms: Vec<V> = base.soffset.into_iter().collect();
+        let terms: Vec<V> = base.soffset.into_iter().chain(base.voff).collect();
         let (lo, hi) = self.x_address(base.lo, hi, &terms, base.upper << 16, None);
         let (pages, dwords, size) = (self.xi(0xffff_0000), self.xi(0xfffc), self.xi(0x1_0000));
         let page = self.xb(Bin::And, lo, pages);
@@ -778,45 +839,45 @@ impl<'a> Lower<'a> {
         let wrapped = self.xc(pred::EQ, lo2, zero);
         let carry = self.s.m.cast(self.cur, Cast::ZExt, wrapped, i32t);
         let hi2 = self.xb(Bin::Add, hi, carry);
-        let pre = self.cur;
-        let head = self.s.m.new_block();
-        self.s.m.terminate(pre, Term::Br(head));
-        self.cur = head;
-        let (lo_now, hi_now, second) = (self.s.m.phi(head, i32t), self.s.m.phi(head, i32t), self.s.m.phi(head, i1t));
-        let (view0, byte0) = (self.s.m.phi(head, i32t), self.s.m.phi(head, i32t));
-        let (view, byte) = self.x_resolve(lo_now, hi_now, origin, None, true);
-        let tail = self.cur;
-        let done = self.s.m.new_block();
-        self.s.m.terminate(tail, Term::CondBr(second, done, head));
-        self.s.m.set_phi(lo_now, vec![(page, pre), (lo2, tail)]);
-        self.s.m.set_phi(hi_now, vec![(hi, pre), (hi2, tail)]);
-        self.s.m.set_phi(second, vec![(no, pre), (yes, tail)]);
-        self.s.m.set_phi(view0, vec![(zero, pre), (view, tail)]);
-        self.s.m.set_phi(byte0, vec![(zero, pre), (byte, tail)]);
-        self.cur = done;
+        // The group's two pages, one resolver each: what used to be a loop of exactly two
+        // rounds, with a phi for each value it carried.
+        let (view0, byte0) = self.x_resolve(page, hi, origin, None, true);
+        let (view, byte) = self.x_resolve(lo2, hi2, origin, None, true);
         // Both pages were resolved at their first byte. A member's dword is at the base's
         // low bits plus its offset's, less 64 KiB in the second page.
         let first_byte = self.xb(Bin::Add, byte0, low);
         let down = self.xb(Bin::Sub, low, size);
         let next_byte = self.xb(Bin::Add, byte, down);
         let handles = [self.x_data(view0), self.x_data(view)];
+        let over = (!self.x_state().coherent).then(|| {
+            let w = self.x_raw(self.cur, handles[1], byte, 3);
+            [w[0], w[1], w[2]]
+        });
         Group {
             views: [view0, view],
             bytes: [first_byte, next_byte],
             low,
             handles,
             next: byte,
+            over,
         }
     }
 
-    /// The page group that serves the scalar load `inst` with these values for its base, and
-    /// the low 16 bits of its offset.
-    fn x_group_of(&mut self, inst: &Inst, lo: V, hi: V, soffset: Option<V>) -> Option<(Group, u32)> {
-        let (base, low) = smem_base(inst)?;
+    /// The page group that serves the load `inst` with these values for its base, and the
+    /// low 16 bits of its offset.
+    fn x_group_of(&mut self, inst: &Inst, lo: V, hi: V, soffset: Option<V>, voff: Option<V>) -> Option<(Group, u32)> {
+        let (base, low) = match smem_base(inst) {
+            Some((base, low)) => (base, low),
+            None => {
+                let (base, low, _) = buffer_base(inst)?;
+                (base, low)
+            }
+        };
         let key = Base {
             lo,
             hi,
             soffset,
+            voff,
             buffer: base.buffer,
             upper: base.upper,
         };
@@ -830,7 +891,11 @@ impl<'a> Lower<'a> {
     /// four. The others of the four may lie in the next page, when the base is not on 16
     /// bytes: those are taken from one more read, of the next page's first dwords.
     fn x_group_load(&mut self, g: Group, low: u32, n: u32) -> Vec<V> {
-        let over = if n > 1 { self.x_raw(self.cur, g.handles[1], g.next, (n - 1).min(3)) } else { Vec::new() };
+        let over = match (n, g.over) {
+            (1, _) => Vec::new(),
+            (_, Some(w)) => w.to_vec(),
+            (_, None) => self.x_raw(self.cur, g.handles[1], g.next, (n - 1).min(3)),
+        };
         let mut out = Vec::new();
         for first in (0..n).step_by(4) {
             let (c, m) = (low + 4 * first, (n - first).min(4));
@@ -1176,7 +1241,7 @@ impl<'a> Lower<'a> {
         let terms: Vec<V> = soff.into_iter().collect();
         let d0 = self.x_sgpr(inst, *base, "an address not in SGPRs")?;
         let d1 = self.x_sgpr(inst, base + 1, "an address not in SGPRs")?;
-        let grouped = self.x_group_of(inst, d0, d1, soff);
+        let grouped = self.x_group_of(inst, d0, d1, soff, None);
         let stats = &mut self.x_state().stats;
         if buffer {
             stats.buffer_accesses += 1;
@@ -1404,11 +1469,21 @@ impl<'a> Lower<'a> {
             },
         };
         let read = Origin::Read(base_hi, true);
+        // A vector load whose offset is a constant on a dword and whose lane offset is a
+        // value joins the page group of its descriptor and that lane offset: several loads
+        // of one descriptor at one lane offset share the two pages' resolutions.
+        let grouped = match kind {
+            Kind::Load(n) if n > 1 => self.x_group_of(inst, d0, d1, soff, voff),
+            _ => None,
+        };
         match kind {
             Kind::Load(n) => {
                 let lo = self.x_aligned(lo);
                 let oks: Vec<V> = (0..n).map(|k| self.x_bound(&bounds, 4 * k + 4)).collect();
-                let got = self.x_load(lo, hi, read, None, n);
+                let got = match grouped {
+                    Some((g, low)) => self.x_group_load(g, low, n),
+                    None => self.x_load(lo, hi, read, None, n),
+                };
                 for (k, (x, ok)) in got.into_iter().zip(oks).enumerate() {
                     let x = self.xs(ok, x, zero);
                     self.write(inst, Reg::V(reg + k as u8), x, guard);
@@ -1423,7 +1498,10 @@ impl<'a> Lower<'a> {
             }
             Kind::Described(n, halves) => {
                 let d3 = d3.expect("read above");
-                let f = self.x_word_format(d3);
+                let mut f = self.x_word_format(d3);
+                if halves.is_some() && d16_half_bits() {
+                    f = self.x_d16_twin(f, Some(d3), n);
+                }
                 let (mut xs, int) = self.x_format_load(f, Some(d3), lo, hi, read, &bounds, n);
                 if let Some(high) = halves {
                     // (the high form keeps the register's low half)
@@ -1439,10 +1517,13 @@ impl<'a> Lower<'a> {
                 }
             }
             Kind::FormatStore(n, halves) => {
-                let f = match (d3, *format) {
+                let mut f = match (d3, *format) {
                     (Some(d3), _) => self.x_word_format(d3),
                     (None, f) => self.xi(u32::from(f.expect("the instruction's format"))),
                 };
+                if halves.is_some() && d16_half_bits() {
+                    f = self.x_d16_twin(f, None, n);
+                }
                 self.x_format_store(f, lo, hi, base_hi, &bounds, &vals, halves.map(|h| (n, h)), guard);
             }
             Kind::SmallLoad(bits, signed) => {
@@ -1465,6 +1546,7 @@ impl<'a> Lower<'a> {
                 }
             }
             Kind::Format(f, channels, halves) => {
+                let f = if halves && d16_half_bits() { d16_twin(f, channels).unwrap_or(f) } else { f };
                 let (bits, _) = super::buffer_format(f).ok_or("a buffer format")?;
                 let total: u32 = bits.iter().sum();
                 let mut ok = self.x_bound(&bounds, total / 8);
@@ -1961,6 +2043,21 @@ struct View {
     /// The class as a value: 0 float, 1 uint, 2 sint.
     class: V,
     known: Option<Class>,
+}
+
+// xsemu: from fxceless/victory-fork d4b786f (PR 927, gpu/half-views) crates/victory-gpu/src/descriptor/host.rs (half_format), GPL-3.0
+/// The unsigned format of the same layout for a d16 access whose 16 bits move unchanged
+/// (`XCL_RECOMP_D16_HALF_BITS`): the three 16-bit float formats, when the format has every
+/// channel the access names. `None` for every other format (16-bit integers already move
+/// their bits; normalised and scaled ones the console converts).
+fn d16_twin(f: u8, channels: u32) -> Option<u8> {
+    let twin = match f {
+        13 => 11,
+        29 => 27,
+        73 => 69,
+        _ => return None,
+    };
+    (u32::from(f & 7) >= channels).then_some(twin)
 }
 
 /// The numeric class of an image format, as xsemu's translator reads it from the buffer

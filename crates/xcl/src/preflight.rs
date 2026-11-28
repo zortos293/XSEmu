@@ -72,7 +72,7 @@ fn gpu_checks(gpu: &Result<Gpu, String>) -> Vec<Check> {
                 return v;
             }
             if g.shader_model < (6, 6) {
-                v.push(check(Level::Error, format!("{} (has {}.{}): shaders cannot run", g.no_sm66, g.shader_model.0, g.shader_model.1), Some("update the GPU driver; on Windows 10, put the D3D12 Agility SDK's D3D12Core.dll in a D3D12 folder next to XSEmu.exe")));
+                v.push(check(Level::Error, format!("{} (has {}.{}): shaders cannot run", g.no_sm66, g.shader_model.0, g.shader_model.1), Some("update the GPU driver; on Windows 10, put the D3D12 Agility SDK's D3D12Core.dll in a D3D12 folder next to xcl.exe")));
             }
             if !g.mesh {
                 v.push(check(Level::Warning, "no mesh shaders: the game's geometry and NGG programs are not drawn", Some("a GPU with D3D12 mesh shaders is needed (NVIDIA RTX 20 / GTX 16 or newer, AMD RX 6000 or newer, Intel Arc)")));
@@ -100,7 +100,7 @@ pub fn checks(f: &Found) -> Vec<Check> {
                 v.push(check(Level::Note, format!("DXC is older than {}.{}: {}", dxc::RECOMMENDED.0, dxc::RECOMMENDED.1, dxc::OUTDATED_COST), Some(dxc::OUTDATED_FIX)));
             }
         }
-        Err(_) => v.push(check(Level::Error, "no DXC (dxcompiler.dll + dxil.dll): no shader can be compiled, the game draws nothing", Some("install the Windows SDK, or put dxcompiler.dll and dxil.dll next to XSEmu.exe (or in %XCL_DXC_DIR%)"))),
+        Err(_) => v.push(check(Level::Error, "no DXC (dxcompiler.dll + dxil.dll): no shader can be compiled, the game draws nothing", Some("install the Windows SDK, or put dxcompiler.dll and dxil.dll next to xcl.exe (or in %XCL_DXC_DIR%)"))),
     }
     if !f.xgameruntime {
         v.push(check(Level::Warning, "no System32\\xgameruntime.dll: dialogs, text entry, game invites and game streaming are missing (XCL's own task queues, async and networking are used)", Some("install Gaming Services (Microsoft Store)")));

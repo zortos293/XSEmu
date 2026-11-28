@@ -102,6 +102,25 @@ pub(super) struct Packed {
     site: Site,
 }
 
+/// The most LDS a D3D12 compute program may declare: 32 KiB.
+const LDS_LIMIT_DWORDS: u32 = 8192;
+
+/// The refusal of a group of more than one console wave whose program leaves no LDS dword for
+/// the counter its host waves take their console threads from ([`Lower::p_base`]).
+pub(in super::super) const NO_CLAIM_DWORD: Why = "packed wave64 form needs an LDS dword past 32 KiB";
+
+/// The LDS dword of that counter for a group of `group` console threads whose program uses
+/// `lds_dwords` of LDS: none with one console wave, else the first after the program's.
+pub(in super::super) fn claim_dword(group: u32, lds_dwords: u32) -> Result<Option<u32>, Why> {
+    if group <= 64 {
+        return Ok(None);
+    }
+    if lds_dwords >= LDS_LIMIT_DWORDS {
+        return Err(NO_CLAIM_DWORD);
+    }
+    Ok(Some(lds_dwords))
+}
+
 /// What [`Lower::section_inst`] says of a value it does not know.
 const UNKNOWN: Why = "a whole-wave section step the simulation does not follow";
 
@@ -118,10 +137,10 @@ impl<'a> Lower<'a> {
         self.console_lanes = true;
         self.s.wave_size = Some(32);
         self.s.host_threads = Some([group.div_ceil(64) * 32, 1, 1]);
-        let claim = (group > 64).then(|| {
+        let claim = claim_dword(group, self.s.lds_dwords).expect("emit::xcl::packed refuses a group whose claim dword does not fit");
+        if claim.is_some() {
             self.s.lds_dwords += 1;
-            self.s.lds_dwords - 1
-        });
+        }
         self.packed = Some(Box::new(Packed {
             half: 0,
             other: Half::default(),

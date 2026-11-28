@@ -13,8 +13,14 @@ pub mod memmap;
 pub mod memdiag;
 pub mod dxc_heap;
 
+// The counting allocator costs two contended updates per allocation; a production build does not
+// pay them (`memdiag`'s lines are off there too, and its counters stay readable).
+#[cfg(not(feature = "production"))]
 #[global_allocator]
 static ALLOCATOR: memdiag::Counting = memdiag::Counting;
+#[cfg(feature = "production")]
+#[global_allocator]
+static ALLOCATOR: std::alloc::System = std::alloc::System;
 pub mod config;
 pub mod control;
 pub mod disasm;

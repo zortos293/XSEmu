@@ -35,6 +35,8 @@ impl ImportedPage {
         &self.resource
     }
 
+    // ImportedPage::len has no caller yet; kept for the next fix.
+    #[allow(dead_code)]
     pub(super) fn len(&self) -> usize {
         PHYS_PAGE_SIZE
     }

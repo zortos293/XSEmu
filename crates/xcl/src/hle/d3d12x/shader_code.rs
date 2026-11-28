@@ -397,9 +397,13 @@ pub(super) fn used_on(allocator: usize, pso: usize) {
     if pso == 0 || !on() {
         return;
     }
-    if budget() != 0 {
+    // with `XCL_PSO_FREE_IDLE` a pipeline state may be taken away under memory pressure too, and
+    // then its lists' holds are what keeps it alive until they are through (`through`)
+    if budget() != 0 || super::real::pso_free_idle() {
         taken_on(allocator, pso);
-        super::pso_async::start_code_release();
+        if budget() != 0 {
+            super::pso_async::start_code_release();
+        }
     }
     let generation = GENERATION.load(Ordering::Acquire);
     let known = KNOWN.with(|k| {

@@ -564,7 +564,7 @@ pub unsafe extern "system" fn XUserDuplicateHandle(h: *mut c_void, out: *mut *mu
 
 pub unsafe extern "system" fn XUserCloseHandle(h: *mut c_void) {
     if valid_user(h) {
-        let _ = USER.refs.fetch_update(Ordering::AcqRel, Ordering::Acquire, |v| Some(v.saturating_sub(1).max(1)));
+        let _ = USER.refs.try_update(Ordering::AcqRel, Ordering::Acquire, |v| Some(v.saturating_sub(1).max(1)));
     }
 }
 

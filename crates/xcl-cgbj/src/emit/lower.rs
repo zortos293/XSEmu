@@ -34,8 +34,8 @@ mod xcl;
 // xsemu: the packed form of a wave64 program on 32-lane waves (not CGBJ code), likewise.
 mod packed;
 #[cfg(test)]
-pub(super) use packed::SEEN as PACKED_SEEN;
-pub(super) use packed::with_packed;
+pub(super) use packed::{NO_CLAIM_DWORD, SEEN as PACKED_SEEN};
+pub(super) use packed::{claim_dword, with_packed};
 
 type Why = &'static str;
 
@@ -4329,7 +4329,12 @@ impl<'a> Lower<'a> {
         if self.packed.is_some() {
             return self.p_wave_wide(when, any);
         }
-        if self.exchange.is_none() && self.halves.is_none() && self.console_lanes && self.mask_data == MaskData::Console {
+        // xsemu: or a pixel program under the XCL binding. Which pixels share a console wave is
+        // the rasterizer's choice, so any host wave is one the console could have run: the
+        // lanes whose bit is set run the block, as there, and the console code already lets
+        // the others run it or not (masks of a pixel program are the host wave's, MaskData::Host).
+        let pixel = self.x.native.stage == HwStage::Ps && self.mask_data == MaskData::Host && crate::xcl::binding().is_some();
+        if self.exchange.is_none() && self.halves.is_none() && (self.console_lanes && self.mask_data == MaskData::Console || pixel) {
             // The host's waves are the console's: the wave's own answer. The lanes that are
             // elsewhere have no bit set, as on the console, so "some lane" needs no one but
             // the lanes here, and "every lane's bit is clear" is true of the others anyway.
@@ -12286,8 +12291,12 @@ impl<'a> Lower<'a> {
         let guard = self.guard(b, i)?;
         let mesh = self.s.mesh.is_some();
         let c = self.cur;
+        // xsemu: a pixel program under the XCL binding writes an export before the last for the
+        // lanes it holds, as the console does (`emit::xcl::pixel`)
+        let held = guard.is_some() && !mesh && !e.done && self.s.pixel && crate::emit::xcl::pixel();
         if let Some(g) = guard
             && !mesh
+            && !held
         {
             if !(e.done && self.s.pixel) {
                 return Err("a conditional export");
@@ -12452,6 +12461,8 @@ impl<'a> Lower<'a> {
                 guard
             };
             self.begin_guarded(mesh_guard)
+        } else if held {
+            self.begin_guarded(guard)
         } else {
             None
         };

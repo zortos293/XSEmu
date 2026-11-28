@@ -548,6 +548,11 @@ impl Shader {
 
     /// The finished container.
     pub fn finish(mut self) -> Vec<u8> {
+        // xsemu: under the XCL binding a pixel program's signatures are those xsemu links
+        // (`super::xcl::link_signatures`)
+        if self.pixel {
+            super::xcl::link_signatures(&mut self.inputs, &mut self.outputs);
+        }
         if self.pixel {
             // Reading a per-vertex value with attributeAtVertex needs a
             // constant input, even when the source declaration was smooth.

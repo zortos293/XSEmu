@@ -139,27 +139,30 @@ fn a_scalar_load_reads_title_memory_at_its_registers() {
     let e = emit(&[0xF400_0202, 0xFA00_0010, v1_from(8), KEEP_V1[0], KEEP_V1[1], S_ENDPGM]);
     assert_eq!((e.stats.scalar_loads, e.stats.record_loads), (1, 0));
     assert_eq!((e.stats.resolves_single, e.stats.resolves_multi), (1, 0));
-    // Heap handles: the locator's view, the directory's root, a leaf (the second leaf is
-    // asked by the same code), the data view.
-    assert_eq!(e.count("handle"), 1 + 4);
-    // Loads: the limits, the memory words, the locator's view, s4 and s5, the root, a
-    // leaf, the data.
-    assert_eq!(e.count("buffer_load"), 3 + 2 + 2 + 1);
+    // Heap handles: the locator's view, the directory's root, both leaves (read in one
+    // block, no loop), the data view.
+    assert_eq!(e.count("handle"), 1 + 5);
+    // Loads: the limits, the memory words, the locator's view, s4 and s5, the root, both
+    // leaves, the data.
+    assert_eq!(e.count("buffer_load"), 3 + 2 + 3 + 1);
     assert_eq!(e.lowered.root_uavs, vec![0]);
 }
 
 #[test]
-fn a_record_load_resolves_once_and_again_only_across_a_page() {
+fn a_record_load_resolves_the_page_and_the_next_with_no_loop() {
     // s_load_dwordx4 s[8:11], s[4:5], 0
     let e = emit(&[0xF408_0202, 0xFA00_0000, v1_from(11), KEEP_V1[0], KEEP_V1[1], S_ENDPGM]);
     assert_eq!((e.stats.scalar_loads, e.stats.record_loads), (0, 1));
-    // One resolver, in a loop that runs again for the next page: its code is not copied.
-    assert_eq!((e.stats.resolves_single, e.stats.resolves_multi), (0, 1));
-    assert_eq!(e.count("handle"), 1 + 4);
-    // The address, whether it is the second pass, and the dword that is kept.
-    assert!(e.count("phi") >= 4, "{}", e.count("phi"));
+    // The page of the first dword and the page after it, resolved one after the other: no
+    // loop, no phi, no block of its own.
+    assert_eq!((e.stats.resolves_single, e.stats.resolves_multi), (0, 2));
+    assert_eq!(e.count("handle"), 1 + 1 + 1 + 2 * 2 + 2);
     let single = emit(&[0xF400_0202, 0xFA00_0000, v1_from(8), KEEP_V1[0], KEEP_V1[1], S_ENDPGM]);
-    assert!(e.count("blocks") > single.count("blocks"));
+    assert_eq!(e.count("blocks"), single.count("blocks"));
+    assert_eq!(e.count("phi"), single.count("phi"));
+    // A read of title memory for each dword past the first, from each page, and a select.
+    assert!(e.count("buffer_load") > single.count("buffer_load"));
+    assert!(e.count("select") > single.count("select"));
 }
 
 #[test]
@@ -178,7 +181,7 @@ fn a_scalar_buffer_load_tests_each_dword_against_the_buffer() {
         KEEP_V1[1],
         S_ENDPGM,
     ]);
-    assert_eq!((four.stats.buffer_accesses, four.stats.resolves_multi), (1, 1));
+    assert_eq!((four.stats.buffer_accesses, four.stats.resolves_multi), (1, 2));
     // A dword out of the buffer is 0: one more select for each dword that is kept.
     let plain = emit(&[0xF400_0202, 0xFA00_0010, v1_from(8), KEEP_V1[0], KEEP_V1[1], S_ENDPGM]);
     assert!(one.count("select") > plain.count("select"));
@@ -200,8 +203,10 @@ fn buffer_loads_and_stores_go_through_the_resolver() {
         assert_eq!(e.stats.buffer_accesses, 2, "index {index}");
         assert_eq!((e.stats.resolves_single, e.stats.resolves_multi), (2, 0));
         assert_eq!(e.count("buffer_store"), 1);
-        // Every view of title memory is taken from the heap by a computed index.
-        assert_eq!(e.count("handle"), 1 + 1 + 2 * 3);
+        // Every view of title memory is taken from the heap by a computed index: io, the
+        // locator's view and the root once each, and a data view and both leaves for each
+        // resolver.
+        assert_eq!(e.count("handle"), 1 + 2 + 2 * 3);
         assert_eq!(e.lowered.root_uavs, vec![0]);
     }
     // With an index the address is a 64-bit product and the index is tested.
@@ -217,9 +222,9 @@ fn a_store_without_a_high_dword_lands_in_the_null_view() {
     let load_only = emit(&[0xE030_0000, 0x8001_0100, KEEP_V1[0], KEEP_V1[1], S_ENDPGM]);
     assert_eq!(e.count("buffer_store"), 1);
     assert_eq!(load_only.count("buffer_store"), 0);
-    // (the store's resolver adds the directory branch, the leaf loop and their joins,
-    // nothing else)
-    assert_eq!(e.count("blocks"), load_only.count("blocks") + 4);
+    // (the store's resolver walks the directory in its own block, as the load's does: the
+    // walk is not behind a branch, so neither adds a block)
+    assert_eq!(e.count("blocks"), load_only.count("blocks"));
 }
 
 #[test]
@@ -235,8 +240,9 @@ fn a_load_in_the_descriptors_format_is_decoded_through_the_tables() {
     // buffer_load_format_x v1, v0, s[4:7], 0 idxen, and the same with xyzw
     let x = emit(&[0xE000_2000, 0x8001_0100, KEEP_V1[0], KEEP_V1[1], S_ENDPGM]);
     assert_eq!(x.stats.buffer_accesses, 1);
-    // The bytes may start anywhere in a dword: five dwords through one resolver.
-    assert_eq!((x.stats.resolves_single, x.stats.resolves_multi), (0, 1));
+    // The bytes may start anywhere in a dword: five dwords through two resolvers, the
+    // page of the first dword and the page after it.
+    assert_eq!((x.stats.resolves_single, x.stats.resolves_multi), (0, 2));
     // What the format is, and the four words of the one component that is kept.
     assert_eq!(x.count("lds_load"), 1 + 4);
     let xyzw = emit(&[0xE00C_2000, 0x8001_0100, KEEP_V1[0], KEEP_V1[1], S_ENDPGM]);
@@ -274,7 +280,7 @@ fn a_load_of_halves_in_the_descriptors_format_packs_the_components() {
     // The same decode, and the component made a half (an integer format keeps its low bits).
     assert_eq!(d16.count("lds_load"), x.count("lds_load"));
     assert_eq!(math(&d16), math(&x) + 1);
-    assert_eq!((d16.stats.buffer_accesses, d16.stats.resolves_multi), (1, 1));
+    assert_eq!((d16.stats.buffer_accesses, d16.stats.resolves_multi), (1, 2));
     // buffer_load_format_d16_xyzw v[1:2]: four components in two registers, against
     // buffer_load_format_xyzw v[1:4] with all four kept.
     let xyzw = emit(&[0xE20C_2000, 0x8001_0100, KEEP_V1[0], KEEP_V1[1], KEEP_V2[0], KEEP_V2[1], S_ENDPGM]);
@@ -409,13 +415,14 @@ fn program(loads: &[[u32; 5]]) -> Vec<u32> {
 fn loads_of_one_base_share_a_page_group() {
     let e = emit(&program(&[load(0, 8, 0x10), load(0, 9, 0x20)]));
     assert_eq!((e.stats.page_groups, e.stats.grouped_loads, e.stats.scalar_loads), (1, 2, 2));
-    // One resolver for the group, which runs for the base's page and for the next.
-    assert_eq!((e.stats.resolves_single, e.stats.resolves_multi), (0, 1));
-    // Heap handles: the locator's view, the root, a leaf, and the page each load picks.
-    assert_eq!(e.count("handle"), 1 + 3 + 2);
-    // Loads: the limits, the memory words, the locator's view, s4 and s5, the root, a
-    // leaf, and one for each load.
-    assert_eq!(e.count("buffer_load"), 3 + 2 + 2 + 2);
+    // One resolver for the base's page and one for the next, one after the other.
+    assert_eq!((e.stats.resolves_single, e.stats.resolves_multi), (0, 2));
+    // Heap handles: the locator's view and the root once each, both leaves for each of the
+    // group's two pages, and the page each load picks.
+    assert_eq!(e.count("handle"), 1 + 1 + 1 + 4 + 2);
+    // Loads: the limits, the memory words, the locator's view, s4 and s5, the root and both
+    // leaves for each of the group's two pages, and one for each load.
+    assert_eq!(e.count("buffer_load"), 3 + 2 + 2 * 3 + 2);
     // A base that is read once is resolved by its load.
     let one = emit(&program(&[load(0, 8, 0x10)]));
     assert_eq!((one.stats.page_groups, one.stats.grouped_loads, one.stats.resolves_single), (0, 0, 1));
@@ -423,6 +430,38 @@ fn loads_of_one_base_share_a_page_group() {
     let own = emit(&program(&[load(0, 8, 0), load(0, 9, 0x20)]));
     assert_eq!(own.count("handle"), e.count("handle"));
     assert!(own.count("select") < e.count("select"));
+}
+
+/// buffer_load_dwordx2 v[1:2], v0, s[4:7], `offset`, with the lane's offset on.
+fn buffer_x2(offset: u32) -> [u32; 2] {
+    [0xE034_1000 | offset, 0x8004_0100]
+}
+
+#[test]
+fn buffer_loads_of_one_descriptor_and_lane_offset_share_a_page_group() {
+    // Two loads of one descriptor at one lane offset, 0x10 apart: one page group serves both.
+    let pair: Vec<u32> = buffer_x2(0x100).into_iter().chain(buffer_x2(0x110)).chain(KEEP_V1).chain([S_ENDPGM]).collect();
+    let e = emit(&pair);
+    assert_eq!((e.stats.page_groups, e.stats.grouped_loads, e.stats.resolves_multi), (1, 2, 2));
+    // One of them alone: no group, and its own resolution of the page and the next.
+    let one: Vec<u32> = buffer_x2(0x100).into_iter().chain(KEEP_V1).chain([S_ENDPGM]).collect();
+    let one = emit(&one);
+    assert_eq!((one.stats.page_groups, one.stats.resolves_multi), (0, 2));
+    // A single dword is served by its own resolver even when the base is shared: a group
+    // walks two pages where the load walks one.
+    let singles: Vec<u32> = [0xE030_1000u32, 0x8004_0100, 0xE030_1010, 0x8004_0100].into_iter().chain(KEEP_V1).chain([S_ENDPGM]).collect();
+    let singles = emit(&singles);
+    assert_eq!((singles.stats.page_groups, singles.stats.resolves_single), (0, 2));
+    // The same descriptor at another lane offset is another group.
+    let moved: Vec<u32> = buffer_x2(0x100)
+        .into_iter()
+        .chain([0x7E00_0206])
+        .chain(buffer_x2(0x110))
+        .chain(KEEP_V1)
+        .chain([S_ENDPGM])
+        .collect();
+    let moved = emit(&moved);
+    assert_eq!((moved.stats.page_groups, moved.stats.resolves_multi), (0, 4));
 }
 
 #[test]
@@ -437,9 +476,9 @@ fn a_page_group_is_one_64_kib_of_offsets() {
     let off = emit(&program(&[load(0, 8, 0x12), load(0, 9, 0x22)]));
     assert_eq!((off.stats.page_groups, off.stats.resolves_single), (0, 2));
     let long = emit(&program(&[load(2, 8, 0xfff4), load(2, 12, 0xfff4)]));
-    assert_eq!((long.stats.page_groups, long.stats.resolves_multi), (0, 2));
+    assert_eq!((long.stats.page_groups, long.stats.resolves_multi), (0, 4));
     let fits = emit(&program(&[load(2, 8, 0xfff0), load(2, 12, 0xfff0)]));
-    assert_eq!((fits.stats.page_groups, fits.stats.grouped_loads, fits.stats.resolves_multi), (1, 2, 1));
+    assert_eq!((fits.stats.page_groups, fits.stats.grouped_loads, fits.stats.resolves_multi), (1, 2, 2));
 }
 
 #[test]
@@ -459,6 +498,20 @@ fn a_grouped_record_is_read_four_dwords_at_a_time() {
     // (a pick for the second four, and the next page's own handle)
     assert_eq!(e.count("handle"), two.count("handle") + 2);
     assert_eq!(e.count("blocks"), two.count("blocks"));
+}
+
+#[test]
+fn a_group_reads_the_next_page_once_unless_the_program_is_coherent() {
+    let emit = |words: &[u32]| emit_with(words, bare()).unwrap();
+    let mut words = program(&[load(3, 8, 0x10), load(3, 16, 0x40)]);
+    words.splice(words.len() - 1..words.len() - 1, [v1_from(23), KEEP_V1[0], KEEP_V1[1], v1_from(15), KEEP_V1[0], KEEP_V1[1]]);
+    let plain = emit(&words);
+    assert_eq!((plain.stats.page_groups, plain.stats.grouped_loads), (1, 2));
+    // s_dcache_inv first: scalar loads must not take an older value, so each member reads
+    // the next page's first dwords where it stands.
+    let coherent = emit(&[&[0xF480_0000, 0][..], &words].concat());
+    assert_eq!((coherent.stats.page_groups, coherent.stats.grouped_loads), (1, 2));
+    assert_eq!(coherent.count("buffer_load"), plain.count("buffer_load") + 1);
 }
 
 #[test]

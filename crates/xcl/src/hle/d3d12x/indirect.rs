@@ -175,6 +175,8 @@ unsafe fn record_arguments(signature: &ID3D12CommandSignature) -> Option<(u32, V
     Some((words[0], args.to_vec()))
 }
 
+// The prebuilt indirect-action path has no caller yet; kept for the next fix.
+#[allow(dead_code)]
 pub(crate) unsafe fn plain_action(signature: &ID3D12CommandSignature) -> Option<(u32, u32)> {
     let (stride, args) = record_arguments(signature)?;
     if args.len() != 1 || !matches!(args[0][0], 0..=2 | 10) {
@@ -222,6 +224,8 @@ impl IndirectRecipe {
         }
         super::list_x::native_buffer::translated::Rows::prepare(stride, &args, &layout, gfx, super::real::pso_user_sgprs(native_pso), base_args, io)
     }
+    // The prebuilt indirect-action path has no caller yet; kept for the next fix.
+    #[allow(dead_code)]
     pub(crate) fn prebuilt_reads(
         &self,
         locator: u32,
@@ -301,6 +305,8 @@ impl IndirectRecipe {
 }
 
 pub(crate) enum IndirectInput {
+    // The native indirect input is carried but not consumed yet; kept for the next fix.
+    #[allow(dead_code)]
     Native(ID3D12Resource, u64),
     Gather(super::list_x::native_buffer::Read),
 }

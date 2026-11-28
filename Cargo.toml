@@ -15,3 +15,19 @@ license = "GPL-3.0-or-later"
 # resolved to functions, files, and lines without a separate diagnostic build.
 [profile.release]
 debug = 2
+
+# The build handed to players: `cargo build --profile production --features production`. The
+# diagnostics that are on by default are off through the feature, and the optimiser is given the
+# whole crate graph: one codegen unit, fat LTO, line tables only for a crash backtrace.
+#
+# `panic = "abort"` is deliberately NOT set. Six paths recover from a panic with
+# `std::panic::catch_unwind` (the DXC compile in gpu/recomp/dxc.rs, the async PSO workers in
+# hle/d3d12x/pso_async.rs, the warm-up in hle/d3d12x/real.rs); abort would end the process where
+# they carry on, and a shader that panics the translator would kill a run instead of failing one
+# pipeline.
+[profile.production]
+inherits = "release"
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+debug = "line-tables-only"

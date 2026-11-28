@@ -43,6 +43,39 @@ pub(super) const TOKEN_MASK: u64 = 0xFFFF_FFFF_FFFF;
 pub(super) const KNOWN_TOKENS: usize = 64;
 const FLIPPED_KEEP: usize = 64;
 
+/// `XCL_FRAME_INTERVAL_US`: an upper bound for the console frame clock's interval (µs), for a
+/// title that asks for a slower one. Unset: the title's interval, as before. A number (16667 for
+/// 60 Hz): `min(requested, this)`, at least 1000 µs so the clock thread never busy-spins. It never
+/// lowers the title's rate, only lifts it; the port is xcl upstream 4f4db6452875 (`frame.rs`), with
+/// 0 / uncapped left out: uncapping needs the wait path to hand out origins without the clock, and
+/// a clock that stops pacing would leave `WaitFrameEventX` waiting for ever – so 0 is refused and
+/// the title's interval kept. The title's `SetFrameIntervalX(33333, …)` is what held a retail title
+/// at 30 fps (never above 29.2 presented in any run); the interval it asks for is logged.
+pub fn parse_interval_override(raw: Option<&str>) -> Option<u32> {
+    let s = raw?.trim();
+    if s.is_empty() {
+        return None;
+    }
+    if s.eq_ignore_ascii_case("uncapped") || s.eq_ignore_ascii_case("off") {
+        return Some(0);
+    }
+    s.parse::<u32>().ok()
+}
+
+fn interval_override() -> Option<u32> {
+    static OVERRIDE: OnceLock<Option<u32>> = OnceLock::new();
+    *OVERRIDE.get_or_init(|| parse_interval_override(std::env::var("XCL_FRAME_INTERVAL_US").ok().as_deref()))
+}
+
+/// The clock's interval (µs): the title's `requested`, lowered to `override` when one is set and
+/// usable, never under 1000 µs. A refused override (0, uncapped) keeps the title's.
+fn effective_clock_interval_us(requested_us: u32, override_us: Option<u32>) -> u32 {
+    match override_us {
+        Some(ov) if ov > 0 && requested_us > 0 => ov.min(requested_us).max(1000),
+        _ => requested_us,
+    }
+}
+
 /// Frame intervals the console accepts (µs, with the rounding a title may use); the 120 Hz
 /// ones (8 333, 25 000) only on a display that runs at 120 Hz.
 pub fn interval_valid(len_us: u32, high_refresh: bool) -> bool {
@@ -219,7 +252,18 @@ pub unsafe extern "system" fn set_frame_interval_x(_this: *mut std::ffi::c_void,
         c.generation += 1;
     });
     static ONCE: std::sync::Once = std::sync::Once::new();
-    ONCE.call_once(|| crate::xlog_info!("D3D12.X: frame interval {len_us} µs (periodicity {periodicity}, flags {flags:#x})"));
+    ONCE.call_once(|| match interval_override() {
+        Some(0) => crate::xlog_info!(
+            "D3D12.X: frame interval {len_us} µs (XCL_FRAME_INTERVAL_US=0 – uncapped is not ported, the title's interval is kept, periodicity {periodicity}, flags {flags:#x})"
+        ),
+        Some(ov) => {
+            let eff = effective_clock_interval_us(len_us, Some(ov));
+            crate::xlog_info!(
+                "D3D12.X: frame interval {len_us} µs requested → {eff} µs effective (XCL_FRAME_INTERVAL_US={ov}, periodicity {periodicity}, flags {flags:#x})"
+            );
+        }
+        None => crate::xlog_info!("D3D12.X: frame interval {len_us} µs (periodicity {periodicity}, flags {flags:#x})"),
+    });
     SetEvent(wake());
     S_FALSE
 }
@@ -458,7 +502,8 @@ fn clock_thread() {
                 if !c.active || c.interval_us == 0 {
                     return None;
                 }
-                let interval = ticks(c.interval_us as i64);
+                let effective_us = effective_clock_interval_us(c.interval_us, interval_override());
+                let interval = ticks(effective_us as i64);
                 let after = replan_after(invalidated_deadline.take(), qpc());
                 let due: Vec<(i64, usize, usize, Arc<Handles>)> = c
                     .kinds
@@ -466,7 +511,9 @@ fn clock_thread() {
                     .enumerate()
                     .filter(|(_, k)| k.scheduled)
                     .map(|(i, k)| {
-                        let mut d = next_deadline(c.base_qpc, interval, ticks(k.offset_us as i64), after);
+                        // a point of the frame keeps its place in the shorter interval
+                        let offset = k.offset_us % effective_us.max(1);
+                        let mut d = next_deadline(c.base_qpc, interval, ticks(offset as i64), after);
                         if d - last[i] < interval / 2 {
                             d += interval; // this point of the frame already fired
                         }
@@ -506,6 +553,23 @@ fn clock_thread() {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_interval_override_parses_and_clamps() {
+        assert_eq!(super::parse_interval_override(None), None, "unset: the title's interval");
+        assert_eq!(super::parse_interval_override(Some("")), None);
+        assert_eq!(super::parse_interval_override(Some("bad")), None);
+        assert_eq!(super::parse_interval_override(Some("0")), Some(0));
+        assert_eq!(super::parse_interval_override(Some("uncapped")), Some(0));
+        assert_eq!(super::parse_interval_override(Some("OFF")), Some(0));
+        assert_eq!(super::parse_interval_override(Some("8333")), Some(8333));
+        assert_eq!(super::effective_clock_interval_us(33333, Some(16667)), 16667, "60 Hz from a title's 30");
+        assert_eq!(super::effective_clock_interval_us(33333, Some(50000)), 33333, "never slower than the title's");
+        assert_eq!(super::effective_clock_interval_us(8333, Some(16667)), 8333, "never slower than the title's");
+        assert_eq!(super::effective_clock_interval_us(33333, Some(500)), 1000, "never under 1 ms");
+        assert_eq!(super::effective_clock_interval_us(33333, Some(0)), 33333, "uncapped refused: the title's interval");
+        assert_eq!(super::effective_clock_interval_us(33333, None), 33333);
+    }
+
     use super::*;
 
     /// the clock is one per process: the tests that run it take turns

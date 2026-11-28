@@ -109,19 +109,8 @@ const NAMES: [&str; 25] = [
 
 static COUNTS: [AtomicU64; 25] = [const { AtomicU64::new(0) }; 25];
 
-#[cfg(test)]
-thread_local! {
-    /// what this thread counted: the tests compare deltas while three other tests submit in the
-    /// same process and the product's counters are shared
-    static TEST_COUNTS: std::cell::RefCell<[u64; 23]> = const { std::cell::RefCell::new([0; 23]) };
-    /// submissions this thread reported, so a test can tell whether the queue's own wrapper did it
-    static REPORTS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
-}
-
 fn count(c: Count) {
     let n = COUNTS[c as usize].fetch_add(1, Ordering::Relaxed) + 1;
-    #[cfg(test)]
-    TEST_COUNTS.with(|t| t.borrow_mut()[c as usize] += 1);
     if n.is_power_of_two() {
         crate::xlog_info!("D3D12.X: image writeback: {} ({n} so far)", NAMES[c as usize]);
     }
@@ -180,6 +169,8 @@ struct Image {
     generation: u64,
     /// the CPU has read it back: guarded whatever its size from then on
     read: bool,
+    /// the generation last written back (a flush with no newer write skips the copy)
+    landed_generation: Option<u64>,
     guards: Vec<(usize, usize, u32)>,
     /// digest of every subresource as last landed (subresources order); empty: never landed
     landed: Arc<Vec<u64>>,
@@ -416,6 +407,7 @@ pub(super) unsafe fn register(native: *mut c_void, image: &GuestImage) {
         dirty: None,
         generation: 0,
         read: false,
+        landed_generation: None,
         guards: Vec::new(),
         landed: Arc::new(Vec::new()),
         full: BTreeSet::new(),
@@ -624,17 +616,10 @@ fn uav_state(img: &Image, state: u32) -> bool {
 
 /// The PC lists went to queue, in this order: the images they wrote are captured and guarded,
 /// and every image they wrote or transitioned is ordered after them.
-#[cfg(test)]
-pub(super) fn reports() -> u64 {
-    REPORTS.with(|r| r.get())
-}
-
 pub(super) unsafe fn submitted(queue: *mut c_void, lists: &[*mut c_void]) {
     if !ACTIVE.load(Ordering::Relaxed) || lists.is_empty() || super::title_textures::is_own_work() {
         return;
     }
-    #[cfg(test)]
-    REPORTS.with(|r| r.set(r.get() + 1));
     let Some(q) = ID3D12CommandQueue::from_raw_borrowed(&queue) else { return };
     let _submission = Submission::enter();
     let notes = super::title_textures::list_transitions(lists);
@@ -870,6 +855,12 @@ unsafe fn flush_inner(key: usize) {
             if img.guards.is_empty() {
                 return;
             }
+            if img.landed_generation == Some(img.generation) && img.full.is_empty() {
+                count(Count::Unchanged);
+                img.dirty = None;
+                unguard(img);
+                return;
+            }
             let Some(sources) = img.dirty.clone() else {
                 unguard(img);
                 return;
@@ -895,6 +886,7 @@ unsafe fn flush_inner(key: usize) {
         let done = landed.is_none() || img.generation == snap.generation;
         if let Some((digests, wrote)) = landed {
             count(if wrote { Count::Flushed } else { Count::Unchanged });
+            img.landed_generation = Some(snap.generation);
             img.landed = Arc::new(digests);
             img.full.retain(|k| !snap.full.contains(k));
         }
@@ -1029,12 +1021,26 @@ unsafe fn land(contexts: &mut BTreeMap<usize, Context>, key: usize, s: &Snapshot
         let from = &tiled[lo - s.va..hi - s.va];
         match (src, &views[i]) {
             (QueuePageSource::Physical(_), Some(v)) => std::ptr::copy_nonoverlapping(from.as_ptr(), (v.base() + (lo - page)) as *mut u8, from.len()),
-            (QueuePageSource::GuestRange { .. }, _) => with_access(lo, hi - lo, || std::ptr::copy_nonoverlapping(from.as_ptr(), lo as *mut u8, from.len())),
+            (QueuePageSource::GuestRange { .. }, _) => {
+                if !write_title(lo, from) {
+                    count(Count::Failed);
+                }
+            }
             _ => count(Count::Hole),
         }
     }
     kernelx::note_written(s.va, s.size);
     Some((digests, true))
+}
+
+/// Writes from into the title's at at without changing its protection: another thread reading
+/// there meanwhile sees the bytes before or after, not half of each, and a guarded page stays
+/// guarded for its readers.
+unsafe fn write_title(at: usize, from: &[u8]) -> bool {
+    use windows_sys::Win32::System::Diagnostics::Debug::WriteProcessMemory;
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+    let mut done = 0usize;
+    WriteProcessMemory(GetCurrentProcess(), at as *mut c_void, from.as_ptr().cast(), from.len(), &mut done) != 0 && done == from.len()
 }
 
 /// f with [at, at + len) readable and writable (a guarded page of private memory: there is no
@@ -1165,7 +1171,7 @@ unsafe fn read_back(contexts: &mut BTreeMap<usize, Context>, res: &ID3D12Resourc
 
 #[cfg(test)]
 fn counted(name: &str) -> u64 {
-    NAMES.iter().position(|n| *n == name).map_or(0, |i| TEST_COUNTS.with(|t| t.borrow()[i]))
+    NAMES.iter().position(|n| *n == name).map_or(0, |i| COUNTS[i].load(Ordering::Relaxed))
 }
 
 #[cfg(test)]

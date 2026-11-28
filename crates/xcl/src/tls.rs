@@ -11,7 +11,7 @@
 //! thread exit – and starts each thread's block as the carrier's template. We write that slot's
 //! index into the game's `_tls_index`. The game's TLS template reaches the block of each thread:
 //! * existing threads – from ntdll, under its own lock, when the carrier is loaded,
-//! * new threads – from ntdll too, and again from `XSEmu.exe`'s own TLS callback
+//! * new threads – from ntdll too, and again from `xcl.exe`'s own TLS callback
 //!   (`on_thread_attach`), which ntdll calls after allocating all TLS blocks and before the
 //!   thread start routine runs.
 //!
@@ -254,14 +254,14 @@ unsafe fn fill_block(block: *mut u8, img: &TlsImage) {
 // slot 0 for the title's executable
 // ---------------------------------------------------------------------------------------
 
-/// The slot XSEmu.exe's own TLS moved to when the title's executable took slot 0 (NO_INDEX: not
+/// The slot xcl.exe's own TLS moved to when the title's executable took slot 0 (NO_INDEX: not
 /// moved).
 static XCL_SLOT: AtomicU32 = AtomicU32::new(NO_INDEX);
 /// TEBs of the threads whose slots were exchanged by `take_slot_zero` itself (their TLS
 /// callback, if it still comes, leaves them as they are); held during the exchange
 static MOVED: std::sync::Mutex<Vec<usize>> = std::sync::Mutex::new(Vec::new());
 
-/// XSEmu.exe's `_tls_index` (its TLS directory's AddressOfIndex)
+/// xcl.exe's `_tls_index` (its TLS directory's AddressOfIndex)
 unsafe fn own_tls_index() -> Option<*mut u32> {
     use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
     let base = GetModuleHandleW(std::ptr::null()) as usize;
@@ -312,19 +312,19 @@ pub(crate) unsafe fn thread_tebs() -> Vec<*mut u8> {
 /// The title's executable gets TLS slot 0, as on Windows (and the console) the process's
 /// executable has it: code built with /GA reads `ThreadLocalStoragePointer[0]` directly, without
 /// `_tls_index` (Fortnite: the guard of its thread-safe statics, so its allocator was never
-/// made). Slot 0 is XSEmu.exe's own: its TLS moves to the carrier's slot `k` (all of its code
+/// made). Slot 0 is xcl.exe's own: its TLS moves to the carrier's slot `k` (all of its code
 /// goes through `_tls_index`), the carrier's blocks – the title's – to slot 0. Running threads
-/// first get XSEmu.exe's block in both slots and only then the title's in slot 0, so a TLS
+/// first get xcl.exe's block in both slots and only then the title's in slot 0, so a TLS
 /// access in flight with either index stays right.
 pub unsafe fn take_slot_zero(img_name: &str, title_index: *mut u32, k: u32) -> Result<(), String> {
     use std::sync::atomic::fence;
-    let own = own_tls_index().ok_or("XSEmu.exe has no TLS directory")?;
+    let own = own_tls_index().ok_or("xcl.exe has no TLS directory")?;
     if *own != 0 {
-        return Err(format!("XSEmu.exe's TLS index is {}, not 0", *own));
+        return Err(format!("xcl.exe's TLS index is {}, not 0", *own));
     }
     let mut moved = MOVED.lock().map_err(|_| "TLS lock poisoned")?;
     let tebs = thread_tebs();
-    // 1. slot k = slot 0 (XSEmu.exe's block) in every thread; the carrier blocks kept
+    // 1. slot k = slot 0 (xcl.exe's block) in every thread; the carrier blocks kept
     let mut carriers: Vec<(*mut *mut u8, *mut u8)> = Vec::new();
     for &teb in &tebs {
         let arr = *(teb.add(0x58) as *const *mut *mut u8);
@@ -353,11 +353,11 @@ pub unsafe fn take_slot_zero(img_name: &str, title_index: *mut u32, k: u32) -> R
         }
     }
     drop(moved);
-    crate::xlog_info!("TLS: {img_name} has slot 0 (as a process's executable); XSEmu.exe's own TLS is in slot {k} – {} threads", tebs.len());
+    crate::xlog_info!("TLS: {img_name} has slot 0 (as a process's executable); xcl.exe's own TLS is in slot {k} – {} threads", tebs.len());
     Ok(())
 }
 
-/// A new thread: ntdll gave slot 0 XSEmu.exe's block and slot k the carrier's – exchanged before
+/// A new thread: ntdll gave slot 0 xcl.exe's block and slot k the carrier's – exchanged before
 /// anything here reads TLS.
 unsafe fn exchange_for_new_thread(teb: *mut u8) {
     let k = XCL_SLOT.load(Ordering::Acquire);
@@ -390,7 +390,7 @@ pub fn on_thread_detach() {
     }
 }
 
-/// Called for every new thread from XSEmu.exe's TLS callback (DLL_THREAD_ATTACH).
+/// Called for every new thread from xcl.exe's TLS callback (DLL_THREAD_ATTACH).
 pub unsafe fn on_thread_attach() {
     let teb = current_teb();
     exchange_for_new_thread(teb);

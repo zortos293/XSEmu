@@ -40,6 +40,21 @@
 //! - `XCL_GTA6_AMBIENT_BOUND=<multiple>`: the estimate is at most that multiple of the mean light
 //!   the title's own program left in the frame, before the raise (1 unless set; `0`: unbounded).
 //!   The title's light follows its exposure, so the stand-in cannot outshine the frame it is put in.
+//! - `XCL_GTA6_AMBIENT_FALLBACK=<share>`: the estimate above is only as good as the light it is
+//!   taken from, and with rays off the probes can leave no light at all over most of the picture
+//!   (play-126: zero over 92.5% of it), so the estimate is zero there and the raise adds nothing.
+//!   While the estimate reads nothing in more than that share of its cells, or the light the title's
+//!   own program left reads zero over more than that share of the picture, the estimate is raised,
+//!   where it is darker, to the mean of the light the picture's lit part still sends out (its sky and
+//!   its sunlit surfaces, damped as the cells are so a glint does not set it), flat, at the same
+//!   `level` of it the estimate is taken at (0.8 of it), shaded in creases like the flat light, and
+//!   not bounded by `XCL_GTA6_AMBIENT_BOUND`, which reads that same dead light. 0.5 unless set (more
+//!   than half; `0` is today's behaviour, the estimate from the probe chain and nothing else; a share
+//!   of 1, or more, never engages). One line per occasion is logged, with both shares that engaged
+//!   it (they are read back from the GPU: see `copy_report`). A picture with no light anywhere reads
+//!   zero over all of itself and leaves nothing to take the level from: it takes
+//!   `XCL_GTA6_AMBIENT=constant:<level>` instead. General fix: inline ray tracing the driver can
+//!   compile in bounded memory, then ray tracing on, and the probes carry the light themselves.
 //!
 //! None of these changes a translated shader, so none is in the translation cache's identity:
 //! the passes here are XCL's own programs, compiled like its other helpers (`real::compile`).
@@ -97,7 +112,7 @@
 
 use std::collections::HashMap;
 use std::ffi::c_void;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 use windows::core::Interface;
@@ -227,6 +242,9 @@ struct Settings {
     fall: f32,
     /// The most the estimate is, as a multiple of the mean of the title's own light (0: no bound).
     bound: f32,
+    /// The share of the estimate's cells, or of the picture, that has to read no light before the
+    /// estimate is raised to the level the picture's lit part sends out (0: no fallback).
+    fallback: f32,
 }
 
 fn settings() -> &'static Settings {
@@ -241,6 +259,7 @@ fn settings() -> &'static Settings {
             lowest: parse_share(&var("XCL_GTA6_AMBIENT_FLOOR"), 0.0),
             fall: parse_share(&var("XCL_GTA6_AMBIENT_FALL"), FOLLOW).min(1.0),
             bound: parse_share(&var("XCL_GTA6_AMBIENT_BOUND"), 1.0),
+            fallback: parse_share(&var("XCL_GTA6_AMBIENT_FALLBACK"), FALLBACK),
         }
     })
 }
@@ -267,8 +286,9 @@ pub(super) fn wanted() -> bool {
         };
         let air = if s.air > 0.0 && matches!(s.light, Set::Estimate(_)) { format!("the air scatters at most {} times the light around", s.air) } else { "the air is left as the title has it (XCL_GTA6_AMBIENT_AIR)".into() };
         let cap = if s.cap > 0.0 { format!("the title's own light cut to {} times the estimate", s.cap) } else { "the title's own light kept whole".into() };
+        let fallback = if s.fallback > 0.0 { format!("the estimate raised to the level of the light the picture's lit part sends out when it reads nothing in more than {} of its cells, or the title's own light reads zero over more than {} of the picture", s.fallback, s.fallback) } else { "the estimate the probe chain's alone, never raised (XCL_GTA6_AMBIENT_FALLBACK)".into() };
         crate::xlog_info!(
-            "D3D12.X: title patch {what} on ({switch}=0 turns it off): {light}, creases shaded with strength {} over {} m (XCL_GTA6_AMBIENT_SHADE), {air}, {cap} (XCL_GTA6_AMBIENT_CAP), the estimate at least {} of the slow mean (XCL_GTA6_AMBIENT_FLOOR), which follows a darker frame at {} a frame (XCL_GTA6_AMBIENT_FALL), and at most {} times the mean of the title's own light (XCL_GTA6_AMBIENT_BOUND); it engages at the first dispatch of {}",
+            "D3D12.X: title patch {what} on ({switch}=0 turns it off): {light}, creases shaded with strength {} over {} m (XCL_GTA6_AMBIENT_SHADE), {air}, {cap} (XCL_GTA6_AMBIENT_CAP), the estimate at least {} of the slow mean (XCL_GTA6_AMBIENT_FLOOR), which follows a darker frame at {} a frame (XCL_GTA6_AMBIENT_FALL), and at most {} times the mean of the title's own light (XCL_GTA6_AMBIENT_BOUND), {fallback} (XCL_GTA6_AMBIENT_FALLBACK); it engages at the first dispatch of {}",
             s.shade[0],
             s.shade[1],
             s.lowest,
@@ -435,17 +455,21 @@ const SOURCE: &str = r#"
 #define CY 36
 #define CELLS (CX * CY)
 #define OWN_AT (2 * CELLS + 1)
+#define SKY_AT (2 * CELLS + 2)
+#define DEAD_AT (2 * CELLS + 3)
 #define PX 160
 #define PY 90
 cbuffer Set : register(b0) {
     float level; float constant; float strength; float radius;
     float near; float tan_y; uint width; uint height;
     float follow; float most; float air; float lowest;
-    float fall; float bound; float unused1; float unused2;
+    float fall; float bound; float fallback; float unused2;
 };
 Texture2D<float> depth : register(t0);
 // Cells: the light they send out (then, at CELLS, the slow mean), from
-// CELLS + 1 on where they are.
+// CELLS + 1 on where they are, at OWN_AT the mean the title's own program
+// left, at SKY_AT the level and share of the light its lit part sends out,
+// and at DEAD_AT the share the estimate reads nothing in.
 RWStructuredBuffer<float4> cells : register(u1);
 // Three a point: red, green and blue, each a mean and a direction.
 RWStructuredBuffer<float4> points : register(u2);
@@ -469,10 +493,18 @@ RWTexture2D<uint> light : register(u0);
 [numthreads(1, 1, 1)]
 void main() {
     float sum = 0;
+    float3 lit_sum = 0;
+    uint lit = 0;
     for (uint y = 0; y < CY; y++) for (uint x = 0; x < CX; x++) {
-        sum += dot(unpack(light[uint2((float2(x, y) + 0.5) * float2(width, height) / float2(CX, CY))]), LUMA);
+        float3 c = unpack(light[uint2((float2(x, y) + 0.5) * float2(width, height) / float2(CX, CY))]);
+        float l = dot(c, LUMA);
+        sum += l;
+        // The lit part, damped as the cells are: a lamp or a glint counts, but not for everything.
+        lit_sum += c / max(1.0, l / 20.0);
+        lit += (l > 0.0) ? 1u : 0u;
     }
     cells[OWN_AT] = float4(sum / CELLS, 0.0, 0.0, 1.0);
+    cells[SKY_AT] = float4(lit_sum / max(lit, 1u), float(lit) / CELLS);
 }
 #endif
 
@@ -500,11 +532,18 @@ void main(uint3 at : SV_DispatchThreadID) {
 [numthreads(1, 1, 1)]
 void main() {
     float3 sum = 0;
-    for (uint i = 0; i < CELLS; i++) sum += cells[i].rgb;
+    uint dead = 0;
+    for (uint i = 0; i < CELLS; i++) {
+        float3 c = cells[i].rgb;
+        sum += c;
+        dead += (dot(c, LUMA) > 0.0) ? 0u : 1u;
+    }
     float4 was = cells[CELLS];
     float3 now = sum / CELLS;
     float rate = dot(now, LUMA) < dot(was.rgb, LUMA) ? fall : follow;
     cells[CELLS] = float4(was.a > 0.0 ? lerp(was.rgb, now, rate) : now, 1.0);
+    // The share of the cells the estimate reads nothing in: with rays off, most of them.
+    cells[DEAD_AT] = float4(float(dead) / CELLS, 0.0, 0.0, 1.0);
 }
 #endif
 
@@ -647,6 +686,11 @@ void main(uint3 at : SV_DispatchThreadID) {
     if (bound > 0.0) {
         found *= min(1.0, bound * cells[OWN_AT].x / max(dot(found, LUMA), 1e-6));
     }
+    // The probes are dead over most of the picture (or the light they resolved with them): the
+    // estimate is nothing (and the bound above cut it to that nothing), so the picture takes the
+    // level of the light its own lit part still sends out, flat, at the share of it the estimate is
+    // taken at. The bound is not asked again: the mean it reads is that same dead light.
+    if (fallback > 0.0 && (cells[DEAD_AT].x > fallback || cells[SKY_AT].w < 1.0 - fallback)) found = max(found, cells[SKY_AT].rgb * (level * open));
     float3 was = unpack(light[p]);
     // What the program left counts as far as it can be true: the sky's light
     // outdoors, not the blocks of other memory.
@@ -669,12 +713,16 @@ fn source(part: &str) -> String {
 }
 
 /// Cells across and down, points across and down (`SOURCE`'s CX, CY, PX, PY), and the bytes of the
-/// cells' buffer (the light of each, the slow mean, where each is) and of the points' (three
-/// float4 a point).
+/// cells' buffer (the light of each, the slow mean, where each is, the mean light the title's own
+/// program left, the level and share of the light the picture's own lit part sends out, and the
+/// share the estimate reads nothing in) and of the points' (three float4 a point).
 const CELLS: [u32; 2] = [64, 36];
 const POINTS: [u32; 2] = [160, 90];
-const CELL_BYTES: u64 = (2 * (CELLS[0] * CELLS[1]) as u64 + 2) * 16;
+const CELL_BYTES: u64 = (2 * (CELLS[0] * CELLS[1]) as u64 + 4) * 16;
 const POINT_BYTES: u64 = (POINTS[0] * POINTS[1]) as u64 * 48;
+/// Where the cells' buffer holds that level and share (`SKY_AT`), from which the log copies out the
+/// whole tail of the buffer: `SKY_AT` and `DEAD_AT` are the last two slots.
+const SKY_BYTES: u64 = (2 * (CELLS[0] * CELLS[1]) as u64 + 2) * 16;
 
 /// The distance of the near plane in metres and the tangent of half the view's height, which the
 /// passes take the place of a texel from; and how fast the slow mean follows a brighter frame (a
@@ -683,12 +731,17 @@ const NEAR: f32 = 0.1;
 const TAN_Y: f32 = 0.45;
 const FOLLOW: f32 = 0.04;
 
+/// The share of the estimate's cells, or of the picture, that `XCL_GTA6_AMBIENT_FALLBACK` waits
+/// for unless it names one: more than half of either reading no light at all.
+const FALLBACK: f32 = 0.5;
+
 /// XCL's objects for the passes, raw (never released): the root signature, the pipelines in the
-/// order of `PARTS`, and the GPU addresses of the two buffers.
+/// order of `PARTS`, and the two buffers (the cells' own resource too, for the log's copy out).
 struct Passes {
     rs: usize,
     pipelines: [usize; 7],
     cells: u64,
+    cells_res: usize,
     points: u64,
 }
 
@@ -727,7 +780,7 @@ fn passes() -> Option<&'static Passes> {
                     pipelines[k] = pso.into_raw() as usize;
                 }
                 // (a new committed buffer is zero: the slow mean starts unset, `was.a` 0)
-                let buffer = |bytes: u64| -> Result<u64, String> {
+                let buffer = |bytes: u64| -> Result<(u64, usize), String> {
                     let props = D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() };
                     let desc = D3D12_RESOURCE_DESC {
                         Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
@@ -744,10 +797,10 @@ fn passes() -> Option<&'static Passes> {
                     dev.CreateCommittedResource(&props, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, None, &mut r).map_err(|e| format!("a buffer of {bytes} bytes: {e}"))?;
                     let r = r.ok_or("a buffer")?;
                     let va = r.GetGPUVirtualAddress();
-                    let _ = r.into_raw();
-                    Ok(va)
+                    Ok((va, r.into_raw() as usize))
                 };
-                Ok(Passes { rs: rs.into_raw() as usize, pipelines, cells: buffer(CELL_BYTES)?, points: buffer(POINT_BYTES)? })
+                let (cells, cells_res) = buffer(CELL_BYTES)?;
+                Ok(Passes { rs: rs.into_raw() as usize, pipelines, cells, cells_res, points: buffer(POINT_BYTES)?.0 })
             })
         })();
         match made {
@@ -771,7 +824,7 @@ static GATHERED: AtomicBool = AtomicBool::new(false);
 /// The constants of the passes (`SOURCE`'s `Set`) for an image of `size`.
 fn constants(level: f32, constant: f32, s: &Settings, size: [u32; 2]) -> [u32; 16] {
     let f = f32::to_bits;
-    [f(level), f(constant), f(s.shade[0]), f(s.shade[1]), f(NEAR), f(TAN_Y), size[0], size[1], f(FOLLOW), f(s.cap), f(s.air), f(s.lowest), f(s.fall), f(s.bound), 0, 0]
+    [f(level), f(constant), f(s.shade[0]), f(s.shade[1]), f(NEAR), f(TAN_Y), size[0], size[1], f(FOLLOW), f(s.cap), f(s.air), f(s.lowest), f(s.fall), f(s.bound), f(s.fallback), 0]
 }
 
 /// The passes after `role` and the groups each is dispatched with (a pipeline of `PARTS` each), for
@@ -789,8 +842,9 @@ fn schedule(role: Role, flat: bool, size: [u32; 2], slices: u32) -> Vec<(usize, 
 
 /// Records `passes` on `list`, with `image` and `depth` as the handles of the title's views in the shared
 /// view heap. A barrier for all unordered access goes before the first and after each: a pass
-/// reads what the title's program and the pass before it wrote.
-unsafe fn record(list: *mut c_void, p: &Passes, words: &[u32; 16], image: u64, depth: u64, passes: &[(usize, [u32; 3])]) -> bool {
+/// reads what the title's program and the pass before it wrote. With `report`, the light's own
+/// report is copied out for the log after the last pass (`copy_report`).
+unsafe fn record(list: *mut c_void, p: &Passes, words: &[u32; 16], image: u64, depth: u64, passes: &[(usize, [u32; 3])], report: bool) -> bool {
     let (rs, Some(l)) = (p.rs as *mut c_void, ID3D12GraphicsCommandList::from_raw_borrowed(&list)) else { return false };
     let Some(rs) = ID3D12RootSignature::from_raw_borrowed(&rs) else { return false };
     let barrier = || [D3D12_RESOURCE_BARRIER { Type: D3D12_RESOURCE_BARRIER_TYPE_UAV, ..Default::default() }];
@@ -809,7 +863,87 @@ unsafe fn record(list: *mut c_void, p: &Passes, words: &[u32; 16], image: u64, d
         l.Dispatch(x, y, z);
         l.ResourceBarrier(&barrier());
     }
+    if report {
+        copy_report(list, l, p);
+    }
     true
+}
+
+/// The light's own report (`SKY_AT` and `DEAD_AT`: the level of the picture's lit part, the share
+/// that is lit, and the share the estimate reads nothing in) in a readback buffer the CPU reads for
+/// the log, and the sequence number of the copy that carries it.
+struct Readback {
+    /// the readback resource itself, for the copy
+    readback: usize,
+    /// its GPU address, where the sequence number goes
+    va: u64,
+    /// its CPU address, mapped for good
+    cpu: usize,
+    seq: AtomicU32,
+}
+
+/// The report's readback buffer, made at the first fallback the stand-in records; `None` when the
+/// device would not make one (the log then says nothing about the share).
+fn readback() -> Option<&'static Readback> {
+    static BUFFER: OnceLock<Option<Readback>> = OnceLock::new();
+    BUFFER.get_or_init(|| unsafe { super::markers::readback_buffer(64) }.map(|(readback, va, cpu)| Readback { readback, va, cpu, seq: AtomicU32::new(0) })).as_ref()
+}
+
+/// Copies `SKY_AT` and `DEAD_AT` of the cells' buffer (`p`) into the report's readback at 4, after
+/// the passes that wrote them, and then writes the copy's sequence number at its start. A list's
+/// commands run in order on their queue, so a CPU that reads that sequence reads a copy the GPU has
+/// finished: the number at 0 is what `note_fallback` waits for, never a fence.
+unsafe fn copy_report(list: *mut c_void, l: &ID3D12GraphicsCommandList, p: &Passes) {
+    let Some(r) = readback() else { return };
+    let (dst_raw, src_raw) = (r.readback as *mut c_void, p.cells_res as *mut c_void);
+    let (Some(dst), Some(src), Some(l2)) = (
+        ID3D12Resource::from_raw_borrowed(&dst_raw),
+        ID3D12Resource::from_raw_borrowed(&src_raw),
+        ID3D12GraphicsCommandList2::from_raw_borrowed(&list),
+    ) else {
+        return;
+    };
+    l.ResourceBarrier(&[super::indirect::transition(p.cells_res, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE)]);
+    l.CopyBufferRegion(dst, 4, src, SKY_BYTES, 32);
+    l.ResourceBarrier(&[super::indirect::transition(p.cells_res, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS)]);
+    let seq = r.seq.fetch_add(1, Ordering::Relaxed) + 1;
+    let params = [D3D12_WRITEBUFFERIMMEDIATE_PARAMETER { Dest: r.va, Value: seq }];
+    l2.WriteBufferImmediate(1, params.as_ptr(), None);
+}
+
+/// The shares the fallback waits for, from the report the GPU last finished writing: logged the
+/// first time it engages and again each time the light comes back to it, one line an occasion, with
+/// the share that engaged it. The report lags the frame it was measured in by a frame or two (it is
+/// read when its copy has landed), and a pair read while its copy is in flight can name another
+/// frame's share: this is a log, it decides nothing.
+fn note_fallback(s: &Settings) {
+    static SEEN: AtomicU32 = AtomicU32::new(0);
+    static ENGAGED: AtomicBool = AtomicBool::new(false);
+    let Some(r) = readback() else { return };
+    // (the sequence is written after the copy it follows: a different one is a copy that landed)
+    let seq = unsafe { (r.cpu as *const u32).read_volatile() };
+    if seq == 0 || seq <= SEEN.load(Ordering::Relaxed) {
+        return;
+    }
+    SEEN.store(seq, Ordering::Relaxed);
+    // (4 bytes of sequence, then `SKY_AT` and `DEAD_AT`: the lit part's level and share, then the
+    // share the estimate reads nothing in)
+    let slot = unsafe { ((r.cpu + 4) as *const [f32; 8]).read_volatile() };
+    let dead = slot[4];
+    let engaged = dead > s.fallback || slot[3] < 1.0 - s.fallback;
+    let was = ENGAGED.swap(engaged, Ordering::Relaxed);
+    if engaged && !was {
+        let (what, switch, frame) = (Patch::Ambient.what(), Patch::Ambient.switch(), super::present::counters().0);
+        crate::xlog_info!(
+            "D3D12.X: title patch {what} ({switch}=0 turns it off) falls back at frame {frame}: the estimate reads nothing in {:.1}% of its cells and the title's own light is zero over {:.1}% of the picture (XCL_GTA6_AMBIENT_FALLBACK={}), so the estimate is the level of the light its lit part sends out, {:.3} {:.3} {:.3}, at the share of it the stand-in adds",
+            dead * 100.0,
+            (1.0 - slot[3]) * 100.0,
+            s.fallback,
+            slot[0],
+            slot[1],
+            slot[2]
+        );
+    }
 }
 
 /// A dispatch of the title's pipeline `title_pso` was recorded on `list` just now: when the pipeline has
@@ -993,6 +1127,12 @@ pub(super) unsafe fn after_dispatch(list: *mut c_void, title_pso: usize) {
         Set::Estimate(level) => (level, 0.0),
         Set::Constant(level) => (0.0, level),
     };
+    // (the fallback is the resolve chain's: that is where the title's own light is read, and its
+    // report is what the log copies out)
+    let report = role == Role::Resolve && constant == 0.0 && s.fallback > 0.0;
+    if report {
+        note_fallback(s);
+    }
     // (the flat light reads neither the cells nor the points, so nothing is kept for it, and the
     // air's bound is a multiple of the estimate)
     if (role != Role::Resolve && constant > 0.0) || (role == Role::Air && s.air == 0.0) {
@@ -1028,7 +1168,7 @@ pub(super) unsafe fn after_dispatch(list: *mut c_void, title_pso: usize) {
     };
     let Some(p) = passes() else { return };
     let words = constants(level, constant, s, size);
-    if !record(list, p, &words, image_at, depth_at, &schedule(role, constant > 0.0, size, slices)) {
+    if !record(list, p, &words, image_at, depth_at, &schedule(role, constant > 0.0, size, slices), report) {
         return refused(role, "the list or the passes' objects are gone".into());
     }
     match role {
@@ -1147,6 +1287,10 @@ mod tests {
         assert_eq!(parse_share("-1", 0.5), 0.5);
         assert_eq!(parse_share("nan", 0.5), 0.5);
         assert_eq!(parse_share(" 0.04 ", 0.0), 0.04);
+        // the fallback waits for more than half of the picture unless its switch names a share
+        assert_eq!(parse_share("", FALLBACK), 0.5);
+        assert_eq!(parse_share("0.9", FALLBACK), 0.9);
+        assert_eq!(parse_share("0", FALLBACK), 0.0, "0 is today's behaviour");
     }
 
     #[test]
@@ -1330,9 +1474,19 @@ mod tests {
         assert_eq!(schedule(Role::Resolve, false, [1281, 721], 1)[3], (RAISE, [161, 91, 1]));
         assert_eq!(schedule(Role::Resolve, true, [1280, 720], 1), [(RAISE, [160, 90, 1])]);
         assert_eq!(schedule(Role::Air, false, [160, 90], 65), [(CLEAR_AIR, [20, 12, 33])]);
-        assert_eq!((CELL_BYTES, POINT_BYTES), ((2 * 2304 + 2) * 16, 160 * 90 * 48));
+        assert_eq!((CELL_BYTES, POINT_BYTES), ((2 * 2304 + 4) * 16, 160 * 90 * 48));
+        assert_eq!(SKY_BYTES, (2 * 2304 + 2) * 16, "the fallback's own slots, after the title's own light");
         assert!(SOURCE.contains("#define OWN_AT (2 * CELLS + 1)
 "), "the title's own light sits after the cells' places");
+        assert!(SOURCE.contains("#define SKY_AT (2 * CELLS + 2)
+"), "the lit part's level and share sit after it");
+        assert!(SOURCE.contains("#define DEAD_AT (2 * CELLS + 3)
+"), "the share the estimate reads nothing in sits after those");
+        // the fallback takes the picture's own level only above the share it waits for, and only
+        // while it is asked for
+        assert!(SOURCE.contains("if (fallback > 0.0 && (cells[DEAD_AT].x > fallback || cells[SKY_AT].w < 1.0 - fallback))"), "the fallback waits for either share that reads nothing");
+        assert!(SOURCE.contains("lit += (l > 0.0) ? 1u : 0u;"), "the share that is lit is counted, not the share that is dark");
+        assert!(SOURCE.contains("dead += (dot(c, LUMA) > 0.0) ? 0u : 1u;"), "and the cells the estimate reads nothing in");
         assert_eq!(PARTS[KEEP], "KEEP");
         assert_eq!(PARTS[MEAN], "MEAN");
         assert_eq!(PARTS[PLACE], "PLACE");
@@ -1340,9 +1494,9 @@ mod tests {
         assert_eq!(PARTS[RAISE], "RAISE");
         assert_eq!(PARTS[CLEAR_AIR], "AIR");
         assert_eq!(PARTS[OWN], "OWN");
-        let s = Settings { light: Set::Estimate(0.8), air: 1.5, shade: [1.0, 0.6], cap: 4.0, lowest: 0.5, fall: 0.04, bound: 1.0 };
+        let s = Settings { light: Set::Estimate(0.8), air: 1.5, shade: [1.0, 0.6], cap: 4.0, lowest: 0.5, fall: 0.04, bound: 1.0, fallback: 0.5 };
         let words = constants(0.8, 0.0, &s, [1280, 720]);
-        assert_eq!(words, [0.8f32.to_bits(), 0, 1.0f32.to_bits(), 0.6f32.to_bits(), 0.1f32.to_bits(), 0.45f32.to_bits(), 1280, 720, 0.04f32.to_bits(), 4.0f32.to_bits(), 1.5f32.to_bits(), 0.5f32.to_bits(), 0.04f32.to_bits(), 1.0f32.to_bits(), 0, 0]);
+        assert_eq!(words, [0.8f32.to_bits(), 0, 1.0f32.to_bits(), 0.6f32.to_bits(), 0.1f32.to_bits(), 0.45f32.to_bits(), 1280, 720, 0.04f32.to_bits(), 4.0f32.to_bits(), 1.5f32.to_bits(), 0.5f32.to_bits(), 0.04f32.to_bits(), 1.0f32.to_bits(), 0.5f32.to_bits(), 0]);
         // the sizes the programs are written for are the ones the buffers and the groups are
         for (name, value) in [("CX", CELLS[0]), ("CY", CELLS[1]), ("PX", POINTS[0]), ("PY", POINTS[1])] {
             assert!(SOURCE.contains(&format!("#define {name} {value}\n")), "{name}");

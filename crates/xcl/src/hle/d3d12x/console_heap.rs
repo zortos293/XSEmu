@@ -970,22 +970,14 @@ pub fn register(obj: usize, n: u32, pc_cpu: u64, pc_gpu: u64, inc: u32, sampler:
     // avoid touching unused pages with `write_bytes` (which would mark them dirty for write-watch).
     let (p, memory) = if let Some(p) = unsafe { title_memory(u, bytes as usize) } {
         (p as *mut u8, Memory::Title)
-    } else if let Some(addr) = u.is_sparse_window(0).then(|| unsafe { super::sparse::alloc_in(0, bytes as usize, 256) }).flatten() {
-        (addr.0 as *mut u8, Memory::Sparse)
+    } else if u.is_sparse_window(0) {
+        let Some((addr, _)) = (unsafe { super::sparse::alloc_in(0, bytes as usize, 256) }) else {
+            return false;
+        };
+        (addr as *mut u8, Memory::Sparse)
     } else {
-        // Window 0 only: a descriptor table reaches its slots through a 32-bit console address, and
-        // translation resolves that in window 0. A heap anywhere else would be one the title cannot
-        // name, so a machine without window-0 storage has no console heap (and says so below).
         let Some(p) = u.alloc_in(0, bytes as usize, 256) else { return false };
         unsafe { std::ptr::write_bytes(p, 0, bytes as usize) };
-        if u.is_sparse_window(0) {
-            // The adapter could not make the 4 GiB sparse windows (a software adapter cannot), so the
-            // heap lives in the committed window: a descriptor table still reaches its slots.
-            static SAID: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-            if !SAID.swap(true, std::sync::atomic::Ordering::Relaxed) {
-                crate::xlog_warn!("console descriptor heaps: the sparse VRAM windows are not open, so heaps are kept in the committed window (descriptor tables still work, the 32-bit slot aliasing does not)");
-            }
-        }
         (p, Memory::Uma)
     };
     {
@@ -1246,11 +1238,12 @@ impl ViewOwners {
 static RES: Mutex<Option<ViewOwners>> = Mutex::new(None);
 
 /// What each view slot names is kept (`note_resource`): for the traces and markers, for the
-/// FSR4 stand-in, which tells its input and outputs by it (`bind::compute_images`), and for the
+/// FSR4 stand-in, which tells its input and outputs by it (`bind::compute_images`), for the
 /// stand-in for the indirect light (`title_gta6_ambient`), which checks the resources behind the
-/// views it writes through before it records anything.
+/// views it writes through before it records anything, and for the depth-UAV shadows, whose
+/// use-based sync resolves the tables a draw or dispatch names (`depth_uav::sync_owners`).
 fn owners_kept() -> bool {
-    super::present::trace_frame() || super::markers::enabled() || super::present::writer_trace_configured() || super::fsr4_standin::wants_views() || super::title_gta6_ambient::wanted()
+    super::present::trace_frame() || super::markers::enabled() || super::present::writer_trace_configured() || super::fsr4_standin::wants_views() || super::title_gta6_ambient::wanted() || super::depth_uav::sync_owners()
 }
 
 /// The unordered-access view of each slot is kept (`note_native_uav`): for the native-view
@@ -1262,7 +1255,11 @@ pub(super) fn native_uavs_kept() -> bool {
 
 /// The view in slot `s` names `res` (0: none).
 pub fn note_resource(s: &Slot, res: usize) {
-    if s.sampler || !owners_kept() {
+    if s.sampler {
+        return;
+    }
+    super::depth_uav::probe_slot(s.at, res);
+    if !owners_kept() {
         return;
     }
     RES.lock().unwrap().get_or_insert_with(Default::default).note(s, res);
@@ -1593,9 +1590,6 @@ mod tests {
         if let Err(e) = crate::gpu::recomp::dxc::location().and_then(|_| real::init()) {
             println!("SKIPPED texture3d_uav_companion_reads_written_mip: {e}");
             return;
-        }
-        if let Some(why) = sparse_windows_missing() {
-            return crate::gpu::recomp::runner::skip_test(&why);
         }
         unsafe {
             let raw = real::device_raw();
@@ -2008,21 +2002,8 @@ mod tests {
         }
     }
 
-    /// The 4 GiB sparse VRAM windows (a software adapter such as the CI runner's WARP cannot reserve
-    /// them). Tests that prove what only they do skip with this reason; XCL_REQUIRE_GPU=window makes
-    /// the skip a failure.
-    fn sparse_windows_missing() -> Option<String> {
-        if crate::hle::d3d12x::sparse::windows_ready() {
-            return None;
-        }
-        Some("no 4 GiB sparse memory window: this adapter cannot reserve one".to_string())
-    }
-
     #[test]
     fn slots_copy_and_release() {
-        if let Some(why) = sparse_windows_missing() {
-            return crate::gpu::recomp::runner::skip_test(&why);
-        }
         let Some(u) = crate::gpu::uma::get() else { return };
         let rel = |p: u64| (p as usize - u.base()) as u32;
         // views: 4 slots over a PC heap at 0x1000 (increment 32, GPU 0x5000); samplers: 2 at 0x9000
@@ -2069,9 +2050,6 @@ mod tests {
         use windows::Win32::Graphics::Dxgi::*;
         if crate::gpu::uma::get().is_none() {
             return;
-        }
-        if let Some(why) = sparse_windows_missing() {
-            return crate::gpu::recomp::runner::skip_test(&why);
         }
         let dev = unsafe {
             let mut dev: Option<ID3D12Device> = None;

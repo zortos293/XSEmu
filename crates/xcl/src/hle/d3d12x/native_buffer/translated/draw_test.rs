@@ -5,7 +5,7 @@ use crate::hle::d3d12x::page_mappings::queue;
 use crate::hle::d3d12x::{console_heap, physical_directory, real};
 use std::sync::Arc;
 use windows::core::Interface;
-use windows::Win32::Graphics::Direct3D::D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
+use windows::Win32::Graphics::Direct3D::{D3D_FEATURE_LEVEL_11_0, D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST};
 use windows::Win32::Graphics::Dxgi::Common::*;
 
 const SHADER: &str = r#"
@@ -41,11 +41,13 @@ unsafe fn buffer(dev: &ID3D12Device, ty: D3D12_HEAP_TYPE, flags: D3D12_RESOURCE_
 #[test]
 fn translated_draw_rows_take_gathered_guest_records_and_bound_their_draws() {
     unsafe {
-        let _serial = crate::hle::d3d12x::physical_directory::test_serial();
-        let Some(dev) = crate::hle::d3d12x::real::test_device() else {
+        let mut dev = None;
+        if D3D12CreateDevice(None, D3D_FEATURE_LEVEL_11_0, &mut dev).is_err() {
             crate::gpu::recomp::runner::skip_test("no GPU");
             return;
-        };
+        }
+        let dev: ID3D12Device = dev.unwrap();
+        let _uma = real::open_uma_for_test(&dev);
         assert!(!real::uma_window_vas().is_empty(), "unified memory must be open on the device");
         assert!(physical_directory::init(&dev));
         let q: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC { Type: D3D12_COMMAND_LIST_TYPE_DIRECT, ..Default::default() }).unwrap();

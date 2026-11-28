@@ -189,6 +189,8 @@ impl PhysicalPageRef {
 #[derive(Clone, Debug)]
 pub(crate) enum QueuePageSource {
     Physical(PhysicalPageRef),
+    // GuestRange base and len are not read yet; kept for the next fix.
+    #[allow(dead_code)]
     GuestRange { base: usize, len: usize },
     Hole,
 }
@@ -198,6 +200,8 @@ pub(crate) fn snapshot_queue_sources(slots: &[usize]) -> Result<Vec<QueuePageSou
     slots.iter().map(|&at| g.queue_source(at)).collect()
 }
 
+// The GDK physical ABI scaffolding has no caller yet; kept for the next fix.
+#[allow(dead_code)]
 pub(crate) fn snapshot_default_gpu_sources(slots: &[usize]) -> Result<Vec<Option<QueuePageSource>>, &'static str> {
     let g = PHYS.lock().unwrap();
     slots.iter().map(|&at| g.cpu_reservation(at).filter(|r| r.class.default_gpu).map(|_| g.queue_source(at)).transpose()).collect()
@@ -247,6 +251,8 @@ impl Phys {
     }
 }
 
+// The GDK physical ABI scaffolding has no caller yet; kept for the next fix.
+#[allow(dead_code)]
 pub(crate) fn cpu_reservation_at(at: usize) -> Option<CpuReservation> {
     PHYS.lock().unwrap().cpu_reservation(at)
 }
@@ -302,6 +308,8 @@ pub(crate) fn physical_import_probe_views() -> Option<(PhysicalSectionView, Phys
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum VirtualGrain {
     K64,
+    // The GDK physical ABI scaffolding has no caller yet; kept for the next fix.
+    #[allow(dead_code)]
     M2,
 }
 
@@ -328,11 +336,15 @@ pub(crate) struct GdkPhysicalAbi {
 
 static SECTION_BACKEND: OnceLock<GdkPhysicalAbi> = OnceLock::new();
 
+// The GDK physical ABI scaffolding has no caller yet; kept for the next fix.
+#[allow(dead_code)]
 pub(crate) fn install_section_backend(abi: GdkPhysicalAbi) -> Result<(), GdkPhysicalAbi> {
     SECTION_BACKEND.set(abi)
 }
 
 #[derive(Clone, Copy, Debug)]
+// Fields of the GDK CPU reservation; not read yet, kept for the next fix.
+#[allow(dead_code)]
 pub(crate) struct CpuReservation {
     pub(crate) id: usize,
     pub(crate) requested: usize,
@@ -393,6 +405,8 @@ enum Slot {
     Private,
 }
 
+// Raw GDK64 reservations are not observed yet; kept for the next fix.
+#[allow(dead_code)]
 struct Reservation {
     cpu: Option<CpuReservation>,
     raw_gdk64: Option<RawGdk64>,
@@ -401,6 +415,8 @@ struct Reservation {
 }
 
 #[derive(Clone, Copy, Debug)]
+// Fields of the raw GDK64 reservation; not read yet, kept for the next fix.
+#[allow(dead_code)]
 pub(crate) struct RawGdk64 {
     pub(crate) requested: usize,
     pub(crate) requested_size: usize,
@@ -409,6 +425,8 @@ pub(crate) struct RawGdk64 {
     pub(crate) protection: u32,
 }
 
+// The GDK physical ABI scaffolding has no caller yet; kept for the next fix.
+#[allow(dead_code)]
 pub(crate) fn compat_gdk64_reservation_at(at: usize) -> Option<(usize, usize, RawGdk64)> {
     let g = PHYS.lock().unwrap();
     let (&base, r) = g.reservations.range(..=at).next_back()?;
@@ -1277,6 +1295,8 @@ pub unsafe extern "system" fn XMemFreePhysicalPages(n: usize, arr: *mut u64) -> 
 
 /// A reservation of 64 KiB pages for the title (MEM_RESERVE | MEM_64K_PAGES, no address chosen)
 /// as a placeholder, so the pages it maps there are views (None: Windows refused).
+// The GDK physical ABI scaffolding has no caller yet; kept for the next fix.
+#[allow(dead_code)]
 pub(crate) unsafe fn reserve(size: usize) -> Option<usize> {
     reserve_compat(size, None)
 }
@@ -1607,6 +1627,23 @@ impl Held<'_> {
         if u.is_sparse(at) {
             crate::hle::d3d12x::sparse::committed(at, PHYS_PAGE);
         }
+        true
+    }
+
+    /// The 64 KiB at `at` that `claim` committed given back: decommitted, its slot a placeholder
+    /// again (`claim`'s inverse; false: it is not such a page any more).
+    pub(crate) unsafe fn release(&mut self, at: usize) -> bool {
+        if let Some(r) = self.0.reservation(at) {
+            return r.slots.get(&at) == Some(&Slot::Private) && r.placeholder(at);
+        }
+        let uma = crate::gpu::uma::get();
+        if uma.is_some_and(|u| u.is_committed(at)) {
+            return false;
+        }
+        if uma.is_some_and(|u| u.is_sparse(at)) {
+            crate::hle::d3d12x::sparse::decommitted(at, PHYS_PAGE);
+        }
+        decommit(at, PHYS_PAGE);
         true
     }
 

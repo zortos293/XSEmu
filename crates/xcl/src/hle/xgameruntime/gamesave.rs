@@ -9,8 +9,9 @@ use std::ffi::{c_void, CString, OsStr};
 use std::fs;
 use std::io::{self, ErrorKind};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::RwLock;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::{RwLock, RwLockWriteGuard, TryLockError};
+use std::time::{Duration, Instant};
 
 use super::xasync::*;
 use crate::util::{from_cstr_ptr, E_FAIL, E_INVALIDARG, HRESULT, S_OK};
@@ -22,6 +23,77 @@ static NEXT_TMP: AtomicU64 = AtomicU64::new(0);
 const CURRENT: &str = "~xclsave.current";
 const SNAPSHOTS: [&str; 2] = ["~xclsave.0", "~xclsave.1"];
 static SAVE_FILES: RwLock<()> = RwLock::new(());
+/// Async commits and deletes submitted and not yet done (`settle_for_exit`); a sync one holds
+/// `SAVE_FILES` for writing while it runs.
+static QUEUED: AtomicUsize = AtomicUsize::new(0);
+
+/// One async commit or delete in `QUEUED`, from its submit until its job has run or is dropped.
+struct Queued;
+
+impl Queued {
+    fn new() -> Self {
+        QUEUED.fetch_add(1, Ordering::AcqRel);
+        Queued
+    }
+}
+
+impl Drop for Queued {
+    fn drop(&mut self) {
+        QUEUED.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+/// `XCL_EXIT_SAVE_WAIT_MS` (default 5000, 0: off): how long XCL's own end of the process (its
+/// window closed, the launcher's stop) waits for the title's save commits and deletes.
+fn exit_wait() -> Duration {
+    let ms = std::env::var("XCL_EXIT_SAVE_WAIT_MS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(5000u64);
+    Duration::from_millis(ms)
+}
+
+/// Before XCL ends the process on purpose: the save commits and deletes under way or queued
+/// finish (up to `XCL_EXIT_SAVE_WAIT_MS`), then the save files stay locked so that none starts
+/// while the process ends – a title thread that tries waits there until it is ended. A commit
+/// cut short leaves the last committed snapshot in place, so what this keeps is the save the
+/// title asked for last. Never blocks past the wait: the lock is only tried.
+pub fn settle_for_exit() {
+    let wait = exit_wait();
+    if wait.is_zero() {
+        return;
+    }
+    let start = Instant::now();
+    let held = settle(&SAVE_FILES, &QUEUED, wait);
+    let queued = QUEUED.load(Ordering::Acquire);
+    if held.is_none() || queued > 0 {
+        crate::xlog_warn!(
+            "XGameSave: the process ends with a save {} after {} ms ({queued} async commits or deletes not run)",
+            if held.is_some() { "queued" } else { "commit or delete under way" },
+            start.elapsed().as_millis()
+        );
+    } else if start.elapsed() >= Duration::from_millis(5) {
+        crate::xlog_info!("XGameSave: the process ends after the title's saves finished ({} ms)", start.elapsed().as_millis());
+    }
+    std::mem::forget(held);
+}
+
+/// `files` locked for writing once `queued` is 0 and no writer holds it, or at `wait` if
+/// it is free then (None: a writer still held it).
+fn settle<'a>(files: &'a RwLock<()>, queued: &AtomicUsize, wait: Duration) -> Option<RwLockWriteGuard<'a, ()>> {
+    let start = Instant::now();
+    loop {
+        let timed_out = start.elapsed() >= wait;
+        if queued.load(Ordering::Acquire) == 0 || timed_out {
+            match files.try_write() {
+                Ok(g) => return Some(g),
+                Err(TryLockError::Poisoned(e)) => return Some(e.into_inner()),
+                Err(TryLockError::WouldBlock) => {}
+            }
+        }
+        if timed_out {
+            return None;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
 
 pub const E_GS_INVALID_CONTAINER_NAME: HRESULT = 0x8083_0001u32 as i32;
 pub const E_GS_OUT_OF_LOCAL_STORAGE: HRESULT = 0x8083_0003u32 as i32;
@@ -337,7 +409,9 @@ pub unsafe extern "system" fn XGameSaveDeleteContainerAsync(p: *mut Provider, na
         return E_INVALIDARG;
     }
     let dir = delete_path(p, name);
+    let queued = Queued::new();
     begin_with(b, &DELETE_ID as *const u8 as usize, move || {
+        let _queued = queued;
         delete_container(&dir?);
         Ok(Vec::new())
     })
@@ -725,9 +799,13 @@ static SUBMIT_ID: u8 = 0;
 pub unsafe extern "system" fn XGameSaveSubmitUpdateAsync(u: *mut Update, b: *mut XAsyncBlock) -> HRESULT {
     let Some(u) = update(u) else { return E_INVALIDARG };
     let (dir, display, ops) = (u.dir.clone(), u.display.clone(), u.ops.clone());
-    begin_with(b, &SUBMIT_ID as *const u8 as usize, move || match apply(&dir, display.as_deref(), &ops) {
-        S_OK => Ok(Vec::new()),
-        e => Err(e),
+    let queued = Queued::new();
+    begin_with(b, &SUBMIT_ID as *const u8 as usize, move || {
+        let _queued = queued;
+        match apply(&dir, display.as_deref(), &ops) {
+            S_OK => Ok(Vec::new()),
+            e => Err(e),
+        }
     })
 }
 
@@ -806,6 +884,89 @@ mod tests {
             }
             let _ = std::fs::remove_dir_all(&self.root);
         }
+    }
+
+    #[test]
+    fn exit_waits_for_a_commit_under_way_then_holds_the_save_files() {
+        let files = std::sync::Arc::new(RwLock::new(()));
+        let (queued, (tx, rx)) = (AtomicUsize::new(0), std::sync::mpsc::channel());
+        let writer = {
+            let files = files.clone();
+            std::thread::spawn(move || {
+                let _commit = files.write().unwrap();
+                tx.send(()).unwrap();
+                std::thread::sleep(Duration::from_millis(200));
+            })
+        };
+        rx.recv().unwrap();
+        let start = Instant::now();
+        let held = settle(&files, &queued, Duration::from_secs(5));
+        assert!(held.is_some());
+        assert!(start.elapsed() >= Duration::from_millis(150), "{:?}", start.elapsed());
+        assert!(matches!(files.try_read(), Err(TryLockError::WouldBlock)), "no new commit or read starts");
+        drop(held);
+        writer.join().unwrap();
+    }
+
+    #[test]
+    fn exit_waits_for_queued_async_saves() {
+        let (files, queued) = (std::sync::Arc::new(RwLock::new(())), std::sync::Arc::new(AtomicUsize::new(1)));
+        let job = {
+            let queued = queued.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(200));
+                queued.store(0, Ordering::Release);
+            })
+        };
+        let start = Instant::now();
+        assert!(settle(&files, &queued, Duration::from_secs(5)).is_some());
+        assert!(start.elapsed() >= Duration::from_millis(150), "{:?}", start.elapsed());
+        job.join().unwrap();
+    }
+
+    #[test]
+    fn exit_wait_is_bounded() {
+        let files = std::sync::Arc::new(RwLock::new(()));
+        let start = Instant::now();
+        assert!(settle(&files, &AtomicUsize::new(1), Duration::from_millis(100)).is_some(), "a job never dispatched: the files are still fenced");
+        assert!(start.elapsed() < Duration::from_secs(2));
+        let (tx, rx) = std::sync::mpsc::channel::<()>();
+        let (held_tx, held_rx) = std::sync::mpsc::channel();
+        let writer = {
+            let files = files.clone();
+            std::thread::spawn(move || {
+                let _stuck = files.write().unwrap();
+                held_tx.send(()).unwrap();
+                let _ = rx.recv();
+            })
+        };
+        held_rx.recv().unwrap();
+        let start = Instant::now();
+        assert!(settle(&files, &AtomicUsize::new(0), Duration::from_millis(100)).is_none());
+        assert!(start.elapsed() < Duration::from_secs(2));
+        drop(tx);
+        writer.join().unwrap();
+    }
+
+    #[test]
+    fn async_saves_count_as_queued_until_run_or_dropped() {
+        let _g = ASYNC_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let before = QUEUED.load(Ordering::Acquire);
+        let mut fixture = DeleteFixture::new();
+        unsafe {
+            let name = CString::new(DELETE_TEST_NAME).unwrap();
+            assert_eq!(XGameSaveDeleteContainerAsync(fixture.provider, name.as_ptr().cast(), &mut *fixture.block), S_OK);
+            assert_eq!(QUEUED.load(Ordering::Acquire), before + 1);
+            assert!(XTaskQueueDispatch(fixture.block.queue, PORT_WORK, 0));
+            assert_eq!(XGameSaveDeleteContainerResult(&mut *fixture.block), S_OK);
+            assert_eq!(QUEUED.load(Ordering::Acquire), before);
+            std::fs::create_dir_all(fixture.container_dir().join("b")).unwrap();
+            assert_eq!(XGameSaveDeleteContainerAsync(fixture.provider, name.as_ptr().cast(), &mut *fixture.block), S_OK);
+            assert_eq!(QUEUED.load(Ordering::Acquire), before + 1);
+            assert_eq!(XTaskQueueTerminate(fixture.block.queue, true, std::ptr::null_mut(), 0), S_OK);
+            assert_eq!(XGameSaveDeleteContainerResult(&mut *fixture.block), E_ABORT);
+        }
+        assert_eq!(QUEUED.load(Ordering::Acquire), before, "a job its queue dropped no longer counts");
     }
 
     #[test]

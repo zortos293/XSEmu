@@ -4,9 +4,10 @@
 //! (Behaviour after VIctory/CGBJ `translate --cache --pipelines` and its pipeline library: a
 //! library made over a read-only mapping of its file, the file held while the library lives.)
 //!
-//! Files, "shards": `library-<writer>.<generation>.bin` in
-//! `<driver cache>\library\<translation era>\`, so another driver, adapter or translation uses
-//! another folder. A warm-up child's writer is its warm-up peer slot (`w00` …), the game's
+//! Files, "shards": `library-<writer>.<generation>.bin` in `<driver cache>\library\`. The folder
+//! belongs to the driver (`driver_cache::dir`, which carries the adapter and the driver version),
+//! never to a translation: a build that emits the same DXIL asks for the same entry and hits.
+//! A warm-up child's writer is its warm-up peer slot (`w00` …), the game's
 //! `game`: no two live processes write one writer's files. A writer's newest shard holds
 //! everything it stored: a process makes its writer's library over the writer's newest shard,
 //! mapped read-only, adds its new pipelines to it, and reads every other shard of the folder
@@ -24,13 +25,14 @@
 //! (`.invalid`); one that cannot be read now is left as it is; neither, nor any other writer's
 //! shard, is ever removed.
 //!
-//! Only the game keeps a library (a warm-up process makes none), and only with
-//! `XCL_PSO_LIBRARY=1`: it is off by default. Each entry is named by this build's fingerprint
-//! (the translation era) and its key, a hash of the exact description it was built from (every
-//! shader's bytes, the root signature's static samplers and all state, `real::library_key`). A
-//! shard is read only with its key list (`library-<writer>.<generation>.keys`), written by the
-//! same fingerprint; a load asks the driver only for a key a shard lists, so a pipeline is never
-//! taken from a shard of another build or under another description.
+//! Only the game keeps a library (a warm-up process makes none). It is on by default;
+//! `XCL_PSO_LIBRARY=0` turns it off. Each entry is named by its key, a hash of the DXIL and the
+//! exact description it was built from (every shader's bytes, the root signature's static
+//! samplers and all state, `real::library_key`), and of nothing of the build that made it. A
+//! shard is read only with its key list (`library-<writer>.<generation>.keys`), written in the
+//! same format; a load asks the driver only for a key a shard lists. The driver then compares the
+//! description and refuses an entry of another one, and it refuses a library of another driver or
+//! adapter, so a pipeline is never taken under a description it was not built from.
 
 use std::ffi::c_void;
 use std::path::{Path, PathBuf};
@@ -68,7 +70,7 @@ static WAIT_US_MAX: AtomicU64 = AtomicU64::new(0);
 pub(super) fn summary() -> String {
     let n = |c: &AtomicU64| c.load(Ordering::Relaxed);
     format!(
-        "pipeline library {} hits, {} misses, {} stored, {} shards refused, {} shards of another build or without keys skipped, {} loads refused, {} saves ({} MB, longest {} ms), longest wait {:.1} ms",
+        "pipeline library {} hits, {} misses, {} stored, {} shards refused, {} shards skipped without a key list this build reads, {} loads refused, {} saves ({} MB, longest {} ms), longest wait {:.1} ms",
         n(&HITS), n(&MISSES), n(&STORED), n(&REFUSED), n(&STALE), n(&LOAD_REFUSED), n(&SAVES), n(&SAVED_BYTES) >> 20, n(&SAVE_MS_MAX), n(&WAIT_US_MAX) as f64 / 1000.0
     )
 }
@@ -89,19 +91,28 @@ pub(super) fn grows(len: usize) -> bool {
     len < SEGMENT
 }
 
+/// Whether this process keeps a pipeline library: on unless `XCL_PSO_LIBRARY=0`.
 pub(super) fn on() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var("XCL_PSO_LIBRARY").is_ok_and(|v| v.trim() == "1"))
+    *ON.get_or_init(|| std::env::var("XCL_PSO_LIBRARY").map_or(true, |v| v.trim() != "0"))
 }
 
-/// This build's fingerprint, in every entry's name and every key list: the translation era.
-pub(super) fn fingerprint() -> u64 {
-    crate::gpu::recomp::pso::translation_era()
+/// The key of a pipeline: a hash of the driver blob's name and of the description the pipeline is
+/// built from, and of nothing of the build or the translation that made it. `tag` says which kind
+/// of description `description` is; the blob's name carries the DXIL, its flags, and the root
+/// signature's static samplers and node mask when they are not empty (`driver_cache`).
+pub(super) fn key(blob_name: &str, description: &[u8], tag: u8) -> u64 {
+    let mut bytes = Vec::with_capacity(1 + blob_name.len() + description.len());
+    bytes.push(tag);
+    bytes.extend_from_slice(blob_name.as_bytes());
+    bytes.extend_from_slice(description);
+    crate::gpu::shader::fnv64(&bytes)
 }
 
-/// The name of the entry of key `key` under fingerprint `fingerprint`.
-pub(super) fn entry_name(fingerprint: u64, key: u64) -> Vec<u16> {
-    format!("{fingerprint:016x}-{key:016x}").encode_utf16().chain(Some(0)).collect()
+/// The name of the entry of `key`: the key alone, so a build that emits the same DXIL under the
+/// same description asks the driver for the same entry.
+pub(super) fn entry_name(key: u64) -> Vec<u16> {
+    format!("{key:016x}").encode_utf16().chain(Some(0)).collect()
 }
 
 /// The key list of shard `shard` (`library-<writer>.<generation>.keys`).
@@ -109,17 +120,19 @@ pub(super) fn keys_path(shard: &Path) -> PathBuf {
     shard.with_extension("keys")
 }
 
-const KEYS_MAGIC: &[u8; 8] = b"XCLKEYS1";
+const KEYS_MAGIC: &[u8; 8] = b"XCLKEYS2";
+/// the key list's format, in every list; a list of another format is not read
+const KEYS_FORMAT: u64 = 2;
 
-/// Writes the key list of a shard at `path` (a new file, never over one): the fingerprint and
-/// the keys, sorted.
-pub(super) fn write_keys(path: &Path, fingerprint: u64, keys: &[u64]) -> std::io::Result<()> {
+/// Writes the key list of a shard at `path` (a new file, never over one): the format and the
+/// keys, sorted.
+pub(super) fn write_keys(path: &Path, keys: &[u64]) -> std::io::Result<()> {
     let mut sorted = keys.to_vec();
     sorted.sort_unstable();
     sorted.dedup();
     let mut bytes = Vec::with_capacity(24 + sorted.len() * 8);
     bytes.extend_from_slice(KEYS_MAGIC);
-    bytes.extend_from_slice(&fingerprint.to_le_bytes());
+    bytes.extend_from_slice(&KEYS_FORMAT.to_le_bytes());
     bytes.extend_from_slice(&(sorted.len() as u64).to_le_bytes());
     for k in sorted {
         bytes.extend_from_slice(&k.to_le_bytes());
@@ -138,17 +151,17 @@ pub(super) fn write_keys(path: &Path, fingerprint: u64, keys: &[u64]) -> std::io
     result
 }
 
-/// The sorted keys of the key list at `path` written under `fingerprint`; an error for a missing or
-/// damaged list or one of another fingerprint.
-pub(super) fn read_keys(path: &Path, fingerprint: u64) -> Result<Vec<u64>, String> {
+/// The sorted keys of the key list at `path`; an error for a missing or damaged list or one of
+/// another format.
+pub(super) fn read_keys(path: &Path) -> Result<Vec<u64>, String> {
     let bytes = std::fs::read(path).map_err(|e| format!("no key list ({e})"))?;
     let word = |at: usize| bytes.get(at..at + 8).map(|b| u64::from_le_bytes(b.try_into().unwrap()));
     if bytes.get(..8) != Some(&KEYS_MAGIC[..]) {
         return Err("a damaged key list".into());
     }
-    let (Some(of), Some(n)) = (word(8), word(16)) else { return Err("a damaged key list".into()) };
-    if of != fingerprint {
-        return Err(format!("written by another build ({of:016x}, this one {fingerprint:016x})"));
+    let (Some(format), Some(n)) = (word(8), word(16)) else { return Err("a damaged key list".into()) };
+    if format != KEYS_FORMAT {
+        return Err(format!("a key list of format {format}, this build reads {KEYS_FORMAT}"));
     }
     if bytes.len() as u64 != 24 + n.saturating_mul(8) {
         return Err("a damaged key list".into());
@@ -214,7 +227,7 @@ pub(super) enum Refusal {
     Invalid(String),
     /// it cannot be read now (the file busy, no memory): left as it is
     Unreadable(String),
-    /// no key list of this build's fingerprint: never read by this build, left as it is
+    /// no key list of the format this build reads: never read by this build, left as it is
     Unkeyed(String),
 }
 
@@ -485,9 +498,9 @@ impl Shard {
     }
 
     /// The shard of the file at `path`, its library made over the mapped file, when its key list
-    /// was written under `fingerprint`.
-    fn open(path: &Path, create: &Create, fingerprint: u64) -> Result<Shard, Refusal> {
-        let keys = read_keys(&keys_path(path), fingerprint).map_err(Refusal::Unkeyed)?;
+    /// is one this build reads.
+    fn open(path: &Path, create: &Create) -> Result<Shard, Refusal> {
+        let keys = read_keys(&keys_path(path)).map_err(Refusal::Unkeyed)?;
         let file = Mapped::open(path).map_err(|e| Refusal::Unreadable(e.to_string()))?;
         match create(file.bytes()) {
             Ok(library) => Ok(Shard { keys, ..Shard::new(library, Some(file)) }),
@@ -535,8 +548,8 @@ impl Own {
     }
 
     /// Stores `pso` under key `key` and lists the key (false: one of that key is there).
-    unsafe fn add(&self, fingerprint: u64, key: u64, pso: *mut c_void) -> bool {
-        let added = self.shard.store(&entry_name(fingerprint, key), pso);
+    unsafe fn add(&self, key: u64, pso: *mut c_void) -> bool {
+        let added = self.shard.store(&entry_name(key), pso);
         if added {
             lock(&self.keys).push(key);
         }
@@ -554,8 +567,6 @@ pub(super) struct Libraries {
     /// during a save (Some), the pipelines stored meanwhile, stored in its successor after it
     pending: Mutex<Option<Vec<(u64, ID3D12PipelineState)>>>,
     dir: PathBuf,
-    /// this build's (`fingerprint`): in every entry's name and key list
-    fingerprint: u64,
     create: Create,
     /// the generation the next save writes; held through a save
     next: Mutex<u32>,
@@ -588,7 +599,7 @@ impl Libraries {
     /// from a shard on disk at the start whose key list names it; None (counted a miss) when none
     /// does, or the driver refuses it there.
     pub(super) unsafe fn load(&self, key: u64, desc: Desc, riid: *const GUID, ppv: *mut *mut c_void) -> Option<HRESULT> {
-        let wide = entry_name(self.fingerprint, key);
+        let wide = entry_name(key);
         let asked = Instant::now();
         let _one = lock(&self.names[key as usize % 64]);
         waited(asked);
@@ -625,7 +636,7 @@ impl Libraries {
             };
             match held {
                 Some(held) => held,
-                None => own.add(self.fingerprint, key, pso),
+                None => own.add(key, pso),
             }
         };
         if !stored {
@@ -672,13 +683,13 @@ impl Libraries {
         let len = unsafe { (vtable.GetSerializedSize)(raw) };
         let written = save_shard(&self.dir, writer(), *next, |tmp| write_mapped(tmp, len, |view| unsafe { (vtable.Serialize)(raw, view, len).is_ok() }), rename_new).and_then(|generation| {
             *next = generation + 1;
-            write_keys(&keys_path(&self.dir.join(shard_name(writer(), generation))), self.fingerprint, &keys).map(|()| generation)
+            write_keys(&keys_path(&self.dir.join(shard_name(writer(), generation))), &keys).map(|()| generation)
         });
         let saved = match written {
             Ok(generation) => {
                 let path = self.dir.join(shard_name(writer(), generation));
                 if grows(len) || over.is_some() {
-                    Shard::open(&path, &self.create, self.fingerprint)
+                    Shard::open(&path, &self.create)
                         .map_err(|why| crate::xlog_warn!("D3D12.X: pipeline library: {} saved but not read back ({why:?}): it is kept, and the next save holds its pipelines too", path.display()))
                         .ok()
                         .map(|shard| (generation, Some(shard)))
@@ -713,7 +724,7 @@ impl Libraries {
         {
             let own = self.own.read().unwrap_or_else(|e| e.into_inner());
             for (key, pso) in later {
-                unsafe { own.add(self.fingerprint, key, pso.as_raw()) };
+                unsafe { own.add(key, pso.as_raw()) };
             }
         }
         let Some((generation, full)) = handed else { return true };
@@ -746,7 +757,7 @@ pub(super) fn of(device: usize, dir: impl FnOnce() -> PathBuf, create: Create, r
     if let Some((_, libraries)) = lock(&DEVICES).iter().find(|(d, _)| *d == device) {
         return libraries.clone();
     }
-    let libraries = open(dir(), create, &refused, fingerprint()).map_err(|e| crate::xlog_warn!("D3D12.X: pipeline library: none for this device: {e}")).ok().map(Arc::new);
+    let libraries = open(dir(), create, &refused).map_err(|e| crate::xlog_warn!("D3D12.X: pipeline library: none for this device: {e}")).ok().map(Arc::new);
     let mut devices = lock(&DEVICES);
     if let Some((_, raced)) = devices.iter().find(|(d, _)| *d == device) {
         return raced.clone();
@@ -755,14 +766,14 @@ pub(super) fn of(device: usize, dir: impl FnOnce() -> PathBuf, create: Create, r
     libraries
 }
 
-fn open(dir: PathBuf, create: Create, refused: &dyn Fn(), fingerprint: u64) -> Result<Libraries, String> {
+fn open(dir: PathBuf, create: Create, refused: &dyn Fn()) -> Result<Libraries, String> {
     static LOGGED: AtomicBool = AtomicBool::new(false);
     std::fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
     let names: Vec<String> = std::fs::read_dir(&dir).map_err(|e| format!("{}: {e}", dir.display()))?.filter_map(|e| e.ok()?.file_name().into_string().ok()).collect();
     let found = shards(writer(), names.iter().map(String::as_str));
     let read = |name: &str| {
         let path = dir.join(name);
-        Shard::open(&path, &create, fingerprint).map_err(|why| {
+        Shard::open(&path, &create).map_err(|why| {
             if let Refusal::Unkeyed(_) = why {
                 STALE.fetch_add(1, Ordering::Relaxed);
                 return;
@@ -786,13 +797,13 @@ fn open(dir: PathBuf, create: Create, refused: &dyn Fn(), fingerprint: u64) -> R
         None => Own::new(Shard::new(create(&[]).map_err(|hr| format!("an empty library: {hr:?}"))?, None), None),
     };
     if found.older > 0 {
-        crate::xlog_info!("D3D12.X: pipeline library: {} older generations of {} kept read-only (left by an earlier build, never removed)", found.older, writer());
+        crate::xlog_info!("D3D12.X: pipeline library: {} older generations of {} kept read-only (left by an earlier save, never removed)", found.older, writer());
     }
-    crate::xlog_info!("D3D12.X: pipeline library: {} as {} over generation {}: {} of {} other shards read; {} skipped as another build's or without a key list (kept as they are)", dir.display(), writer(), own.over.map_or("none".to_string(), |g| g.to_string()), read_others, found.others.len(), STALE.load(Ordering::Relaxed));
+    crate::xlog_info!("D3D12.X: pipeline library: {} as {} over generation {}: {} of {} other shards read; {} skipped without a key list this build reads (kept as they are)", dir.display(), writer(), own.over.map_or("none".to_string(), |g| g.to_string()), read_others, found.others.len(), STALE.load(Ordering::Relaxed));
     if let (Some(g), false) = (found.own, grown) {
         crate::xlog_info!("D3D12.X: pipeline library: {}'s generation {g} is a full segment or unread: kept as it is, new pipelines go to a new shard", writer());
     }
-    Ok(Libraries { shards, own: RwLock::new(own), pending: Mutex::new(None), dir, fingerprint, create, next: Mutex::new(found.next), unsaved: AtomicUsize::new(0), dirty: AtomicBool::new(false), saving: AtomicBool::new(false), born: Instant::now(), last_save_ms: AtomicU64::new(0), names: std::array::from_fn(|_| Mutex::new(())) })
+    Ok(Libraries { shards, own: RwLock::new(own), pending: Mutex::new(None), dir, create, next: Mutex::new(found.next), unsaved: AtomicUsize::new(0), dirty: AtomicBool::new(false), saving: AtomicBool::new(false), born: Instant::now(), last_save_ms: AtomicU64::new(0), names: std::array::from_fn(|_| Mutex::new(())) })
 }
 
 /// Saves every device's new pipelines: at a clean end without a limit (a warm-up child's, a
@@ -1050,7 +1061,7 @@ mod tests {
         let (len, slow_ms) = (Arc::new(AtomicUsize::new(4096)), Arc::new(std::sync::atomic::AtomicU64::new(1500)));
         let (l, s) = (len.clone(), slow_ms.clone());
         let create: Create = Box::new(move |_: &[u8]| Ok(fake::Library { len: l.clone(), slow_ms: s.clone(), hand_out: false }.into()));
-        let libraries = Arc::new(open(dir.clone(), create, &|| {}, 7).unwrap());
+        let libraries = Arc::new(open(dir.clone(), create, &|| {}).unwrap());
         let pso: ID3D12PipelineState = fake::Pso.into();
         for i in 0..10 {
             assert!(unsafe { libraries.store(i, pso.as_raw()) });
@@ -1102,43 +1113,129 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// A driver's library that hands out a pipeline for every key, so a miss can only come from
+    /// this library's own key list.
+    fn hand_out() -> Create {
+        Box::new(|_: &[u8]| Ok(fake::Library { len: Arc::new(AtomicUsize::new(64)), slow_ms: Arc::new(AtomicU64::new(0)), hand_out: true }.into()))
+    }
+
+    /// Whether the libraries answer a load of `key` with that driver, releasing what they hand out.
+    fn hit(libraries: &Libraries, key: u64, desc: &D3D12_COMPUTE_PIPELINE_STATE_DESC) -> bool {
+        let mut out = std::ptr::null_mut();
+        let hit = unsafe { libraries.load(key, Desc::Compute(desc), &ID3D12PipelineState::IID, &mut out) }.is_some();
+        if hit {
+            drop(unsafe { ID3D12PipelineState::from_raw(out) });
+        }
+        hit
+    }
+
+    fn compute_desc(cs: &[u8]) -> D3D12_COMPUTE_PIPELINE_STATE_DESC {
+        D3D12_COMPUTE_PIPELINE_STATE_DESC { CS: windows::Win32::Graphics::Direct3D12::D3D12_SHADER_BYTECODE { pShaderBytecode: cs.as_ptr().cast(), BytecodeLength: cs.len() }, ..Default::default() }
+    }
+
     #[test]
-    fn a_shard_of_another_build_or_a_key_its_list_lacks_is_a_miss() {
-        let dir = scratch("fingerprint");
-        let create = || -> Create { Box::new(|_: &[u8]| Ok(fake::Library { len: Arc::new(AtomicUsize::new(64)), slow_ms: Arc::new(std::sync::atomic::AtomicU64::new(0)), hand_out: true }.into())) };
+    fn a_library_one_run_saves_is_read_by_the_next_with_no_build_in_any_name() {
+        let dir = scratch("next-run");
+        let pso: ID3D12PipelineState = fake::Pso.into();
+        let cs = [7u8; 16];
+        let desc = compute_desc(&cs);
+        let blob = "0123456789abcdef-10-0.pso";
+        let entry = key(blob, &cs, b'c');
+        {
+            let run = Arc::new(open(dir.clone(), hand_out(), &|| {}).unwrap());
+            assert!(unsafe { run.store(entry, pso.as_raw()) });
+            assert!(run.save(None));
+        }
+        let shard = dir.join(shard_name(writer(), 0));
+        let mut names: Vec<String> = std::fs::read_dir(&dir).unwrap().filter_map(|e| e.ok()?.file_name().into_string().ok()).collect();
+        names.sort();
+        assert_eq!(names, [shard_name(writer(), 0), keys_path(&shard).file_name().unwrap().to_str().unwrap().to_string()], "a shard and its key list, and nothing of a build");
+        let list = std::fs::read(keys_path(&shard)).unwrap();
+        assert_eq!(list.get(..8), Some(&KEYS_MAGIC[..]));
+        assert_eq!(list.get(8..16), Some(&KEYS_FORMAT.to_le_bytes()[..]), "the list says its format, not a translation");
+        assert_eq!(read_keys(&keys_path(&shard)).unwrap(), [entry]);
+        assert_eq!(String::from_utf16(&entry_name(entry)[..16]).unwrap(), format!("{entry:016x}"), "an entry is named by its key alone");
+        let next = open(dir.clone(), hand_out(), &|| {}).unwrap();
+        assert!(hit(&next, entry, &desc), "the next run reads the entry, with no build identity to change");
+        assert!(!hit(&next, entry ^ 1, &desc), "a key no list names is a miss, though the driver hands out anything");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_changed_dxil_or_a_changed_description_is_another_key_and_does_not_hit() {
+        let dir = scratch("changed");
+        let pso: ID3D12PipelineState = fake::Pso.into();
+        let cs = [7u8; 16];
+        let desc = compute_desc(&cs);
+        let entry = key("0123456789abcdef-10-0.pso", &cs, b'c');
+        {
+            let run = Arc::new(open(dir.clone(), hand_out(), &|| {}).unwrap());
+            assert!(unsafe { run.store(entry, pso.as_raw()) });
+            assert!(run.save(None));
+        }
+        let next = open(dir.clone(), hand_out(), &|| {}).unwrap();
+        assert!(hit(&next, entry, &desc));
+        let mut changed = cs;
+        changed[3] ^= 1;
+        assert_ne!(key_of("0123456789abcdef-10-0.pso", &changed), entry, "a changed DXIL is another key");
+        assert!(!hit(&next, key_of("0123456789abcdef-10-0.pso", &changed), &desc), "and misses");
+        assert_ne!(key_of("another-name-10-0.pso", &cs), entry, "a changed blob name (the root signature's samplers, the flags) is another key");
+        assert!(!hit(&next, key_of("another-name-10-0.pso", &cs), &desc), "and misses");
+        assert_ne!(key("0123456789abcdef-10-0.pso", &cs, b'g'), entry, "another kind of description is another key");
+        assert_eq!(key_of("0123456789abcdef-10-0.pso", &cs), entry, "the same DXIL and description are the same key, whichever build asks");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn key_of(blob: &str, cs: &[u8]) -> u64 {
+        key(blob, cs, b'c')
+    }
+
+    #[test]
+    fn a_key_its_list_lacks_or_a_list_of_another_format_is_a_miss() {
+        let dir = scratch("keys");
         let pso: ID3D12PipelineState = fake::Pso.into();
         let cs = [0u8; 16];
-        let desc = D3D12_COMPUTE_PIPELINE_STATE_DESC { CS: windows::Win32::Graphics::Direct3D12::D3D12_SHADER_BYTECODE { pShaderBytecode: cs.as_ptr().cast(), BytecodeLength: cs.len() }, ..Default::default() };
-        let (built, rebuilt) = (0xaaaa_u64, 0xbbbb_u64);
+        let desc = compute_desc(&cs);
         {
-            let writer = Arc::new(open(dir.clone(), create(), &|| {}, built).unwrap());
+            let writer = Arc::new(open(dir.clone(), hand_out(), &|| {}).unwrap());
             assert!(unsafe { writer.store(42, pso.as_raw()) });
             assert!(writer.save(None));
         }
         let shard = dir.join(shard_name(writer(), 0));
-        assert_eq!(read_keys(&keys_path(&shard), built).unwrap(), [42]);
-        assert!(read_keys(&keys_path(&shard), rebuilt).is_err());
-        let hit = |libraries: &Libraries, key| {
-            let mut out = std::ptr::null_mut();
-            let hit = unsafe { libraries.load(key, Desc::Compute(&desc), &ID3D12PipelineState::IID, &mut out) }.is_some();
-            if hit {
-                drop(unsafe { ID3D12PipelineState::from_raw(out) });
-            }
-            hit
-        };
-        let stale = STALE.load(Ordering::Relaxed);
-        let other = open(dir.clone(), create(), &|| {}, rebuilt).unwrap();
-        assert!(!hit(&other, 42), "another build's shard is never read, though this driver hands anything out");
-        assert_eq!(STALE.load(Ordering::Relaxed), stale + 1);
-        let same = open(dir.clone(), create(), &|| {}, built).unwrap();
-        assert!(hit(&same, 42), "its own build's entry");
-        assert!(!hit(&same, 43), "a key no list names is a miss without asking the driver");
+        assert_eq!(read_keys(&keys_path(&shard)).unwrap(), [42]);
+        let mut earlier = std::fs::read(keys_path(&shard)).unwrap();
+        earlier[..8].copy_from_slice(b"XCLKEYS1");
+        std::fs::write(keys_path(&shard), &earlier).unwrap();
+        assert!(read_keys(&keys_path(&shard)).is_err(), "a list of an earlier format is not read");
+        std::fs::write(keys_path(&shard), &std::fs::read(keys_path(&shard)).unwrap()[..8]).unwrap();
+        assert!(read_keys(&keys_path(&shard)).is_err(), "nor is a damaged one");
+        std::fs::write(keys_path(&shard), &{
+            let mut list = Vec::new();
+            list.extend_from_slice(KEYS_MAGIC);
+            list.extend_from_slice(&KEYS_FORMAT.to_le_bytes());
+            list.extend_from_slice(&2u64.to_le_bytes());
+            list.extend_from_slice(&42u64.to_le_bytes());
+            list.extend_from_slice(&41u64.to_le_bytes());
+            list
+        }).unwrap();
+        assert!(read_keys(&keys_path(&shard)).is_err(), "nor an unsorted one");
+        std::fs::write(keys_path(&shard), &{
+            let mut list = Vec::new();
+            list.extend_from_slice(KEYS_MAGIC);
+            list.extend_from_slice(&KEYS_FORMAT.to_le_bytes());
+            list.extend_from_slice(&1u64.to_le_bytes());
+            list.extend_from_slice(&42u64.to_le_bytes());
+            list
+        }).unwrap();
+        let same = open(dir.clone(), hand_out(), &|| {}).unwrap();
+        assert_eq!(read_keys(&keys_path(&shard)).unwrap(), [42]);
+        assert!(hit(&same, 42, &desc));
+        assert!(!hit(&same, 43, &desc), "a key no list names is a miss without asking the driver");
         std::fs::write(dir.join("library-w05.0.bin"), [1u8; 64]).unwrap();
         let unkeyed = STALE.load(Ordering::Relaxed);
-        drop(open(dir.clone(), create(), &|| {}, built).unwrap());
-        assert_eq!(STALE.load(Ordering::Relaxed), unkeyed + 1, "a shard without a key list (an earlier format) is not read");
+        drop(open(dir.clone(), hand_out(), &|| {}).unwrap());
+        assert_eq!(STALE.load(Ordering::Relaxed), unkeyed + 1, "a shard without a key list is not read");
         assert!(shard.exists() && dir.join("library-w05.0.bin").exists(), "and nothing is removed");
-        drop((other, same));
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

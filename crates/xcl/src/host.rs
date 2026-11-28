@@ -139,6 +139,9 @@ pub fn host_main(boot_path: &Path) -> i32 {
                 if let Some(aliases) = crate::hle::d3d12x::texture_alias::summary() {
                     crate::xlog_info!("{aliases}");
                 }
+                if let Some(aliased) = crate::hle::d3d12x::vram::alias_line() {
+                    crate::xlog_info!("{aliased}");
+                }
                 last = now;
             }
         });

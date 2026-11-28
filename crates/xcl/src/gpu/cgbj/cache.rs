@@ -46,20 +46,27 @@ pub struct Key {
     pub hash2: u64,
     pub len: usize,
     pub sampler_base: u32,
+    /// A pixel program's links: an `identity` of the output signatures its inputs take the
+    /// rows of. 0 for compute.
+    pub link: u64,
 }
 
 impl Key {
-    pub fn new(ident: u64, fnv: u64, blob: &[u8], sampler_base: u32) -> Key {
-        Key { ident, fnv, hash2: hash2(blob), len: blob.len(), sampler_base }
+    pub fn new(ident: u64, fnv: u64, blob: &[u8], sampler_base: u32, link: u64) -> Key {
+        Key { ident, fnv, hash2: hash2(blob), len: blob.len(), sampler_base, link }
     }
 
     pub fn file(&self, dir: &Path) -> PathBuf {
-        dir.join("cgbj").join(format!("{:016x}", self.ident)).join(format!("{:016x}_{}.bin", self.fnv, self.sampler_base))
+        let name = match self.link {
+            0 => format!("{:016x}_{}.bin", self.fnv, self.sampler_base),
+            link => format!("{:016x}_{}_{link:016x}.bin", self.fnv, self.sampler_base),
+        };
+        dir.join("cgbj").join(format!("{:016x}", self.ident)).join(name)
     }
 
     fn header(&self) -> Vec<u8> {
         let mut h = MAGIC.to_vec();
-        for v in [self.ident, self.len as u64, self.hash2] {
+        for v in [self.ident, self.len as u64, self.hash2, self.link] {
             h.extend_from_slice(&v.to_le_bytes());
         }
         h
@@ -127,6 +134,11 @@ pub fn store(dir: &Path, key: &Key, e: &Entry) {
 
 static MEMORY: Mutex<Option<(HashMap<Key, Entry>, usize)>> = Mutex::new(None);
 
+thread_local! {
+    /// the keys of this thread's pipeline build that CGBJ remembered here (`remember`)
+    static ASKED: std::cell::RefCell<Vec<Key>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
 pub fn remembered(key: &Key) -> Option<Entry> {
     MEMORY.lock().ok()?.as_ref()?.0.get(key).cloned()
 }
@@ -142,8 +154,48 @@ pub fn remember(key: Key, e: &Entry) {
         map.clear();
         *bytes = 0;
     }
+    if matches!(e, Entry::Good(_)) && crate::gpu::recomp::pso::freeing_after_build() {
+        ASKED.with(|a| a.borrow_mut().push(key));
+    }
     if map.insert(key, e.clone()).is_none() {
         *bytes += size;
+    }
+}
+
+/// `XCL_TRANSLATION_RAM_FREE`: the pipeline state this thread's build asked CGBJ for exists, so the
+/// DXIL CGBJ remembered for it goes - its file is under `{dxc::cache_dir()}/cgbj/{identity}/`, and a
+/// rebuild reads it back rather than translating it again. A refusal stays: it is a few bytes and
+/// keeps a program CGBJ cannot take from being offered again.
+///
+/// The keys are this thread's, taken whole: a build that made no pipeline leaves its keys for the
+/// next pipeline this thread completes (the list has no per-build scope), and freeing one then
+/// costs a file read, never a translation - `keep` wrote the file before `remember` kept the copy.
+pub fn built() {
+    if !crate::gpu::recomp::pso::translation_ram_free() {
+        return;
+    }
+    let keys = ASKED.with(|a| std::mem::take(&mut *a.borrow_mut()));
+    if keys.is_empty() {
+        return;
+    }
+    let mut m = MEMORY.lock().unwrap();
+    let Some((map, bytes)) = m.as_mut() else { return };
+    let (mut entries, mut freed) = (0, 0);
+    for key in keys {
+        if let Some(e) = map.remove(&key) {
+            freed += match &e {
+                Entry::Good(c) => c.dxil.len(),
+                Entry::Refused(r) => r.len(),
+            };
+            entries += 1;
+        }
+    }
+    // (a key remembered again with a bigger entry than the first leaves the count below what its
+    // removal takes back: clamped, because the count only decides when the map is emptied)
+    *bytes = bytes.saturating_sub(freed);
+    drop(m);
+    if entries != 0 {
+        crate::gpu::recomp::pso::note_freed(entries, freed);
     }
 }
 
@@ -160,7 +212,7 @@ mod tests {
     }
 
     fn key() -> Key {
-        Key::new(identity(&[b"a", b"b"]), 7, b"blob", 0)
+        Key::new(identity(&[b"a", b"b"]), 7, b"blob", 0, 0)
     }
 
     #[test]
@@ -173,10 +225,25 @@ mod tests {
     }
 
     #[test]
+    fn a_built_pipeline_drops_what_was_remembered_for_it_and_keeps_its_refusal() {
+        assert!(crate::gpu::recomp::pso::translation_ram_free(), "on by default");
+        let build = crate::gpu::recomp::pso::pipeline_build();
+        let (good, refused) = (Key::new(identity(&[b"c", b"d"]), 9, b"program", 0, 0), Key::new(identity(&[b"c", b"d"]), 10, b"refused", 0, 0));
+        remember(good, &Entry::Good(Compiled { dxil: vec![3; 8], samplers: vec![] }));
+        remember(refused, &Entry::Refused("ray tests under the XCL binding".into()));
+        assert!(remembered(&good).is_some());
+        built();
+        assert!(remembered(&good).is_none(), "the DXIL of a built pipeline goes");
+        assert!(remembered(&refused).is_some(), "a refusal has no pipeline to be dead with");
+        drop(build);
+    }
+
+    #[test]
     fn another_program_or_build_or_a_cut_file_is_not_read() {
         let e = Entry::Good(Compiled { dxil: vec![9; 10], samplers: vec![] });
         let b = encode(&key(), &e);
-        assert!(decode(&Key::new(key().ident, 7, b"bloc", 0), &b).is_none());
+        assert!(decode(&Key::new(key().ident, 7, b"bloc", 0, 0), &b).is_none());
+        assert!(decode(&Key { link: 5, ..key() }, &b).is_none());
         assert!(decode(&Key { ident: key().ident ^ 2, ..key() }, &b).is_none());
         assert!(decode(&key(), &b[..b.len() - 1]).is_none());
         assert!(decode(&key(), &b).is_some());
@@ -192,8 +259,10 @@ mod tests {
 
     #[test]
     fn file_names() {
-        let k = Key { ident: 0x10, fnv: 0xabc, hash2: 0, len: 0, sampler_base: 3 };
+        let k = Key { ident: 0x10, fnv: 0xabc, hash2: 0, len: 0, sampler_base: 3, link: 0 };
         let p = k.file(Path::new("c"));
         assert!(p.ends_with(Path::new("cgbj").join("0000000000000010").join("0000000000000abc_3.bin")));
+        let p = Key { link: 0x5d, ..k }.file(Path::new("c"));
+        assert!(p.ends_with(Path::new("cgbj").join("0000000000000010").join("0000000000000abc_3_000000000000005d.bin")));
     }
 }

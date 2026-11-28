@@ -3,20 +3,28 @@ use super::*;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Aspect { Color, Depth, Stencil }
 #[derive(Debug)]
+// Render-pass conversion is not read by a consumer yet; kept for the next fix.
+#[allow(dead_code)]
 pub(crate) enum Load { Preserve, Discard, Clear(Clear) }
 #[derive(Debug)]
 pub(crate) enum Store { Preserve, Discard, Resolve(Resolve) }
 #[derive(Debug)]
+// Render-pass conversion is not read by a consumer yet; kept for the next fix.
+#[allow(dead_code)]
 pub(crate) struct Resolve {
     pub dst: ID3D12Resource, pub format: DXGI_FORMAT, pub mode: D3D12_RESOLVE_MODE,
     pub preserve_source: bool, pub regions: Vec<Region>,
 }
 #[derive(Debug)]
+// Render-pass conversion is not read by a consumer yet; kept for the next fix.
+#[allow(dead_code)]
 pub(crate) struct Region {
     pub params: D3D12_RENDER_PASS_ENDING_ACCESS_RESOLVE_SUBRESOURCE_PARAMETERS,
     pub full_destination: bool,
 }
 #[derive(Debug)]
+// Render-pass conversion is not read by a consumer yet; kept for the next fix.
+#[allow(dead_code)]
 pub(crate) struct Attachment {
     pub view: View, pub aspect: Aspect, pub plane: u32, pub read_only: bool,
     pub load: Load, pub store: Store,

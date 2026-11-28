@@ -177,8 +177,12 @@ pub(crate) enum Disposition {
     /// not a translated graphics draw (or one the draw path skips): IA as before
     Untranslated,
     /// gathered views bound for this draw; dropping it binds the title's views again
+    // The IA gather packet type is recorded but not consumed yet; kept for the next fix.
+    #[allow(dead_code)]
     Gathered(DrawIa),
     /// a translated draw whose IA could not be gathered safely here, and why
+    // The IA gather packet type is recorded but not consumed yet; kept for the next fix.
+    #[allow(dead_code)]
     Refused(String),
 }
 

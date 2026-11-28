@@ -221,6 +221,15 @@ fn show_dropped(frame: u64) {
     );
 }
 
+/// The jitter the title rendered the frame with, and whether the upscaler must reset its history:
+/// `(x, y, reset)` in the convention DLSS takes, read from the title's own upscale dispatch by
+/// `fidelityfx`. Until the title has dispatched an upscale the answer is "not known", and
+/// `upscaler` blits instead of guessing - an unjittered DLSS evaluation is a blurred picture, not
+/// a faster one.
+pub(super) fn jitter() -> Option<(f32, f32, i32)> {
+    super::fidelityfx::jitter()
+}
+
 /// The title released pipeline `pso` for good.
 pub(super) fn gone(pso: usize) {
     if !ANY.load(Ordering::Acquire) {
@@ -297,6 +306,28 @@ unsafe fn upscale(list: *mut c_void, read: Option<Vec<Image>>, frame: u64) {
     };
     let input = &read[input];
     let outputs: Vec<&Image> = outputs.into_iter().map(|k| &written[k]).collect();
+    // `XCL_UPSCALER=dlss`: the shim writes the picture and there is nothing to blit. Every reason it
+    // cannot - no DLLs, no jitter yet, a refusal - is one line the first time and then the bilinear
+    // pass, which is what a build without the switch does.
+    if super::upscaler::choice() == super::upscaler::Choice::Dlss {
+        let picture = outputs.iter().find(|o| o.format == input.format).copied().or_else(|| outputs.first().copied());
+        let attempt = match picture {
+            None => Err(String::from("no output to write")),
+            Some(out) => match super::upscaler::plan(&read, input) {
+                Err(why) => Err(why),
+                Ok(plan) => super::upscaler::upscale(list, &plan, out.resource, input.width, out.width),
+            },
+        };
+        match attempt {
+            Ok(()) => return,
+            Err(why) => {
+                static ONCE: std::sync::Once = std::sync::Once::new();
+                ONCE.call_once(|| {
+                    crate::xlog_info!("D3D12.X: upscaler: XCL_UPSCALER=dlss falls back to the bilinear pass: {why}");
+                });
+            }
+        }
+    }
     let Some((rs, pso)) = pipeline() else { return };
     let (rs, pso) = (rs as *mut c_void, pso as *mut c_void);
     let (Some(rs), Some(pso), Some(l)) = (ID3D12RootSignature::from_raw_borrowed(&rs), ID3D12PipelineState::from_raw_borrowed(&pso), ID3D12GraphicsCommandList::from_raw_borrowed(&list)) else { return };
@@ -318,6 +349,7 @@ unsafe fn upscale(list: *mut c_void, read: Option<Vec<Image>>, frame: u64) {
     if s.shown.as_ref() != Some(&now) {
         static N: AtomicU32 = AtomicU32::new(0);
         if N.fetch_add(1, Ordering::Relaxed) < 16 {
+            super::census::trigger("the FSR4 stand-in");
             crate::xlog_info!(
                 "D3D12.X: FSR4 stand-in: from frame {frame} the input is {}x{} format {} (view {}, resource {:#x}; of what the first pass read: {}), written to {} (views {:?})",
                 input.width, input.height, input.format, input.index, input.resource, self::list(read.iter().filter(|i| !i.uav)), self::list(outputs.iter().copied()), outputs.iter().map(|o| o.index + 1).collect::<Vec<_>>()

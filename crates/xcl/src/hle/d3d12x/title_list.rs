@@ -198,7 +198,7 @@ unsafe extern "system" fn close(this: *mut c_void) -> HRESULT {
 
 /// #10 Reset(allocator, initial_pso): resets the primary PC list (`F_PRIMARY`) via `list_x::reset_x`
 /// (calling directly rather than through the dual-dispatch vtable thunk so console state always
-/// resets even though this wrapper sits in `XSEmu.exe`), restores `F_BACKING = F_PRIMARY`, and moves
+/// resets even though this wrapper sits in `xcl.exe`), restores `F_BACKING = F_PRIMARY`, and moves
 /// any extra split segments into the per-list spare pool.
 unsafe extern "system" fn reset(this: *mut c_void, alloc: usize, pso: usize) -> HRESULT {
     let primary = *((this as usize + F_PRIMARY) as *const *mut c_void);

@@ -27,6 +27,23 @@ pub fn wave_exact() -> bool {
     WAVE_EXACT.load(Ordering::Relaxed)
 }
 
+static D16_HALF_BITS: AtomicBool = AtomicBool::new(false);
+
+/// A d16 typed-buffer access moves a 16-bit float format's channels as their 16 bits, the way
+/// it moves an integer format's (`XCL_RECOMP_D16_HALF_BITS`): the view is read as the unsigned
+/// format of the same layout, so every one of the 65,536 patterns comes through, where the
+/// f32 round trip keeps every finite value and infinity and not every NaN pattern. Off (the
+/// default): the format's value through f32. Set it once, before any translation; it is part
+/// of [`crate::emit::translation_fingerprint`].
+pub fn set_d16_half_bits(on: bool) {
+    D16_HALF_BITS.store(on, Ordering::Relaxed);
+}
+
+/// See [`set_d16_half_bits`].
+pub fn d16_half_bits() -> bool {
+    D16_HALF_BITS.load(Ordering::Relaxed)
+}
+
 /// What a wave form does to the console's results.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FormKind {
@@ -82,7 +99,7 @@ pub fn take_form() -> Option<(String, FormKind)> {
 }
 
 /// Bumped on any change to the code emitted under the XCL binding. The host keys its caches on it.
-pub const BINDING_VERSION: u32 = 5;
+pub const BINDING_VERSION: u32 = 7;
 
 /// The label ([`take_form`]) of the packed form: a console wave64 program on 32-lane waves with
 /// each host lane holding two console lanes. Its numthreads are [`packed_threads`].
@@ -99,9 +116,10 @@ pub fn packed_threads(console: [u32; 3]) -> [u32; 3] {
 pub struct XclConfig {
     /// Title memory windows in the view heap. The game has 4. 1 is refused.
     pub mem_windows: u32,
-    /// Honour the dispatch thread limits in io[119..121].
+    /// Honour the dispatch thread limits in io[119..121]. Compute only.
     pub thread_limits: bool,
-    /// First static sampler register in space 1. 0 for compute.
+    /// First static sampler register in space 1. 0 for compute; a pixel program's are the
+    /// pipeline's vertex program's count.
     pub sampler_base: u32,
 }
 
@@ -151,6 +169,16 @@ pub struct XclShader {
     pub threads: [u32; 3],
     /// The wave form the translation took, as [`take_form`] gives it.
     pub form: Option<(String, FormKind)>,
+    pub stats: XclStats,
+}
+
+/// A pixel program translated under the XCL binding.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct XclPixel {
+    /// The DXIL container, hashed as D3D12 expects.
+    pub dxil: Vec<u8>,
+    /// Static samplers in register order: the S# words and whether it compares.
+    pub samplers: Vec<([u32; 4], bool)>,
     pub stats: XclStats,
 }
 
@@ -230,7 +258,39 @@ pub fn translate_compute(container: &[u8], cfg: &XclConfig) -> Result<XclShader,
         return Err(crate::ShaderError::Unsupported { offset: 0, what: "the XCL binding with other than 4 memory windows" });
     }
     let _scope = BindingScope::enter(*cfg);
-    crate::emit::xcl::translate(container)
+    crate::emit::xcl::translate(container, crate::native::HwStage::Cs, &[])
+}
+
+/// Translates the pixel program of a console shader container under the XCL binding, as
+/// [`translate_compute`] does a compute program, whatever the console's wave size.
+///
+/// A pixel program declares no wave size: D3D12 has none for a pixel shader, so the driver
+/// picks the host's. A wave64 program's cross-lane operations are lowered as wave operations
+/// of the host's wave: a whole-wave section (the reduction and prefix idioms between
+/// `s_or_saveexec` and its restore) is the wave operation it computes, and a lane read
+/// outside such a section is refused, as any cross-lane read outside compute is. On a host of
+/// 32-lane waves each host wave is a console wave whose upper lanes are not populated, which
+/// is how xsemu's own translator's upper_lanes form runs such a program there.
+///
+/// The caller sets the host facts first, as [`translate_compute`] does; `emit::set_host_max_wave`
+/// must say 32 for a wave32 program to translate. In a 64-lane wave the other console wave
+/// shares the host wave, and its lanes would join every ballot and reduction, so a host whose
+/// driver may pick 64 lanes refuses it and translates it itself. A wave64 program translates
+/// at either host wave size.
+///
+/// `links` are the DXIL containers of the stages before it in the pipeline (the vertex
+/// program, and a geometry program behind it): each input takes the row of the output of the
+/// same semantic in every one of them, which must agree, so the pair links whether D3D12
+/// matches signatures by semantic or by row. With none, the inputs take the rows xsemu's own
+/// translator gives a pixel program's. Colour outputs are four columns wide, as xsemu's own.
+/// `cfg.thread_limits` is not used.
+pub fn translate_pixel(container: &[u8], cfg: &XclConfig, links: &[&[u8]]) -> Result<XclPixel, crate::ShaderError> {
+    if cfg.mem_windows != 4 {
+        return Err(crate::ShaderError::Unsupported { offset: 0, what: "the XCL binding with other than 4 memory windows" });
+    }
+    let _scope = BindingScope::enter(XclConfig { thread_limits: false, ..*cfg });
+    let s = crate::emit::xcl::translate(container, crate::native::HwStage::Ps, links)?;
+    Ok(XclPixel { dxil: s.dxil, samplers: s.samplers, stats: s.stats })
 }
 
 #[cfg(test)]

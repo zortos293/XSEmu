@@ -9,6 +9,8 @@ use crate::gpu::{
 use std::sync::Arc;
 use windows::Win32::Graphics::{Direct3D12::*, Dxgi::DXGI_ERROR_NOT_FOUND};
 
+// List-X footprint binding is not executed yet; kept for the next fix.
+#[allow(dead_code)]
 pub(crate) struct FootprintBinding {
     pub resource: ID3D12Resource,
     pub native: D3D12_PLACED_SUBRESOURCE_FOOTPRINT,
@@ -20,6 +22,8 @@ pub(crate) struct FootprintBinding {
 /// For a raw footprint, return only a native buffer that already aliases its
 /// actual bytes at execution, plus every required canonical ownership request.
 /// A footprint requiring unimplemented gather/scatter must return Err.
+// List-X footprint binding is not executed yet; kept for the next fix.
+#[allow(dead_code)]
 pub(crate) unsafe trait ExecutionFacts: Send + Sync {
     fn certify_native_equivalence(&self, op: &Operation) -> Result<(),String>;
     fn prove_native_only(&self, resource: &ID3D12Resource, sub: u32, write: bool, state: D3D12_RESOURCE_STATES) -> Result<(),String>;
@@ -29,6 +33,8 @@ pub(crate) unsafe trait ExecutionFacts: Send + Sync {
     fn pin(&self, image: &GuestImage, vpn: u32, location: PageLocation) -> Result<Arc<PinnedPage>, &'static str>;
 }
 
+// List-X footprint binding is not executed yet; kept for the next fix.
+#[allow(dead_code)]
 struct Bound {
     op: Operation,
     facts: Arc<dyn ExecutionFacts>,
@@ -42,6 +48,8 @@ impl NativeOperation for Bound {
 }
 
 impl Operation {
+    // List-X footprint binding is not executed yet; kept for the next fix.
+    #[allow(dead_code)]
     pub(crate) unsafe fn prepare(mut self, queue: &ID3D12CommandQueue, epoch: Epoch, kernels: Arc<Kernels>,
         facts: Arc<dyn ExecutionFacts>) -> Result<lifecycle::Operation,String> {
         if !self.permits(queue.GetDesc().Type) { return Err("invalid native operation on this execution queue".into()); }

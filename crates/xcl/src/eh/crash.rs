@@ -644,7 +644,7 @@ unsafe fn submit(job: Job) -> bool {
     }
     let _ = reporter
         .busy
-        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |state| {
+        .try_update(Ordering::AcqRel, Ordering::Acquire, |state| {
             (state & !STATE_MASK == ticket).then_some(
                 ticket
                     | if state & STATE_MASK == DONE {

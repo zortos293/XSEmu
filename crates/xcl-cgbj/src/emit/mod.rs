@@ -308,8 +308,9 @@ pub fn translation_fingerprint() -> Vec<u8> {
     out.extend_from_slice(&loop_limit().to_le_bytes());
     out.push(group_sync());
     out.extend_from_slice(&shader_opt().to_le_bytes());
-    // xsemu: the wave policy
+    // xsemu: the wave policy, and d16 channels as integers
     out.push(u8::from(crate::xcl::wave_exact()));
+    out.push(u8::from(crate::xcl::d16_half_bits()));
     out
 }
 

@@ -5,12 +5,75 @@
 
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap, VecDeque};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 /// DXIL from which a program is a giant (a warm-up builds giants in single-key children,
 /// `warm_children`); giants, like every compile, start when their expected peak fits
 pub const GIANT_DXIL: usize = 1 << 20;
 pub const GIANTS_AT_ONCE: usize = 3;
+
+/// Ray-tracing pipeline builds in flight at once, of the preload's backlog and the bind queue
+/// together (`XCL_RT_COMPILE_QUEUE`, `rt_compile_queue`): enough of them to make progress on a
+/// title's ray passes, few enough that they leave the compile threads and the driver slots to
+/// the pipelines a frame waits for. They are built in queues of their own (`Backlog`'s
+/// ray-tracing lane, `pso_async`'s bind queue), after every other build; a title that made
+/// hundreds at once (play-128, `XCL_RT_GATE=miss`) ran the frame at 0.1 - 0.2 fps with all of
+/// them compiling beside it.
+pub const RT_AT_ONCE: usize = 2;
+
+/// Ray-tracing pipelines are built in a queue and class of their own, at most `RT_AT_ONCE` at
+/// once (`XCL_RT_COMPILE_QUEUE=1`; unset or any other value, `0` included: in the graphics and
+/// compute queues as before).
+pub fn rt_compile_queue() -> bool {
+    if let Some(on) = rt_queue_for_test() {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = std::env::var("XCL_RT_COMPILE_QUEUE").is_ok_and(|v| v.trim() == "1");
+        if on {
+            crate::xlog_info!("D3D12.X: ray-tracing pipeline builds go in a queue of their own, {RT_AT_ONCE} at once, after every other build (XCL_RT_COMPILE_QUEUE=1)");
+        } else {
+            crate::xlog_info!("D3D12.X: ray-tracing pipeline builds take the graphics and compute queues as before (XCL_RT_COMPILE_QUEUE not 1)");
+        }
+        on
+    })
+}
+
+// (tests) this thread's `rt_compile_queue` instead of `XCL_RT_COMPILE_QUEUE`
+#[cfg(test)]
+thread_local! {
+    static RT_QUEUE_FOR_TEST: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+#[cfg(test)]
+fn rt_queue_for_test() -> Option<bool> {
+    RT_QUEUE_FOR_TEST.with(std::cell::Cell::get)
+}
+
+#[cfg(not(test))]
+fn rt_queue_for_test() -> Option<bool> {
+    None
+}
+
+/// Ray-tracing builds in flight across the preload's backlog and the bind queue.
+static RT_OUT: AtomicUsize = AtomicUsize::new(0);
+
+/// A place for one more ray-tracing build (`rt_done` when it is over). False: the class has
+/// `RT_AT_ONCE` builds in flight and this one waits its turn. True with the class off.
+pub fn rt_take() -> bool {
+    if !rt_compile_queue() {
+        return true;
+    }
+    RT_OUT.try_update(Ordering::AcqRel, Ordering::Acquire, |n| (n < RT_AT_ONCE).then_some(n + 1)).is_ok()
+}
+
+/// The ray-tracing build that took a `rt_take` place is over.
+pub fn rt_done() {
+    if rt_compile_queue() {
+        RT_OUT.fetch_sub(1, Ordering::AcqRel);
+    }
+}
 
 /// How far back `Trend` looks for the fastest fall of a memory figure, in seconds: a burst the
 /// title loaded is let go of soon after (play-87n: a 30 s window held its whole loading phase).
@@ -304,6 +367,17 @@ pub fn fits_on_machine(peak: u64, floor: u64, physical_total: u64) -> bool {
 /// only if it leaves the giant its peak, unless the giant could not fit even with every running
 /// compile gone: small compiles finishing and starting again would otherwise keep the memory
 /// below a giant's peak for the whole pass.
+/// What a build the title has not asked for keeps available once the title presents
+/// (XCL_PSO_PRELOAD_FLOOR_MB, read by the caller): keep, or asked_mb when that is higher and the
+/// title has presented. A title's in-world memory is what the compiles made ahead compete with,
+/// and they are the ones that can wait; before its first frame nothing is held back.
+pub fn preload_floor(keep: u64, asked_mb: Option<u64>, presenting: bool) -> u64 {
+    match asked_mb {
+        Some(mb) if presenting => keep.max(mb.saturating_mul(1 << 20)),
+        _ => keep,
+    }
+}
+
 pub fn admit(ask: &Ask, load: &Load, room: &Room) -> Verdict {
     admit_why(ask, load, room).0
 }
@@ -527,8 +601,12 @@ pub enum Lane {
     Slow,
     /// (`Backlog::drawn_first`) no run bound it, and it is slow or heavy as `Slow`
     LaterSlow,
-    /// a ray pass built with every ray a miss (`Backlog::rt_pass`): after every other lane
+    /// a ray-tracing pipeline (`Backlog::rt_pass`): after every other lane, `RT_AT_ONCE` of them
+    /// at once
     RtPass,
+    /// a ray-tracing pipeline whose build was parked for memory (`Backlog::park`), taken again:
+    /// as `RtPass`
+    RtParked,
 }
 
 /// Console shader bytes from which a pipeline is built ahead of the others (`Lane::Heavy`): a
@@ -545,6 +623,8 @@ struct Parked<T> {
     group: u64,
     id: u64,
     first_use: Option<usize>,
+    /// a ray-tracing pipeline (`XCL_RT_COMPILE_QUEUE`): taken again only with a `rt_take` place
+    rt: bool,
     item: T,
 }
 
@@ -594,8 +674,9 @@ pub struct Backlog<T> {
     slow_out: usize,
     /// workers building one of the later lanes now
     later_out: usize,
-    /// ray passes built with every ray a miss (`rt_pass`), oldest first: taken when nothing else is
-    rt: VecDeque<T>,
+    /// ray-tracing pipelines (`rt_pass`), each with its number, oldest first: taken when nothing
+    /// else is, `RT_AT_ONCE` of them at once
+    rt: VecDeque<(u64, T)>,
 }
 
 impl<T> Default for Backlog<T> {
@@ -732,8 +813,9 @@ impl<T> Backlog<T> {
         }
     }
 
-    /// Pipeline `n` is a ray pass built with every ray a miss while ray tracing is off
-    /// (`raytracing::miss_pass`): it is taken after every other pipeline waiting, the newest first.
+    /// Pipeline `n` is a ray-tracing pipeline (`raytracing::rt_pipeline`, `XCL_RT_COMPILE_QUEUE`):
+    /// it is taken after every other pipeline waiting, the newest first, `RT_AT_ONCE` of them at
+    /// once. A bind that promotes it (`promote`) moves it to the front of them.
     pub fn rt_pass(&mut self, n: u64) {
         let Some((item, lane)) = self.waiting.remove(&n) else { return };
         match lane {
@@ -741,12 +823,20 @@ impl<T> Backlog<T> {
             Lane::Slow | Lane::LaterSlow => self.slow_waiting -= 1,
             _ => {}
         }
-        self.rt.push_back(item);
+        self.rt.push_back((n, item));
     }
 
     pub fn promote(&mut self, n: u64) {
         if n == 0 || self.promoted.back() == Some(&n) {
             return;
+        }
+        if rt_compile_queue() {
+            if let Some(at) = self.rt.iter().position(|&(id, _)| id == n) {
+                if let Some(entry) = self.rt.remove(at) {
+                    self.rt.push_back(entry);
+                }
+                return;
+            }
         }
         self.promoted.retain(|&id| id != n);
         if self.promoted.len() >= 64 {
@@ -756,9 +846,10 @@ impl<T> Backlog<T> {
     }
 
     /// A pipeline of `group` whose driver compile of `dxil_len` bytes did not fit: it waits for
-    /// memory. A bind that needs it schedules an urgent build instead.
-    pub fn park(&mut self, dxil_len: usize, group: u64, id: u64, first_use: Option<usize>, item: T) {
-        insert_by_size(&mut self.parked, dxil_len, Parked { group, id, first_use, item });
+    /// memory. A bind that needs it schedules an urgent build instead. `rt`: it is of the
+    /// ray-tracing class, so it is taken again only with a `rt_take` place and after the others.
+    pub fn park(&mut self, dxil_len: usize, group: u64, id: u64, first_use: Option<usize>, rt: bool, item: T) {
+        insert_by_size(&mut self.parked, dxil_len, Parked { group, id, first_use, rt, item });
     }
 
     fn take(&mut self, n: u64) -> Option<(T, Lane)> {
@@ -826,11 +917,14 @@ impl<T> Backlog<T> {
         let (fit, peer_fit) = (std::cell::RefCell::new(HashMap::new()), std::cell::RefCell::new(HashMap::new()));
         let fits = |len: usize| *fit.borrow_mut().entry(len).or_insert_with(|| fits(len));
         let peer_fits = |len: usize| *peer_fit.borrow_mut().entry(len).or_insert_with(|| peer_fits(len));
+        // (a ray-tracing build waits for a place while `RT_AT_ONCE` of them are in flight; the one
+        // that finds the last place taken gives up this take)
+        let rt_free = !rt_compile_queue() || RT_OUT.load(Ordering::Acquire) < RT_AT_ONCE;
         let list = &mut self.parked;
         list.retain(|(_, p)| live(&p.item));
         {
             let peer = recent.iter().filter(|g| **g != 0).find_map(|g| {
-                list.iter().enumerate().filter(|(_, (len, p))| p.group == *g && peer_fits(*len))
+                list.iter().enumerate().filter(|(_, (len, p))| p.group == *g && !p.rt && peer_fits(*len))
                     .min_by_key(|(_, (_, p))| (p.first_use.unwrap_or(usize::MAX), std::cmp::Reverse(p.id))).map(|(at, _)| at)
             });
             if let Some(at) = peer {
@@ -844,23 +938,33 @@ impl<T> Backlog<T> {
             if self.waiting.contains_key(&id) {
                 Some((pos, id, None))
             } else {
-                list.iter().position(|(len, p)| p.id == id && fits(*len)).map(|at| (pos, id, Some(at)))
+                list.iter().position(|(len, p)| p.id == id && fits(*len) && (!p.rt || rt_free)).map(|at| (pos, id, Some(at)))
             }
         });
         if let Some((pos, id, parked)) = promoted {
-            self.promoted.remove(pos);
             if let Some(at) = parked {
-                return Some((list.remove(at).1.item, Lane::Parked));
+                let rt = list[at].1.rt;
+                // (the class is full: the builds that may start go on)
+                if !rt || rt_take() {
+                    self.promoted.remove(pos);
+                    return Some((list.remove(at).1.item, if rt { Lane::RtParked } else { Lane::Parked }));
+                }
+            } else {
+                self.promoted.remove(pos);
+                return self.take(id);
             }
-            return self.take(id);
         }
         let pick = |group: Option<u64>| {
-            list.iter().enumerate().rev().filter(|(_, (len, p))| group.is_none_or(|g| g == p.group) && fits(*len))
-                .min_by_key(|(_, (_, p))| p.first_use.unwrap_or(usize::MAX))
+            list.iter().enumerate().rev()
+                .filter(|(_, (len, p))| group.is_none_or(|g| g == p.group) && fits(*len) && (!p.rt || rt_free))
+                .min_by_key(|(_, (_, p))| (p.rt, p.first_use.unwrap_or(usize::MAX)))
                 .map(|(at, _)| at)
         };
         if let Some(at) = recent.iter().copied().filter(|&g| g != 0).find_map(|g| pick(Some(g))).or_else(|| pick(None)) {
-            return Some((list.remove(at).1.item, Lane::Parked));
+            let rt = list[at].1.rt;
+            if !rt || rt_take() {
+                return Some((list.remove(at).1.item, if rt { Lane::RtParked } else { Lane::Parked }));
+            }
         }
         let later_full = self.later_out >= heavy_share(workers);
         for group in recent {
@@ -872,7 +976,7 @@ impl<T> Backlog<T> {
             }
         }
         if self.drawn_first {
-            return self.pop_drawn_first(workers).or_else(|| self.rt.pop_back().map(|item| (item, Lane::RtPass)));
+            return self.pop_drawn_first(workers).or_else(|| self.take_rt().map(|item| (item, Lane::RtPass)));
         }
         if self.heavy_waiting > 0 && (self.heavy_waiting == self.waiting.len() || self.heavy_out < heavy_share(workers)) {
             while let Some((_, n)) = self.heavy.pop() {
@@ -895,7 +999,22 @@ impl<T> Backlog<T> {
                 return self.take(n);
             }
         }
-        self.rt.pop_back().map(|item| (item, Lane::RtPass))
+        self.take_rt().map(|item| (item, Lane::RtPass))
+    }
+
+    /// The newest ray-tracing pipeline waiting, once a `rt_take` place for it is free: it is taken
+    /// only when nothing else waits, so it never holds up a graphics or compute build.
+    fn take_rt(&mut self) -> Option<T> {
+        if !rt_take() {
+            return None;
+        }
+        match self.rt.pop_back() {
+            Some((_, item)) => Some(item),
+            None => {
+                rt_done();
+                None
+            }
+        }
     }
 
     /// A worker is done with what it took from `lane`.
@@ -904,6 +1023,7 @@ impl<T> Backlog<T> {
             Lane::Heavy => self.heavy_out = self.heavy_out.saturating_sub(1),
             Lane::ParkedPeer => self.peer_out -= 1,
             Lane::Slow | Lane::LaterSlow => self.slow_out = self.slow_out.saturating_sub(1),
+            Lane::RtPass | Lane::RtParked => rt_done(),
             _ => {}
         }
         if self.later(lane) {
@@ -1172,6 +1292,27 @@ impl Headroom {
     }
 }
 
+/// The pipeline states a run short of memory gives up (`XCL_PSO_FREE_IDLE`): `bound` holds each
+/// (id, when a bind last took it – when it was built for one nothing bound, whether its driver blob
+/// or library entry is on disk). One unbound for less than `limit` stays; one with nothing on disk
+/// stays too and is counted in the second part, because a rebuild would compile its shaders again;
+/// at most `most` of the others go, the longest unbound first – a round bound, so a title that
+/// comes back to what it bound a minute ago does not wait for thousands of builds.
+pub fn idle_binds_to_free<I: Copy>(bound: &mut [(I, u64, bool)], now: u64, limit: u64, most: usize) -> (Vec<I>, usize) {
+    let mut old: Vec<(u64, I, bool)> = bound.iter().filter(|&&(_, at, _)| now.saturating_sub(at) >= limit).map(|&(id, at, disk)| (at, id, disk)).collect();
+    old.sort_by_key(|&(at, _, _)| at);
+    let mut free = Vec::new();
+    let mut kept = 0;
+    for (_, id, disk) in old {
+        if !disk {
+            kept += 1;
+        } else if free.len() < most {
+            free.push(id);
+        }
+    }
+    (free, kept)
+}
+
 /// Which built pipelines nothing has bound yet to release, of `built` (id, when built): the ones
 /// built `limit` or longer before `now`, and of the rest the oldest beyond the newest `keep`. A
 /// run that builds every pipeline when the title makes it would otherwise hold thousands a
@@ -1186,6 +1327,16 @@ pub fn idle_to_release<I: Copy>(built: &mut Vec<(I, u64)>, now: u64, limit: u64,
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn preload_floor_applies_only_while_the_title_presents() {
+        let gb = 1u64 << 30;
+        assert_eq!(preload_floor(gb, Some(2048), true), 2 * gb);
+        assert_eq!(preload_floor(gb, Some(2048), false), gb, "before the first frame nothing is held back");
+        assert_eq!(preload_floor(gb, None, true), gb, "unset: as before");
+        assert_eq!(preload_floor(3 * gb, Some(2048), true), 3 * gb, "a higher floor wins");
+        assert_eq!(preload_floor(gb, Some(0), true), gb, "0 keeps only the floor");
+    }
 
     /// Drawn first: what an earlier run bound, the slow ones of it quickest measured first on a
     /// quarter of the workers; what no run bound behind it, on a quarter of the workers.
@@ -1455,7 +1606,7 @@ mod tests {
     fn a_take_asks_once_for_a_size() {
         let mut b = Backlog::<&'static str>::default();
         for id in 1..=40 {
-            b.park(if id % 2 == 0 { 2_000 } else { 3_000 }, 7, id, None, "parked");
+            b.park(if id % 2 == 0 { 2_000 } else { 3_000 }, 7, id, None, false, "parked");
         }
         let asked = std::cell::Cell::new(0);
         let fits = |_| {
@@ -1806,10 +1957,11 @@ mod tests {
         assert_eq!(b.waiting(), (0, 0));
     }
 
-    /// play-101: ray passes built with every ray a miss go behind every other pipeline waiting,
-    /// heavy, slow and recently bound ones included, and are still built once nothing else waits.
+    /// play-101, play-128: ray-tracing pipelines go behind every other pipeline waiting, heavy,
+    /// slow and recently bound ones included, and are still built once nothing else waits – in
+    /// their own queue, `RT_AT_ONCE` at a time, the one a bind promoted first.
     #[test]
-    fn ray_passes_built_with_every_ray_a_miss_go_last() {
+    fn ray_tracing_pipelines_go_last_and_take_places_of_their_own() {
         for mut b in [Backlog::default(), Backlog::drawn_first()] {
             let r1 = b.push(100, true, true, 7, None, "r1");
             b.push(100, false, false, 0, None, "g1");
@@ -1828,6 +1980,27 @@ mod tests {
             assert_eq!(taken, [("k1", false), ("g1", false), ("r3", true), ("r2", true), ("r1", true)]);
             assert_eq!(b.waiting(), (0, 0));
         }
+        // (the class queue and its places: `XCL_RT_COMPILE_QUEUE=1`)
+        RT_QUEUE_FOR_TEST.with(|c| c.set(Some(true)));
+        let mut b = Backlog::default();
+        let r1 = b.push(100, false, true, 0, None, "r1");
+        let r2 = b.push(100, false, true, 0, None, "r2");
+        for n in [r1, r2] {
+            b.rt_pass(n);
+        }
+        b.promote(r1);
+        let take = |b: &mut Backlog<&'static str>| b.pop(8, &[], |_| true, |_| true, |_| false);
+        assert_eq!(take(&mut b), Some(("r1", Lane::RtPass)), "the one a bind promoted first");
+        assert_eq!(take(&mut b), Some(("r2", Lane::RtPass)));
+        assert_eq!(take(&mut b), None, "both ray-tracing places are taken");
+        b.done(Lane::RtPass);
+        b.park(700 << 10, 0x51, 3, None, true, "parked");
+        assert_eq!(take(&mut b), Some(("parked", Lane::RtParked)), "a parked one takes the place that came free");
+        assert_eq!(take(&mut b), None);
+        b.done(Lane::RtParked);
+        b.done(Lane::RtPass);
+        assert_eq!(b.waiting(), (0, 0));
+        RT_QUEUE_FOR_TEST.with(|c| c.set(None));
     }
 
     /// Only a share of the workers builds heavy pipelines while small ones wait: the rest go on
@@ -1861,9 +2034,9 @@ mod tests {
         let mut b = Backlog::default();
         b.push(100, false, true, 0, None, "c1");
         b.push(100, false, false, 0, None, "g1");
-        b.park(3 << 20, 0, 0, None, "giant");
-        b.park(300 << 10, 0, 0, None, "mid");
-        b.park(600 << 10, 0, 0, None, "big");
+        b.park(3 << 20, 0, 0, None, false, "giant");
+        b.park(300 << 10, 0, 0, None, false, "mid");
+        b.park(600 << 10, 0, 0, None, false, "big");
         assert_eq!(b.waiting(), (5, 3));
         assert!(b.has_parked());
         assert_eq!(b.least_parked(), 300 << 10);
@@ -1883,8 +2056,8 @@ mod tests {
     #[test]
     fn a_parked_build_something_else_took_is_dropped() {
         let mut b = Backlog::default();
-        b.park(300 << 10, 0, 0, None, "taken by a bind");
-        b.park(600 << 10, 0, 0, None, "still waiting");
+        b.park(300 << 10, 0, 0, None, false, "taken by a bind");
+        b.park(600 << 10, 0, 0, None, false, "still waiting");
         assert_eq!(b.pop(4, &[], |p| *p != "taken by a bind", |_| false, |_| false), None);
         assert_eq!(b.waiting(), (1, 1));
         assert_eq!(b.pop(4, &[], |_| true, |_| true, |_| false), Some(("still waiting", Lane::Parked)));
@@ -2104,9 +2277,9 @@ mod tests {
     #[test]
     fn parked_builds_of_a_group_bound_lately_come_back_before_bigger_ones() {
         let mut b = Backlog::default();
-        b.park(900 << 10, 0x61, 0, None, "big, another pass");
-        b.park(600 << 10, 0x62, 0, None, "this pass");
-        b.park(500 << 10, 0x62, 0, None, "this pass, smaller");
+        b.park(900 << 10, 0x61, 0, None, false, "big, another pass");
+        b.park(600 << 10, 0x62, 0, None, false, "this pass");
+        b.park(500 << 10, 0x62, 0, None, false, "this pass, smaller");
         let take = |b: &mut Backlog<&'static str>, recent: &[u64], most: usize| b.pop(4, recent, |_| true, |len| len <= most, |_| false).map(|(p, _)| p);
         assert_eq!(take(&mut b, &[0x62, 0], 1 << 20), Some("this pass"));
         // only what fits: the smaller one of the pass, not the big one of another
@@ -2156,7 +2329,7 @@ mod tests {
         b.promote(promoted);
         assert_eq!(b.pop(4, &[12], |_| true, |_| true, |_| false), Some(("promoted", Lane::Graphics)));
 
-        b.park(700 << 10, 11, promoted, None, "promoted after parking");
+        b.park(700 << 10, 11, promoted, None, false, "promoted after parking");
         b.promote(promoted);
         assert_eq!(b.pop(4, &[12], |_| true, |_| false, |_| false), Some(("hot", Lane::Known)));
         assert_eq!(b.pop(4, &[12], |_| true, |_| false, |_| false), None);
@@ -2167,11 +2340,11 @@ mod tests {
     #[test]
     fn a_parked_peer_uses_the_bind_window_before_unrelated_work() {
         let mut b = Backlog::default();
-        b.park(900 << 10, 10, 1, None, "unrelated");
-        b.park(700 << 10, 20, 2, None, "newest group, older pipeline");
-        b.park(600 << 10, 30, 3, None, "previous group");
-        b.park(800 << 10, 30, 4, None, "previous group, too big");
-        b.park(500 << 10, 20, 5, None, "newest group, newer pipeline");
+        b.park(900 << 10, 10, 1, None, false, "unrelated");
+        b.park(700 << 10, 20, 2, None, false, "newest group, older pipeline");
+        b.park(600 << 10, 30, 3, None, false, "previous group");
+        b.park(800 << 10, 30, 4, None, false, "previous group, too big");
+        b.park(500 << 10, 20, 5, None, false, "newest group, newer pipeline");
         b.push(64, false, false, 20, None, "unparked");
         let pop = |b: &mut Backlog<_>| b.pop(8, &[20, 30], |_| true, |_| false, |len| len <= 700 << 10);
         assert_eq!(pop(&mut b), Some(("newest group, newer pipeline", Lane::ParkedPeer)));
@@ -2187,11 +2360,11 @@ mod tests {
     #[test]
     fn prior_compute_use_orders_only_fitting_work_within_the_current_priority() {
         let mut b = Backlog::default();
-        b.park(950 << 10, 10, 4, Some(0), "earliest, does not fit");
-        b.park(880 << 10, 10, 3, None, "unknown");
-        b.park(600 << 10, 10, 2, Some(2), "second");
-        b.park(500 << 10, 10, 1, Some(1), "first");
-        b.park(400 << 10, 20, 5, Some(8), "recent group");
+        b.park(950 << 10, 10, 4, Some(0), false, "earliest, does not fit");
+        b.park(880 << 10, 10, 3, None, false, "unknown");
+        b.park(600 << 10, 10, 2, Some(2), false, "second");
+        b.park(500 << 10, 10, 1, Some(1), false, "first");
+        b.park(400 << 10, 20, 5, Some(8), false, "recent group");
         let take = |b: &mut Backlog<_>, recent: &[u64]| b.pop(8, recent, |_| true, |len| len <= 900 << 10, |_| false);
         assert_eq!(take(&mut b, &[20]), Some(("recent group", Lane::Parked)));
         assert_eq!(b.pop(8, &[10], |_| true, |_| false, |len| len <= 900 << 10), Some(("first", Lane::ParkedPeer)));
@@ -2358,5 +2531,24 @@ mod tests {
         assert!(at_most(180 * MIB) == GROWTH_CAP && at_most(u64::MAX) == GROWTH_CAP, "the reserve never passes the cap");
         // a 4.3 MB program (expected 14 GB) never fits 2.8 GB, headroom or not
         assert_eq!(admit(&ask(4_300_000, true), &Load::default(), &Room { fall: 0, ..room(2_867 * MIB) }), Verdict::Hold);
+    }
+
+    /// A run short of memory gives up the pipelines nothing bound for the limit, the longest unbound
+    /// first, and never one whose rebuild would compile its shaders again (`XCL_PSO_FREE_IDLE`).
+    #[test]
+    fn a_memory_short_run_frees_what_nothing_bound_and_keeps_what_no_disk_can_build_again() {
+        let mut bound = [(0xAu64, 1_000u64, true), (0xB, 2_000, true), (0xC, 900, false), (0xD, 3_000, true), (0xE, 3_500, false)];
+        // in 6 s every one is old enough; in the order they were last bound that is 0xC, 0xA,
+        // 0xB, 0xD, 0xE, and 0xC and 0xE have nothing on disk
+        let (free, kept) = idle_binds_to_free(&mut bound, 6_000, 1_500, 8);
+        assert_eq!(free, [0xA, 0xB, 0xD], "the longest unbound first, a blob on disk each");
+        assert_eq!(kept, 2, "0xC and 0xE are old enough, but nothing of them would come back from disk");
+        let (free, kept) = idle_binds_to_free(&mut bound, 6_000, 1_500, 2);
+        assert_eq!(free, [0xA, 0xB], "at most `most` in a round");
+        assert_eq!(kept, 2);
+        let (free, kept) = idle_binds_to_free(&mut bound, 6_000, 6_000, 8);
+        assert!(free.is_empty() && kept == 0, "nothing is old enough yet");
+        let (free, _) = idle_binds_to_free(&mut [(0xFu64, 0, true)], 200_000, 1_500, 8);
+        assert_eq!(free, [0xF], "one built and never bound goes too");
     }
 }

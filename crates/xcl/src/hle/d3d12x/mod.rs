@@ -29,12 +29,14 @@ mod depth_lineage;
 mod depth_lineage_queue;
 mod depth_state;
 mod depth_twin_probe;
+mod census;
 mod dsv_trace;
 mod material_gate_views;
 mod material_gate_capture;
 pub mod depth_uav;
 mod e5_copy;
 mod fence_x;
+mod free_policy;
 pub mod frame;
 pub mod guard;
 pub mod layout;
@@ -46,17 +48,25 @@ pub mod present_order;
 pub(crate) mod texture_alias;
 pub mod pso_async;
 mod pass_chain;
+pub(crate) mod fidelityfx;
 mod fsr4_standin;
+mod light_wait;
+mod upscaler;
+mod pso_fail;
 mod pso_canon;
 mod pso_library;
 pub mod pso_manifest;
 pub mod pso_sched;
+mod mesh_attrib;
+mod mesh_pso;
 pub mod real;
 pub mod residency;
+mod residency_priority;
 pub mod warm_children;
 mod warm_peers;
 mod single;
 mod residency_list;
+mod texture_gate;
 pub mod sparse;
 mod external_buffers;
 
@@ -65,6 +75,7 @@ pub(crate) fn placed_buffers_over(va: usize, len: usize) -> Vec<String> {
     external_buffers::placed_over(va, len)
 }
 pub mod raytracing;
+pub mod tex_census;
 pub mod title_gta6;
 mod title_gta6_ambient;
 pub mod title_list;
@@ -76,6 +87,7 @@ mod wait_trace;
 mod live_status;
 pub mod console_status;
 mod submit_watch;
+mod hung_skip;
 mod shader_code;
 mod target_dump;
 

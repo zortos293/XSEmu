@@ -39,6 +39,9 @@ static RTVS: Mutex<Option<HashMap<usize, usize>>> = Mutex::new(None);
 static LISTS: Mutex<Option<HashMap<usize, usize>>> = Mutex::new(None);
 static CANDIDATE: Mutex<Option<(usize, usize)>> = Mutex::new(None); // (queue, resource) – resource AddRef'd
 static PRESENTS: AtomicU64 = AtomicU64::new(0);
+/// When a frame was last presented, in `now_ms` (0: none yet): the background compiles give way
+/// to a title that draws.
+static LAST_PRESENT_MS: AtomicU64 = AtomicU64::new(0);
 static HOST_PRESENTS: AtomicU64 = AtomicU64::new(0);
 static TITLE_PRESENT_CALLS: AtomicU64 = AtomicU64::new(0);
 static HOST_OCCLUDED: AtomicU64 = AtomicU64::new(0);
@@ -79,6 +82,8 @@ unsafe fn present_x_frame(queue: *mut c_void, plane_count: u32, planes: *const u
         super::gpu_timing_waits::boundary(super::gpu_timing::epoch());
     }
     let frames = BOUNDARIES.fetch_add(1, Ordering::Relaxed) + 1;
+    super::census::present(frames);
+    super::depth_uav::probe_frame();
     if frames % 300 == 0 {
         super::dsv_trace::log_frame();
         // the title's frame rate, for comparing runs (every 300 frames)
@@ -225,6 +230,14 @@ pub fn counters() -> (u64, u64) {
     (PRESENTS.load(Ordering::Relaxed), BOUNDARIES.load(Ordering::Relaxed))
 }
 
+/// How long ago the last frame was presented (`None`: none yet). A title that presents is drawing
+/// now, however slowly, and the background compiles give way to it (`pso_async::pace`).
+#[cfg(not(test))]
+pub fn since_present() -> Option<std::time::Duration> {
+    let at = LAST_PRESENT_MS.load(Ordering::Relaxed);
+    (at != 0).then(|| std::time::Duration::from_millis(now_ms().saturating_sub(at)))
+}
+
 fn enabled() -> bool {
     !crate::state::config().present.eq_ignore_ascii_case("off")
 }
@@ -276,6 +289,13 @@ pub fn note_use(res: usize, what: usize) {
 
 /// resources the title presented
 static PRESENTED: Mutex<Vec<usize>> = Mutex::new(Vec::new());
+
+/// Whether the title has presented a frame: the preload's memory floor applies from then on
+/// (pso_sched::preload_floor), so the compiles made ahead of the title's first frame are not
+/// held back by the RAM the title will need later.
+pub fn title_presents() -> bool {
+    PRESENTX.load(Ordering::Relaxed)
+}
 
 pub fn is_presented(res: usize) -> bool {
     PRESENTED.lock().unwrap().contains(&res)
@@ -664,6 +684,7 @@ pub fn on_queue_console_method(_info: &StubInfo, _caller: usize) {
     }
     BOUNDARIES.fetch_add(1, Ordering::Relaxed);
     LAST_BOUNDARY_MS.store(now_ms(), Ordering::Relaxed);
+    super::depth_uav::probe_frame();
     unsafe { present_now(Duration::from_millis(4), None) };
 }
 
@@ -689,6 +710,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             crate::control::exit(0, "stopped", "");
             flush_frame_dumps();
             crate::report::write_final(None);
+            crate::hle::xgameruntime::gamesave::settle_for_exit();
             crate::log::flush();
             windows::Win32::System::Threading::ExitProcess(0);
         }
@@ -1830,6 +1852,7 @@ unsafe fn present_now(min_interval: Duration, frame: Option<(usize, &[(usize, Op
     }
     p.last = Instant::now();
     PRESENTS.fetch_add(1, Ordering::Relaxed);
+    LAST_PRESENT_MS.store(now_ms(), Ordering::Relaxed);
     crate::control::note_present();
     if let Some(slot) = timed_capture {
         NEXT_PLANE_CAPTURE.store(slot + 1, Ordering::Relaxed);

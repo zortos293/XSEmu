@@ -47,13 +47,28 @@
 //! clears and copies say it): until it is known the copy waits for a later use, on a later list
 //! too (a list that closes leaves the side ahead with the shadow). Bundles take no part.
 //!
+//! A use by a draw or dispatch is found in its unordered access tables, and a table names a
+//! shadow only when the mapping from each view slot to its resource is kept: a plain run keeps
+//! that for no one, so the sync above sees no use at all. `XCL_DEPTH_UAV_OWNERS=1` keeps that
+//! mapping, and with it a shadow no copy ever reached is copied from the plane before a draw or
+//! dispatch is said to use it (off by default: an entry per view slot, and the copies the sync
+//! then records are work the run does not do today). A use of a shadow that needed the plane and
+//! did not get a copy of it says nothing of the plane: the model is left as it was rather than
+//! told the shadow's side is the one ahead.
+//!
+//! `XCL_SHADOW_PROBE=1`: once a frame, a line for each shadow texture a shader pass sampled that
+//! frame – its number and size, the copies it received and sent back, the depth plane's last
+//! clear value and the pass that sampled it (`probe_frame`). It keeps a mapping of its own from a
+//! view slot to its resource (`probe_slot`), so it watches a run as that run is, without the
+//! mapping `XCL_DEPTH_UAV_OWNERS` keeps.
+//!
 //! `XCL_DEPTH_UAV_TWIN=0` (upstream's name): no shadows, null views as before.
 
 use std::collections::HashMap;
 use std::collections::hash_map::Entry;
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 
 use windows::core::Interface;
 use windows::Win32::Foundation::RECT;
@@ -115,6 +130,8 @@ const VIEW_MIPS: u32 = 2;
 /// The shadow of one depth buffer.
 pub(super) struct Shadow {
     texture: ID3D12Resource,
+    /// its number, in the order shadows were made (the probe's index)
+    index: u64,
     /// kept for the descriptors below
     _views: ID3D12DescriptorHeap,
     _targets: ID3D12DescriptorHeap,
@@ -136,6 +153,9 @@ pub(super) struct Shadow {
     exact: bool,
     /// subresources whose copy back a list that cannot draw left to a direct list
     owed: Mutex<Vec<u32>>,
+    /// copies the shadow received from the depth plane, and sent back to it
+    copies_in: AtomicU64,
+    copies_out: AtomicU64,
     /// a copy back was recorded: the title drew or dispatched while it had the depth buffer
     /// in unordered access
     written: AtomicBool,
@@ -364,8 +384,9 @@ unsafe fn shadow_of(res: *mut c_void, rd: &D3D12_RESOURCE_DESC) -> Option<Arc<Sh
     }
     let made = if enabled() { make(res, rd) } else { Err("XCL_DEPTH_UAV_TWIN=0".into()) };
     let shadow = match made {
-        Ok(s) => {
+        Ok(mut s) => {
             let n = MADE.fetch_add(1, Ordering::Relaxed) + 1;
+            s.index = n;
             if n <= 32 || n.is_power_of_two() {
                 crate::xlog_info!(
                     "D3D12.X: depth buffer {}x{} ({} slices, {} mips, format {}{}) with unordered access: views of it go to shadow texture #{n} (format {}), copied from and to the depth plane at the title's transitions ({})",
@@ -489,6 +510,8 @@ unsafe fn make(res: *mut c_void, rd: &D3D12_RESOURCE_DESC) -> Result<Shadow, Str
             targets_cpu,
             targets_step,
             texture,
+            // numbered by the caller that counts it (`shadow_of`)
+            index: 0,
             _views: views,
             _targets: targets,
             width: rd.Width as u32,
@@ -501,6 +524,8 @@ unsafe fn make(res: *mut c_void, rd: &D3D12_RESOURCE_DESC) -> Result<Shadow, Str
             view_format,
             exact: rd.Format == typeless,
             owed: Mutex::new(Vec::new()),
+            copies_in: AtomicU64::new(0),
+            copies_out: AtomicU64::new(0),
             written: AtomicBool::new(false),
             ahead: AtomicU8::new(Ahead::Neither as u8),
         })
@@ -680,6 +705,7 @@ fn mark_in_step(list: *mut c_void, res: usize, sub: u32) {
 
 /// PC `Dispatch` of an adopted list (XCL's own calls of it for the title's dispatches).
 pub(super) unsafe extern "system" fn pc_dispatch(this: *mut c_void, x: u32, y: u32, z: u32) {
+    super::census::dispatch(this as usize, [x, y, z]);
     note_op(this);
     super::image_writeback::note_work(this);
     let f = raw::<unsafe extern "system" fn(*mut c_void, u32, u32, u32)>(this, DISPATCH);
@@ -689,6 +715,7 @@ pub(super) unsafe extern "system" fn pc_dispatch(this: *mut c_void, x: u32, y: u
 /// PC `ClearDepthStencilView` of an adopted list.
 pub(super) unsafe extern "system" fn pc_clear_depth_stencil(this: *mut c_void, dsv: usize, flags: u32, depth: f32, stencil: u8, n: u32, rects: *const RECT) {
     on_clear(this, dsv, flags);
+    probe_clear(dsv, flags, depth);
     note_op(this);
     let f = raw::<unsafe extern "system" fn(*mut c_void, usize, u32, f32, u8, u32, *const RECT)>(this, CLEAR_DEPTH_STENCIL_VIEW);
     super::gpu_timing::class(this, super::gpu_timing::Kind::Clear, || f(this, dsv, flags, depth, stencil, n, rects));
@@ -872,6 +899,7 @@ unsafe fn copy_in_exact(list: *mut c_void, s: &Shadow, depth: usize, sub: u32) -
     barriers(list, &[transition(depth, sub, COPY_SOURCE, SHADER_READ), transition(t, sub, COPY_DEST, UNORDERED_ACCESS)]);
     super::list_x::after_own_pass(list, false, predicated);
     COPIES_IN.fetch_add(1, Ordering::Relaxed);
+    s.copies_in.fetch_add(1, Ordering::Relaxed);
     Ok(())
 }
 
@@ -907,6 +935,7 @@ unsafe fn copy_in(list: *mut c_void, s: &Shadow, runs: &[(u32, u32, u32)]) -> Re
     barriers(list, &[[2, 0, t as u32, (t as u64 >> 32) as u32, 0, 0, 0, 0]]);
     super::list_x::after_own_pass(list, false, predicated);
     COPIES_IN.fetch_add(1, Ordering::Relaxed);
+    s.copies_in.fetch_add(1, Ordering::Relaxed);
     Ok(())
 }
 
@@ -922,6 +951,7 @@ fn out_state(s: &Shadow) -> u32 {
 /// A copy back is recorded.
 fn copied_out(s: &Shadow) {
     COPIES_OUT.fetch_add(1, Ordering::Relaxed);
+    s.copies_out.fetch_add(1, Ordering::Relaxed);
     if !s.written.swap(true, Ordering::Relaxed) {
         let n = WRITTEN.fetch_add(1, Ordering::Relaxed) + 1;
         crate::xlog_info!("D3D12.X: depth buffer {}x{} ({} slices, {} mips): the first copy of its shadow texture back to the depth plane ({n} depth buffers written back so far)", s.width, s.height, s.slices, s.mips);
@@ -1374,7 +1404,7 @@ fn dsv_view(handle: usize) -> Option<Dsv> {
 /// The title makes the depth-stencil view `desc` (None: the default one) of `res` at `handle`
 /// (`real::dev_create_dsv_x`).
 pub(super) unsafe fn note_dsv(handle: usize, res: *mut c_void, desc: Option<&D3D12_DEPTH_STENCIL_VIEW_DESC>) {
-    if !sync() {
+    if !sync() && !probe() {
         return;
     }
     let view = (|| {
@@ -1458,13 +1488,15 @@ unsafe fn copy_to(list: *mut c_void, ty: D3D12_COMMAND_LIST_TYPE, depth: usize, 
 
 /// A command about to be recorded on `list` uses `side` of the shadow `s` of `depth`, changing
 /// it (`write`) or not; for it the depth plane's subresources `subs` are in `state` (None: as
-/// the list left them). The side used is first copied from the other when that is ahead.
+/// the list left them). The side used is first copied from the other when that is ahead – and a
+/// shadow no copy ever reached (it holds nothing of the plane) is copied from the plane first,
+/// whatever the model says of it.
 unsafe fn use_side(list: *mut c_void, depth: usize, s: &Arc<Shadow>, side: Side, write: bool, subs: &[u32], state: Option<u32>) {
     let ty = list_type(list);
     if !matches!(ty, D3D12_COMMAND_LIST_TYPE_DIRECT | D3D12_COMMAND_LIST_TYPE_COMPUTE) {
         return;
     }
-    let states = {
+    let (behind, states) = {
         let mut g = RECORDINGS.lock().unwrap();
         let u = recording(&mut g, list).use_of(depth, s);
         if let Some(st) = state {
@@ -1474,7 +1506,8 @@ unsafe fn use_side(list: *mut c_void, depth: usize, s: &Arc<Shadow>, side: Side,
                 }
             }
         }
-        side.behind(u.ahead).then(|| u.states.clone())
+        let behind = side.behind(u.ahead) || (side == Side::Shadow && s.copies_in.load(Ordering::Relaxed) == 0);
+        (behind, behind.then(|| u.states.clone()))
     };
     let copied = states.is_some_and(|st| copy_to(list, ty, depth, s, side, &st).is_ok());
     if copied {
@@ -1482,7 +1515,11 @@ unsafe fn use_side(list: *mut c_void, depth: usize, s: &Arc<Shadow>, side: Side,
     }
     let mut g = RECORDINGS.lock().unwrap();
     let u = recording(&mut g, list).use_of(depth, s);
-    u.ahead = side.after(u.ahead, write, copied);
+    // a use of the shadow that needed the plane and did not get it says nothing of the plane:
+    // what the shadow holds is not known to be the plane's
+    if side != Side::Shadow || !behind || copied {
+        u.ahead = side.after(u.ahead, write, copied);
+    }
 }
 
 /// The depth buffers with shadows whose unordered access views the tables of `layout` name in
@@ -1536,6 +1573,197 @@ pub(super) unsafe fn before_op(list: *mut c_void, graphics: bool, layout: Option
     let Some(layout) = layout else { return };
     for (depth, s) in named_shadows(layout, args) {
         use_side(list, depth, &s, Side::Shadow, true, &[], None);
+    }
+}
+
+// ---------------------------------------------------------------------------------------
+// the probe (`XCL_SHADOW_PROBE`)
+// ---------------------------------------------------------------------------------------
+
+/// shadow textures a frame's passes are reported for, lines a frame prints of them, and view
+/// slots whose resource is remembered
+const PROBE_SHADOWS: usize = 512;
+const PROBE_LINES: usize = 6;
+const PROBE_OWNERS: usize = 4096;
+/// descriptor slots a pass's tables are scanned for, and of one table
+const PROBE_SLOTS: u32 = 256;
+const PROBE_TABLE_SLOTS: u32 = 64;
+
+/// Whether the probe runs (`XCL_SHADOW_PROBE=1`).
+fn probe() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = std::env::var("XCL_SHADOW_PROBE").is_ok_and(|v| v.trim() == "1");
+        if on {
+            crate::xlog_info!(
+                "D3D12.X: shadow probe on (XCL_SHADOW_PROBE=1): once a frame, a line for each shadow texture a shader pass sampled, with the copies it received and sent back, the depth plane's clear value and the pass that sampled it (a depth buffer a pass names in a root descriptor instead of a table is not seen)"
+            );
+        }
+        on
+    })
+}
+
+/// Whether the mapping from each view slot to its resource is kept for the use-based sync
+/// (`XCL_DEPTH_UAV_OWNERS=1`): without it `named_shadows` resolves no depth buffer, and no draw
+/// or dispatch counts as a use of a shadow (so nothing is copied in or back by use).
+pub(super) fn sync_owners() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = std::env::var("XCL_DEPTH_UAV_OWNERS").is_ok_and(|v| v.trim() == "1");
+        if on {
+            crate::xlog_info!(
+                "D3D12.X: depth-UAV shadows kept in step by use, with the mapping from each view slot to its resource (XCL_DEPTH_UAV_OWNERS=1; XCL_DEPTH_UAV_SYNC=0 turns the copies off again)"
+            );
+        }
+        on
+    })
+}
+
+/// Of one shadow a frame's passes sampled: how, by which pass first, and how often.
+struct Sampled {
+    shadow: Weak<Shadow>,
+    depth: usize,
+    via: &'static str,
+    pass: String,
+    calls: u64,
+}
+
+static PROBE: Mutex<Option<HashMap<usize, Sampled>>> = Mutex::new(None);
+/// the view slot → the resource its view was made of (`probe_slot`)
+static PROBED: Mutex<Option<HashMap<usize, usize>>> = Mutex::new(None);
+/// the last depth clear value the title gave each depth buffer
+static PROBE_CLEARS: Mutex<Option<HashMap<usize, f32>>> = Mutex::new(None);
+
+/// The view in the slot at `at` names `res` (`console_heap::note_resource`): from here on, a pass
+/// whose tables hold that slot sampled the shadow of `res`.
+pub(super) fn probe_slot(at: usize, res: usize) {
+    if !probe() || known(res).is_none() {
+        return;
+    }
+    let mut g = PROBED.lock().unwrap();
+    let m = g.get_or_insert_with(HashMap::new);
+    if m.len() < PROBE_OWNERS || m.contains_key(&at) {
+        m.insert(at, res);
+    }
+}
+
+/// The depth buffers the descriptor tables of `layout` name in `args`, and the view each is
+/// named through (its unordered access view, or a shader view of it) – the candidates for a
+/// shadow; `probe_op` keeps those that have one.
+fn probe_slots(layout: &super::console_list::Layout, args: &[u8]) -> Vec<(usize, &'static str)> {
+    let mut out: Vec<(usize, &'static str)> = Vec::new();
+    let Some(u) = crate::gpu::uma::get() else { return out };
+    let owners = PROBED.lock().unwrap();
+    let Some(owners) = owners.as_ref() else { return out };
+    let mut left = PROBE_SLOTS;
+    for (k, p) in layout.params.iter().enumerate() {
+        let super::console_list::Param::Table { at } = *p else { continue };
+        let Some(bytes) = args.get(at as usize..at as usize + 4) else { continue };
+        let table = u32::from_le_bytes(bytes.try_into().unwrap());
+        if table == 0 {
+            continue;
+        }
+        let n = layout.tables.get(k).copied().unwrap_or(0).min(left).min(PROBE_TABLE_SLOTS);
+        left -= n;
+        for i in 0..n {
+            let addr = table.wrapping_add(super::console_heap::SLOT.wrapping_mul(i));
+            let Some(s) = super::console_heap::lookup((u.base() + addr as usize) as u64) else { break };
+            if s.sampler {
+                continue;
+            }
+            let w = unsafe { (s.at as *const [u32; 8]).read_unaligned() };
+            let ty = w[3] >> 28;
+            // buffer, constant and sampler slots are no image descriptor
+            if ty < 4 {
+                continue;
+            }
+            let Some(&res) = owners.get(&s.at) else { continue };
+            if out.iter().any(|&(d, _)| d == res) {
+                continue;
+            }
+            out.push((res, if ty >= 8 { "a UAV" } else { "a shader view" }));
+        }
+        if left == 0 {
+            break;
+        }
+    }
+    out
+}
+
+/// A draw or dispatch of `pso` (`call`) about to be recorded with the root arguments `args` of
+/// `layout`: the shadows of the depth buffers its tables name are what it samples this frame.
+pub(super) fn probe_op(pso: usize, call: &'static str, layout: Option<&super::console_list::Layout>, args: &[u8]) {
+    let Some(layout) = layout.filter(|_| probe() && active()) else { return };
+    let named = probe_slots(layout, args);
+    if named.is_empty() {
+        return;
+    }
+    let shadows: Vec<(usize, Arc<Shadow>, &'static str)> = {
+        let g = SHADOWS.lock().unwrap();
+        let Some(m) = g.as_ref() else { return };
+        named.into_iter().filter_map(|(res, via)| m.get(&res).and_then(|s| s.as_ref()).map(|s| (res, s.clone(), via))).collect()
+    };
+    if shadows.is_empty() {
+        return;
+    }
+    let pass = match super::real::pso_name(pso) {
+        Some(name) => format!("\"{name}\" ({call})"),
+        None => format!("an unnamed pipeline ({call})"),
+    };
+    let mut g = PROBE.lock().unwrap();
+    let m = g.get_or_insert_with(HashMap::new);
+    for (depth, s, via) in shadows {
+        let twin = s.texture.as_raw() as usize;
+        if m.len() >= PROBE_SHADOWS && !m.contains_key(&twin) {
+            continue;
+        }
+        let e = m.entry(twin).or_insert_with(|| Sampled { shadow: Arc::downgrade(&s), depth, via, pass: pass.clone(), calls: 0 });
+        e.calls += 1;
+    }
+}
+
+/// The title clears the depth-stencil view `handle` with `depth` (`flags` 1: the depth plane):
+/// the value the probe reports for that depth buffer.
+pub(super) fn probe_clear(handle: usize, flags: u32, depth: f32) {
+    if !probe() || flags & 1 == 0 {
+        return;
+    }
+    let Some(d) = dsv_view(handle) else { return };
+    PROBE_CLEARS.lock().unwrap().get_or_insert_with(HashMap::new).insert(d.depth, depth);
+}
+
+/// A frame was presented: what its passes sampled of each shadow, one line each
+/// (`XCL_SHADOW_PROBE`).
+pub(super) fn probe_frame() {
+    if !probe() {
+        return;
+    }
+    let Some(sampled) = PROBE.lock().unwrap().take() else { return };
+    let clears = PROBE_CLEARS.lock().unwrap();
+    let mut entries: Vec<(usize, Sampled)> = sampled.into_iter().collect();
+    entries.sort_by_key(|e| e.0);
+    let total = entries.len();
+    let mut shown = 0usize;
+    for (twin, s) in entries {
+        if shown >= PROBE_LINES {
+            break;
+        }
+        let Some(shadow) = s.shadow.upgrade() else { continue };
+        shown += 1;
+        let clear = clears.as_ref().and_then(|m| m.get(&s.depth)).map_or_else(|| "none recorded".to_string(), |&v| format!("{v:.6}"));
+        let ahead = match Ahead::of(shadow.ahead.load(Ordering::Relaxed)) {
+            Ahead::Shadow => "the shadow texture",
+            Ahead::Plane => "the depth plane",
+            Ahead::Neither => "neither side",
+        };
+        crate::xlog_info!(
+            "D3D12.X: shadow probe: shadow #{} {twin:#x} {}x{} ({} slices, {} mips, format {}) sampled {} time(s) this frame through {}, by {}; {} copies in, {} back; plane clear {clear}; the model has {ahead} ahead",
+            shadow.index, shadow.width, shadow.height, shadow.slices, shadow.mips, shadow.depth_format.0,
+            s.calls, s.via, s.pass, shadow.copies_in.load(Ordering::Relaxed), shadow.copies_out.load(Ordering::Relaxed),
+        );
+    }
+    if total > shown {
+        crate::xlog_info!("D3D12.X: shadow probe: {} more shadow texture(s) sampled this frame, not listed", total - shown);
     }
 }
 

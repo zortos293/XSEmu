@@ -27,10 +27,18 @@ instead of a compute shader:
 
 - exp pos / exp param / exp prim write per-thread locals (lane n of the group exports vertex n
   and primitive n, as the hardware NGG stage does);
-- s_sendmsg GS_ALLOC_REQ (M0 = primitives << 12 | vertices) stores the counts in groupshared;
-- at the end of main, after one group barrier, every thread calls SetMeshOutputCounts with
-  those counts (the call dominates every output write, as DXIL validation requires) and writes
-  its own vertex and primitive;
+- a group of several console waves gives a host wave its console wave from an LDS ticket: a
+  counter each host wave's first lane increments once when the group starts, so `gi / 32` (which
+  a host need not align to waves: NVIDIA fills 2-D groups from 16 x 2 tiles) is not used
+  (VIctory-NVIDIA 854f57f, Vice-Tay c125c0c);
+- s_sendmsg GS_ALLOC_REQ (M0 = primitives << 12 | vertices) sets the counts of the wave that
+  sent it (the lane the console lets send, then lane 0 of that wave). The console's request is
+  the group's, so after the program every wave adds its counts (0 for a wave with no request) to
+  two groupshared dwords;
+- after a group barrier every thread calls SetMeshOutputCounts with the group's counts (D3D12
+  takes the values of the group's first active thread, which is the console thread that sent the
+  request), and after a second barrier writes its own vertex and primitive, at its own console
+  thread index;
 - a null primitive (bit 31 of the export) or one with an index past the vertex count becomes
   the degenerate triangle (0, 0, 0): the console culls with the primitive export only;
 - the output struct is the one the pass-through declares (what the translated pixel shader
@@ -51,13 +59,27 @@ instead of a compute shader:
 
 | limit | why | how common here |
 |---|---|---|
-| the host's wave size is not fixed at 32 | HLSL has no WaveSize for mesh shaders; the translation needs waves it knows (wave64 programs run as two 32-lane halves, docs/wave64-on-wave32.md). NVIDIA reports 32..32. AMD (32..64) and Intel pick per shader | never on the RTX 3080 |
+| the group spans more than one console wave | the native form packs one console wave into one 32-lane host wave, so it accepted a group of one console wave only: at most 32 threads for a wave32 program, 64 for a wave64 one. A host group can hold several waves, and `XCL_MESH_MULTI_WAVE=1` gives a group of two or more console waves one mesh shader (`pso::mesh_native_host_threads`). Off by default | every mesh program of this title, whose groups are 128 threads (two console waves). play-124 ran 0 native and 417 two-pass pipelines and 431,054 two-pass calls; play-125 ran 0 native and 3,119,263 two-pass calls. The fallback line said so each time: "the group has more than one console wave" |
+| the host's wave size is not fixed at 32 | HLSL has no WaveSize for mesh shaders; the translation needs waves it knows (wave64 programs run as two 32-lane halves, docs/wave64-on-wave32.md). NVIDIA reports 32..32. AMD (32..64) and Intel pick per shader | never on the RTX 3080, which reports 32..32. This limit did not cause the fallback there |
 | more than 15 pixel-shader inputs | every input is a float4 in the link signature: 16 B x (1 + n) x 128 vertices must fit D3D12's 32 KB mesh output limit; the pass-through splits such records over several mesh groups, a native shader cannot | at most 69 of 1,831 programs (17+ outputs) |
 | the program uses LDS | xcl_lds is 32 KB, the mesh stage allows 28 KB of groupshared | 2 of 1,831 |
 | more than 128 hardware lanes (vertices or primitives > 128) | a host mesh group has at most 128 threads | none |
 | DXC or the driver rejects the mesh shader | - | not seen |
 
 XCL_MESH=two-pass forces the fallback (A/B runs, and how the fallback is tested on the RTX).
+
+Until `XCL_MESH_MULTI_WAVE=1`, the RTX 3080 ran every mesh pipeline in two passes: the wave-size
+condition held, the group-width condition did not. The native tests use a one-console-wave
+program, so they passed on that card while the title's two-wave groups fell back.
+
+## Driver pipelines per pair
+
+A pair costs one driver pipeline as a host mesh shader and two in the fallback, the raster pass
+and the compute pass. The depth prepass record observer adds one, or two with its paired
+program, and no ordinary run builds it.
+`hle::d3d12x::mesh_pso::mesh_pipelines` is that list: the build lines print its count, and the
+caches line reports `mesh pipelines: N native, M two-pass, K driver compiles`, where K counts the
+creates that reached the driver and leaves out a kept blob or a pipeline library hit.
 
 ## Fallback: two passes
 

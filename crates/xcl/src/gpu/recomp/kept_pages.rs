@@ -66,7 +66,7 @@ fn reaching(insts: &[Decoded], succ: &[Option<Vec<usize>>], exits: &[Vec<Option<
     // hundreds of bases and tens of thousands of instructions, nearly all of them read once
     let mut due = vec![true; insts.len()];
     let mut out = vec![0u64; words];
-    let mut join = |before: &mut [u64], due: &mut [bool], to: usize, from: &[u64]| {
+    let join = |before: &mut [u64], due: &mut [bool], to: usize, from: &[u64]| {
         for (t, f) in before[to * words..][..words].iter_mut().zip(from) {
             due[to] |= *t | *f != *t;
             *t |= *f;

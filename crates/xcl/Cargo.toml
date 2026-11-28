@@ -5,12 +5,18 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[features]
+# The build handed to players (`--features production`, with `[profile.production]` in the
+# workspace manifest): the diagnostics that are on by default in an alpha build are off here, and
+# the allocator is the system's. An alpha build carries the feature not at all and is unchanged.
+production = []
+
 [lib]
 name = "xcl"
 path = "src/lib.rs"
 
 [[bin]]
-name = "XSEmu"
+name = "xcl"
 path = "src/main.rs"
 
 [dependencies]

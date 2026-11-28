@@ -2,17 +2,27 @@
 pub(crate) enum Binding {
     Vertex { slot: u32, bytes: u32, stride: u32 },
     Index { bytes: u32, format: i32 },
+    // Native-buffer recipe resolution has no caller yet; kept for the next fix.
+    #[allow(dead_code)]
     RootCbv(u32),
+    // Native-buffer recipe resolution has no caller yet; kept for the next fix.
+    #[allow(dead_code)]
     RootSrv(u32),
+    // Native-buffer recipe resolution has no caller yet; kept for the next fix.
+    #[allow(dead_code)]
     RootUav(u32),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+// Native-buffer recipe resolution has no caller yet; kept for the next fix.
+#[allow(dead_code)]
 pub(crate) enum Access {
     Read,
     Write,
 }
 
+// Native-buffer recipe resolution has no caller yet; kept for the next fix.
+#[allow(dead_code)]
 pub(crate) struct Run<L> {
     pub(crate) identity: usize,
     pub(crate) native_base: u64,
@@ -22,6 +32,8 @@ pub(crate) struct Run<L> {
     pub(crate) lease: L,
 }
 
+// Native-buffer recipe resolution has no caller yet; kept for the next fix.
+#[allow(dead_code)]
 pub(crate) fn direct_runs<L>(
     cover_bytes: u64,
     access: Access,
@@ -65,6 +77,8 @@ pub(crate) struct Address {
 }
 
 impl Address {
+    // Native-buffer recipe resolution has no caller yet; kept for the next fix.
+    #[allow(dead_code)]
     pub(crate) fn access(self) -> Access {
         if matches!(self.binding, Binding::RootUav(_)) {
             Access::Write
@@ -79,6 +93,8 @@ impl Address {
             _ => None,
         }
     }
+    // Native-buffer recipe resolution has no caller yet; kept for the next fix.
+    #[allow(dead_code)]
     pub(crate) fn resolve<L>(
         self,
         resolver: &mut impl FnMut(Self) -> Option<Resolved<L>>,
@@ -108,12 +124,16 @@ enum FieldKind {
 }
 
 #[derive(Clone, Debug)]
+// Native-buffer recipe resolution has no caller yet; kept for the next fix.
+#[allow(dead_code)]
 pub(crate) struct Layout {
     fields: Vec<(usize, FieldKind)>,
     stride: usize,
 }
 
 impl Layout {
+    // Native-buffer recipe resolution has no caller yet; kept for the next fix.
+    #[allow(dead_code)]
     pub(crate) fn embeds_addresses(&self) -> bool {
         !self.fields.is_empty()
     }
@@ -169,6 +189,8 @@ impl Layout {
         n.checked_mul(self.stride)
     }
 
+    // Native-buffer recipe resolution has no caller yet; kept for the next fix.
+    #[allow(dead_code)]
     pub(crate) fn records<'a>(
         &self,
         max: u32,
@@ -179,6 +201,8 @@ impl Layout {
         Some(after_writers.get(..needed)?.chunks(self.stride))
     }
 
+    // Native-buffer recipe resolution has no caller yet; kept for the next fix.
+    #[allow(dead_code)]
     pub(crate) fn materialize<L>(
         &self,
         source: &[u8],
@@ -215,12 +239,16 @@ impl Layout {
     }
 }
 
+// Native-buffer recipe resolution has no caller yet; kept for the next fix.
+#[allow(dead_code)]
 pub(crate) enum Resolved<L> {
     Canonical { native: u64, lease: L },
     Gathered { native: u64, bytes: u32, lease: L },
 }
 
 impl<L> Resolved<L> {
+    // Native-buffer recipe resolution has no caller yet; kept for the next fix.
+    #[allow(dead_code)]
     pub(crate) fn binding(self, binding: Binding) -> Option<(u64, L)> {
         let (native, lease) = match (self, binding) {
             (Self::Canonical { native, lease }, _) => (native, lease),
@@ -243,6 +271,8 @@ impl<L> Resolved<L> {
             .then_some((native, lease))
     }
 }
+// Native-buffer recipe resolution has no caller yet; kept for the next fix.
+#[allow(dead_code)]
 pub(crate) struct Materialized<L> {
     pub(crate) record: Vec<u8>,
     pub(crate) leases: Vec<L>,

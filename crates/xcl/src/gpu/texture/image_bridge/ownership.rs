@@ -5,16 +5,24 @@ use std::sync::{Arc, LazyLock, Mutex};
 use crate::gpu::physical_binding::BindingIndex;
 use crate::gpu::physical_binding::{PageKey, PinnedPage};
 
+// Image-bridge page ownership is not consulted yet; kept for the next fix.
+#[allow(dead_code)]
 const PAGE: u64 = 65536;
+// Image-bridge page ownership is not consulted yet; kept for the next fix.
+#[allow(dead_code)]
 type Result<T> = std::result::Result<T, &'static str>;
 
 #[derive(Clone, Copy)]
+// Image-bridge page ownership is not consulted yet; kept for the next fix.
+#[allow(dead_code)]
 pub(crate) enum Location {
     Physical { uav: u32, offset: u32 },
     Uma { uav: u32, offset: u32 },
     Native { guest_page: u64 },
 }
 
+// Image-bridge page ownership is not consulted yet; kept for the next fix.
+#[allow(dead_code)]
 pub(crate) struct CapturedTopology {
     id: u64,
     first: u32,
@@ -22,6 +30,8 @@ pub(crate) struct CapturedTopology {
 }
 
 #[derive(Clone, Copy, Debug)]
+// Image-bridge page ownership is not consulted yet; kept for the next fix.
+#[allow(dead_code)]
 pub(crate) enum PayloadEvidence {
     MetadataFreeRawAtUse,
     MetadataFreeFullTypedOverwriteFromBinary16,
@@ -32,6 +42,8 @@ pub(crate) enum PayloadEvidence {
 }
 
 impl CapturedTopology {
+    // Image-bridge page ownership is not consulted yet; kept for the next fix.
+    #[allow(dead_code)]
     pub(super) fn resolve(
         id: u64,
         first: u32,
@@ -63,16 +75,24 @@ impl CapturedTopology {
         Ok(Self { id, first, cells })
     }
 
+    // Image-bridge page ownership is not consulted yet; kept for the next fix.
+    #[allow(dead_code)]
     pub(crate) fn capture_id(&self) -> u64 {
         self.id
     }
+    // Image-bridge page ownership is not consulted yet; kept for the next fix.
+    #[allow(dead_code)]
     pub(crate) fn first_vpn(&self) -> u32 {
         self.first
     }
+    // Image-bridge page ownership is not consulted yet; kept for the next fix.
+    #[allow(dead_code)]
     pub(crate) fn len(&self) -> usize {
         self.cells.len()
     }
 
+    // Image-bridge page ownership is not consulted yet; kept for the next fix.
+    #[allow(dead_code)]
     fn span(&self, request: &mut Request, mut lo: u64, hi: u64) -> Result<()> {
         if lo >= hi || hi > self.cells.len() as u64 * PAGE {
             return Err("image or raw range outside capture");
@@ -96,6 +116,8 @@ impl CapturedTopology {
         Ok(())
     }
 
+    // Image-bridge page ownership is not consulted yet; kept for the next fix.
+    #[allow(dead_code)]
     pub(crate) fn raw_request(&self, byte_offset: u64, bytes: u64, write: bool) -> Result<Request> {
         let mut r = Request {
             image: None,
@@ -111,6 +133,8 @@ impl CapturedTopology {
         Ok(r)
     }
 
+    // Image-bridge page ownership is not consulted yet; kept for the next fix.
+    #[allow(dead_code)]
     pub(super) fn image_request(
         &self,
         native: usize,
@@ -194,6 +218,8 @@ impl CapturedTopology {
 }
 
 #[derive(Clone)]
+// Image-bridge page ownership is not consulted yet; kept for the next fix.
+#[allow(dead_code)]
 struct Claim {
     page: Arc<PinnedPage>,
     vpn: u32,
@@ -201,6 +227,8 @@ struct Claim {
     hi: u32,
 }
 
+// Image-bridge page ownership is not consulted yet; kept for the next fix.
+#[allow(dead_code)]
 pub(crate) struct Request {
     image: Option<(u64, usize, u32)>,
     host: Option<HostBacking>,
@@ -245,6 +273,8 @@ impl HostBacking {
             end: end as u64,
         }
     }
+    // Image-bridge page ownership is not consulted yet; kept for the next fix.
+    #[allow(dead_code)]
     fn overlaps(self, b: Self) -> bool {
         self.kind != 0
             && self.kind == b.kind
@@ -255,6 +285,8 @@ impl HostBacking {
 }
 
 impl Request {
+    // Image-bridge page ownership is not consulted yet; kept for the next fix.
+    #[allow(dead_code)]
     fn compact(&mut self) {
         self.claims.sort_unstable_by_key(|c| (c.vpn, c.lo));
         self.claims.dedup_by(|b, a| {
@@ -269,6 +301,8 @@ impl Request {
 }
 
 #[derive(Clone, Copy)]
+// Image-bridge page ownership is not consulted yet; kept for the next fix.
+#[allow(dead_code)]
 struct Held {
     lo: u32,
     hi: u32,
@@ -279,11 +313,15 @@ struct Held {
 }
 
 impl Held {
+    // Image-bridge page ownership is not consulted yet; kept for the next fix.
+    #[allow(dead_code)]
     fn conflicts(self, other: Self) -> bool {
         (self.write || other.write) && self.lo < other.hi && other.lo < self.hi
     }
 }
 
+// Image-bridge page ownership is not consulted yet; kept for the next fix.
+#[allow(dead_code)]
 struct Lease {
     keys: Vec<PageKey>,
     native: BTreeSet<usize>,
@@ -292,6 +330,8 @@ struct Lease {
 }
 
 #[derive(Default)]
+// Image-bridge page ownership is not consulted yet; kept for the next fix.
+#[allow(dead_code)]
 struct State {
     next: u64,
     by_page: HashMap<PageKey, Vec<Held>>,
@@ -300,8 +340,12 @@ struct State {
 }
 
 #[derive(Clone)]
+// Image-bridge page ownership is not consulted yet; kept for the next fix.
+#[allow(dead_code)]
 pub(crate) struct Ownership(Arc<Mutex<State>>);
 
+// Image-bridge page ownership is not consulted yet; kept for the next fix.
+#[allow(dead_code)]
 pub(crate) struct WritePermit {
     book: Ownership,
     id: u64,
@@ -310,13 +354,19 @@ pub(crate) struct WritePermit {
 }
 
 impl Ownership {
+    // Image-bridge page ownership is not consulted yet; kept for the next fix.
+    #[allow(dead_code)]
     pub(crate) fn shared() -> &'static Self {
         static BOOK: LazyLock<Ownership> = LazyLock::new(|| Ownership(Arc::default()));
         &BOOK
     }
+    // Image-bridge page ownership is not consulted yet; kept for the next fix.
+    #[allow(dead_code)]
     pub(crate) fn admit(&self, requests: &[Request]) -> Result<WritePermit> {
         self.try_admit(requests)?.ok_or("native or physical bytes are still in use")
     }
+    // Image-bridge page ownership is not consulted yet; kept for the next fix.
+    #[allow(dead_code)]
     pub(crate) fn try_admit(&self, requests: &[Request]) -> Result<Option<WritePermit>> {
         if requests.is_empty() {
             return Err("no declared accesses");
@@ -417,14 +467,20 @@ impl Ownership {
 }
 
 impl WritePermit {
+    // Image-bridge page ownership is not consulted yet; kept for the next fix.
+    #[allow(dead_code)]
     pub(crate) fn can_read(&self, capture_id: u64, native_id: usize, native_sub: u32) -> bool {
         self.read_subs
             .contains(&(capture_id, native_id, native_sub))
     }
+    // Image-bridge page ownership is not consulted yet; kept for the next fix.
+    #[allow(dead_code)]
     pub(crate) fn allows(&self, capture_id: u64, native_id: usize, native_sub: u32) -> bool {
         self.subs.contains(&(capture_id, native_id, native_sub))
     }
 
+    // Image-bridge page ownership is not consulted yet; kept for the next fix.
+    #[allow(dead_code)]
     fn release(self) {
         let mut state = self.book.0.lock().unwrap();
         let lease = state.live.remove(&self.id).expect("live ownership permit");
@@ -450,6 +506,8 @@ mod retirement {
     use super::WritePermit;
     use windows::Win32::Graphics::Direct3D12::*;
 
+    // Image-bridge page ownership is not consulted yet; kept for the next fix.
+    #[allow(dead_code)]
     pub(crate) struct Pending {
         uses: Option<WritePermit>,
         fences: Vec<ID3D12Fence>,
@@ -457,6 +515,8 @@ mod retirement {
 
     impl WritePermit {
         /// Each queue must have received its last work for this acquisition.
+        // Image-bridge page ownership is not consulted yet; kept for the next fix.
+        #[allow(dead_code)]
         pub(crate) unsafe fn signal_after_last_use(
             self,
             queues: &[ID3D12CommandQueue],
@@ -483,6 +543,8 @@ mod retirement {
     }
 
     impl Pending {
+        // Image-bridge page ownership is not consulted yet; kept for the next fix.
+        #[allow(dead_code)]
         pub(crate) fn retire_if_complete(&mut self) -> Result<bool, &'static str> {
             for fence in &self.fences {
                 match unsafe { fence.GetCompletedValue() } {

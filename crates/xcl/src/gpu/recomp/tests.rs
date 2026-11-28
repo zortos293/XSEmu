@@ -3582,15 +3582,7 @@ fn gpu_raw_view_spans_a_memory_window() {
             io.Store(0u, w.Load(0u)); io.Store(4u, w.Load(0xFFFFFFFCu)); io.Store(8u, w.Load(0x80000000u));\n\
         }\n";
     let dxil = super::dxc::compile(src, "main", "cs_6_6", &[]).unwrap();
-    let r = match runner::run_with_window_view(&dxil, 1 << 32) {
-        Ok(r) => r,
-        // The window itself is the subject: an adapter that cannot reserve 4 GiB (WARP on the CI
-        // runner) has nothing for this test to prove.
-        Err(e) if e.contains("CreateReservedResource") => {
-            return runner::skip_test(&format!("no 4 GiB memory window ({e})"));
-        }
-        Err(e) => panic!("{e}"),
-    };
+    let r = runner::run_with_window_view(&dxil, 1 << 32).unwrap();
     assert_eq!(&r[..3], &[0x1111_1111, 0x2222_2222, 0]);
 }
 
@@ -4733,6 +4725,65 @@ fn gpu_images_sample_load_store_atomic() {
     }
     assert_eq!(u32::from_le_bytes(r.textures[1][..4].try_into().unwrap()), 63, "image_atomic_umax");
     assert_eq!(u32::from_le_bytes(r.textures[2][..4].try_into().unwrap()), 64, "image_atomic_inc (64 lanes, limit 100)");
+}
+
+/// `XCL_NAN_SCRUB=1` (`emit::nan_scrub`): a NaN or an infinity that a pixel shader exports as a
+/// float colour is written as 0; with the switch off the export is the value itself.
+#[test]
+fn nan_scrub_a_non_finite_colour_export_is_zero() {
+    use super::PsInterface;
+    let code = prog(&[
+        ("V_MOV_B32", "ENC_VOP1", &[("VDST", 0), ("SRC0", 255)], Some(0x7FC0_0000)), // NaN
+        ("V_MOV_B32", "ENC_VOP1", &[("VDST", 1), ("SRC0", 255)], Some(0x7F80_0000)), // +inf
+        ("V_MOV_B32", "ENC_VOP1", &[("VDST", 2), ("SRC0", 255)], Some(0xFF80_0000)), // -inf
+        ("V_MOV_B32", "ENC_VOP1", &[("VDST", 3), ("SRC0", 242)], None),              // 1.0
+        ("EXP", "ENC_EXP", &[("TGT", 0), ("EN", 0xF), ("VSRC0", 0), ("VSRC1", 1), ("VSRC2", 2), ("VSRC3", 3), ("DONE", 1), ("VM", 1)], None),
+    ]);
+    let hlsl = |scrub: Option<bool>| {
+        let psi = PsInterface { outputs: vec![el("SV_Target", 0, 64, 3, 0, 0xF)], ..Default::default() };
+        super::emit::NAN_SCRUB.set(scrub);
+        let t = translate(&code, &Options { mode: Mode::Pixel(psi), wave64: true, ..Default::default() });
+        super::emit::NAN_SCRUB.set(None);
+        let t = t.unwrap();
+        assert!(t.complete(), "{:?}", t.unsupported_why);
+        t.hlsl
+    };
+    let off = hlsl(Some(false));
+    for (c, v) in [(0, "asfloat(v0)"), (1, "asfloat(v1)"), (2, "asfloat(v2)"), (3, "asfloat(v3)")] {
+        assert!(off.contains(&format!("xo.t0[{c}] = {v};")), "{off}");
+    }
+    let on = hlsl(Some(true));
+    for (c, v) in [(0, "asfloat(v0)"), (1, "asfloat(v1)"), (2, "asfloat(v2)"), (3, "asfloat(v3)")] {
+        assert!(on.contains(&format!("xo.t0[{c}] = select((asuint({v}) & 0x7F800000u) == 0x7F800000u, 0.0f, {v});")), "{on}");
+    }
+}
+
+/// `XCL_NAN_SCRUB=1` (`emit::nan_scrub`): a NaN or an infinity stored to an image of the float
+/// class is written as 0; the uint and sint classes, and the store with the switch off, keep the
+/// register bits.
+#[test]
+fn nan_scrub_a_non_finite_float_image_store_is_zero() {
+    use super::CsInterface;
+    let code = prog(&[("IMAGE_STORE", "ENC_MIMG", &[("VDATA", 4), ("VADDR", 0), ("SRSRC", 4), ("DMASK", 0xF), ("DIM", 1)], None)]);
+    let cs = CsInterface { threads: [32, 1, 1], user_sgprs: 4, ..Default::default() };
+    let hlsl = |scrub: Option<bool>| {
+        super::emit::NAN_SCRUB.set(scrub);
+        let t = translate(&code, &Options { mode: Mode::Compute(cs.clone()), ..Default::default() });
+        super::emit::NAN_SCRUB.set(None);
+        let t = t.unwrap();
+        assert!(t.complete(), "{:?}", t.unsupported_why);
+        t.hlsl
+    };
+    let bits = "uint4(v4, v5, v6, v7)";
+    let off = hlsl(Some(false));
+    for store in [format!("= {bits};"), format!("= (int4){bits};"), format!("= asfloat({bits});")] {
+        assert!(off.contains(&store), "{off}");
+    }
+    let on = hlsl(Some(true));
+    assert!(on.contains(&format!("= select(({bits} & 0x7F800000u) == 0x7F800000u, (float4)0, asfloat({bits}));")), "{on}");
+    for store in [format!("= {bits};"), format!("= (int4){bits};")] {
+        assert!(on.contains(&store), "{on}");
+    }
 }
 
 /// Static samplers: the program builds two S# from constants (point / linear, clamp) – as
@@ -11383,6 +11434,206 @@ fn native_mesh_uses_wave_intrinsics_in_branches_and_rejects_multi_wave_groups() 
     assert!(err.contains("more than one console wave"), "{err}");
     let fallback = translate(&meet, &Options { mesh_native: None, ..wide }).unwrap();
     assert!(fallback.hlsl.contains("#define XCL_X_SPIN 1"));
+}
+
+/// The host threads and console waves of a native mesh group (`pso::mesh_native_host_threads`).
+#[test]
+fn mesh_native_host_threads_cover_whole_console_waves_only() {
+    use super::pso::mesh_native_host_threads;
+    assert_eq!(mesh_native_host_threads(32, false), Some((1, 32)));
+    assert_eq!(mesh_native_host_threads(64, false), Some((2, 64)));
+    assert_eq!(mesh_native_host_threads(96, false), Some((3, 96)));
+    assert_eq!(mesh_native_host_threads(128, false), Some((4, 128)));
+    assert_eq!(mesh_native_host_threads(64, true), Some((1, 32)));
+    assert_eq!(mesh_native_host_threads(128, true), Some((2, 64)));
+    assert_eq!(mesh_native_host_threads(192, true), Some((3, 96)));
+    assert_eq!(mesh_native_host_threads(256, true), Some((4, 128)));
+    assert_eq!(mesh_native_host_threads(512, true), None);
+    assert_eq!(mesh_native_host_threads(96, true), None);
+    assert_eq!(mesh_native_host_threads(0, true), None);
+}
+
+/// `XCL_MESH_MULTI_WAVE`: a wave64 mesh group of 128 console threads (two console waves) as one
+/// host mesh shader. 64 host threads in two 32-lane waves; each wave takes its console wave from
+/// an LDS ticket (not from its flat ids, which a host need not align to waves), and every
+/// invocation exports for its own console thread with the group's counts, summed over the waves.
+#[test]
+fn native_mesh_multi_wave_group_gets_a_host_wave_per_console_wave() {
+    let code = prog(&[
+        ("S_MOV_B32", "ENC_SOP1", &[("SDST", 1), ("SSRC0", 3)], None), // reads s3 (the wave field)
+        ("V_MOV_B32", "ENC_VOP1", &[("VDST", 1), ("SRC0", V + 5)], None), // reads v5 (the thread)
+        ("S_MOV_B32", "ENC_SOP1", &[("SDST", 124), ("SSRC0", 255)], Some(2 << 12 | 3)),
+        ("S_SENDMSG", "ENC_SOPP", &[("SIMM16", 9)], None),
+    ]);
+    let ms = super::MsInterface { threads: 128, max_vertices: 3, max_primitives: 1, outputs: vec![] };
+    let options = |multi| Options {
+        mode: Mode::Mesh(ms.clone()),
+        wave64: true,
+        split_wave64: true,
+        mesh_native: Some(super::MeshNative { ps_inputs: None, lds_bytes: 0 }),
+        mesh_multi_wave: multi,
+        ..Default::default()
+    };
+    let err = translate(&code, &options(false)).unwrap_err();
+    assert!(err.contains("more than one console wave"), "{err}");
+    let t = translate(&code, &options(true)).unwrap();
+    assert!(t.complete(), "{:?}", t.unsupported_why);
+    for what in [
+        "[numthreads(64, 1, 1)]",
+        "groupshared uint xcl_ms_ticket;",
+        "groupshared uint xcl_ms_counts[2];",
+        "if (gi == 0u) { xcl_ms_ticket = 0u; xcl_ms_counts[0] = 0u; xcl_ms_counts[1] = 0u; }",
+        "InterlockedAdd(xcl_ms_ticket, (xcl_slot == 0u) ? 1u : 0u, xcl_ticket);",
+        "uint xcl_wave = WaveReadLaneFirst(xcl_ticket);",
+        "uint xcl_thread = xcl_wave * 64u + xcl_slot;",
+        "uint hi_xcl_thread = xcl_thread + 32u;",
+        "xcl_valid_lanes = 64u;",
+        "s3 = (s3 & 0xF0FFFFFFu) | (xcl_wave << 24u);",
+        "uint v5 = gid.x * 128u + xcl_thread;",
+        "uint hi_v5 = gid.x * 128u + hi_xcl_thread;",
+        "InterlockedAdd(xcl_ms_counts[0], xcl_ms_nv); InterlockedAdd(xcl_ms_counts[1], xcl_ms_np);",
+        "uint xcl_nv = min(xcl_ms_counts[0], 3u);",
+        "uint xcl_np = min(xcl_ms_counts[1], 1u);",
+        "if (xcl_thread < xcl_nv)",
+        "if (hi_xcl_thread < xcl_nv)",
+        "verts[xcl_thread] = o;",
+        "verts[hi_xcl_thread] = o;",
+        "tris[xcl_thread] = select(",
+    ] {
+        assert!(t.hlsl.contains(what), "missing {what:?}:\n{}", t.hlsl);
+    }
+    assert!(!t.hlsl.contains("gi / 32u"), "the wave index is the host fill's, not a ticket:\n{}", t.hlsl);
+    assert_eq!(t.hlsl.matches("GroupMemoryBarrierWithGroupSync();").count(), 3, "ticket, counts and the call's barrier:\n{}", t.hlsl);
+}
+
+/// A wave32 mesh group of 96 console threads: one host thread per console thread and a host
+/// wave per console wave, with no packed halves.
+#[test]
+fn native_mesh_multi_wave_wave32_group_keeps_one_host_thread_per_console_thread() {
+    let code = prog(&[("V_MOV_B32", "ENC_VOP1", &[("VDST", 1), ("SRC0", V + 5)], None)]);
+    let ms = super::MsInterface { threads: 96, max_vertices: 3, max_primitives: 1, outputs: vec![] };
+    let t = translate(&code, &Options {
+        mode: Mode::Mesh(ms),
+        wave64: false,
+        mesh_native: Some(super::MeshNative { ps_inputs: None, lds_bytes: 0 }),
+        mesh_multi_wave: true,
+        ..Default::default()
+    })
+    .unwrap();
+    assert!(t.complete(), "{:?}", t.unsupported_why);
+    for what in ["[numthreads(96, 1, 1)]", "uint xcl_thread = xcl_wave * 32u + xcl_slot;", "uint v5 = gid.x * 96u + xcl_thread;"] {
+        assert!(t.hlsl.contains(what), "missing {what:?}:\n{}", t.hlsl);
+    }
+    assert!(!t.hlsl.contains("hi_xcl_thread"));
+}
+
+/// The switch changes nothing for a group of one console wave: the single-wave native path is
+/// the same code before and after it.
+#[test]
+fn native_mesh_single_console_wave_is_the_same_with_the_multi_wave_switch() {
+    let code = prog(&[
+        ("S_MOV_B32", "ENC_SOP1", &[("SDST", 1), ("SSRC0", 3)], None),
+        ("V_MOV_B32", "ENC_VOP1", &[("VDST", 1), ("SRC0", V + 5)], None),
+    ]);
+    let ms = super::MsInterface { threads: 64, max_vertices: 3, max_primitives: 1, outputs: vec![] };
+    let options = |multi| Options {
+        mode: Mode::Mesh(ms.clone()),
+        wave64: true,
+        split_wave64: true,
+        mesh_native: Some(super::MeshNative { ps_inputs: None, lds_bytes: 0 }),
+        mesh_multi_wave: multi,
+        ..Default::default()
+    };
+    let off = translate(&code, &options(false)).unwrap();
+    let on = translate(&code, &options(true)).unwrap();
+    assert!(off.complete(), "{:?}", off.unsupported_why);
+    assert_eq!(off.hlsl, on.hlsl, "the single-wave native path changed");
+    assert!(off.hlsl.contains("[numthreads(32, 1, 1)]") && !off.hlsl.contains("xcl_thread"));
+}
+
+/// `ngg_triangle_per_group` in a 128-thread group (two console waves) with its triangle at
+/// console threads 64..66, the second wave, and its allocation request from console thread 0:
+/// the second wave has no counts of its own. Its interface, SGPRs and memory.
+fn ngg_triangle_in_the_second_wave() -> (Vec<u8>, super::MsInterface, Vec<u32>, Vec<u32>) {
+    let sig = |name: &str, sv: u32, reg: u32| crate::gpu::dxbc::SigElement { name: name.into(), index: 0, system_value: sv, component_type: 3, register: reg, mask: 0xF, rw_mask: 0xF, stream: 0 };
+    let ms = super::MsInterface { outputs: vec![sig("SV_Position", 1, 0), sig("TEXCOORD", 0, 1)], threads: 128, max_vertices: 128, max_primitives: 128 };
+    let exp = |tgt: u64, en: u64, v: [u64; 4], done: u64| -> (&'static str, &'static str, Vec<(&'static str, u64)>, Option<u32>) {
+        ("EXP", "ENC_EXP", vec![("TGT", tgt), ("EN", en), ("VSRC0", v[0]), ("VSRC1", v[1]), ("VSRC2", v[2]), ("VSRC3", v[3]), ("DONE", done)], None)
+    };
+    let mut list: Vec<(&str, &str, Vec<(&str, u64)>, Option<u32>)> = vec![
+        ("S_BFE_U32", "ENC_SOP2", vec![("SDST", 0), ("SSRC0", 3), ("SSRC1", 255)], Some(0x40018)), // wave index
+        ("V_MBCNT_LO_U32_B32", "ENC_VOP3", vec![("VDST", 0), ("SRC0", 193), ("SRC1", 128)], None),
+        ("V_MBCNT_HI_U32_B32", "ENC_VOP3", vec![("VDST", 0), ("SRC0", 193), ("SRC1", V)], None),
+        ("V_LSHL_ADD_U32", "ENC_VOP3", vec![("VDST", 0), ("SRC0", 0), ("SRC1", 134), ("SRC2", V)], None), // console thread
+        ("V_READFIRSTLANE_B32", "ENC_VOP1", vec![("VDST", 1), ("SRC0", V + 5)], None),
+        ("S_LSHR_B32", "ENC_SOP2", vec![("SDST", 1), ("SSRC0", 1), ("SSRC1", 135)], None), // group = v5 >> 7
+        ("V_CMPX_EQ_U32", "ENC_VOPC", vec![("SRC0", 128), ("VSRC1", 0)], None), // console thread 0 sends the request
+        ("S_CBRANCH_EXECZ", "ENC_SOPP", vec![("SIMM16", 3)], None), // skip the move and the message: 8 + 4 bytes
+        ("S_MOV_B32", "ENC_SOP1", vec![("SDST", 124), ("SSRC0", 255)], Some(65 << 12 | 128)), // 65 primitives, 128 vertices
+        ("S_SENDMSG", "ENC_SOPP", vec![("SIMM16", 9)], None),
+        ("S_MOV_B64", "ENC_SOP1", vec![("SDST", 126), ("SSRC0", 193)], None),
+        ("BUFFER_LOAD_DWORDX4", "ENC_MUBUF", vec![("VDATA", 10), ("VADDR", 0), ("SRSRC", 4), ("SOFFSET", 128), ("IDXEN", 1)], None),
+        ("V_CVT_F32_U32", "ENC_VOP1", vec![("VDST", 20), ("SRC0", 1)], None),
+        ("V_ADD_F32", "ENC_VOP2", vec![("VDST", 10), ("SRC0", V + 20), ("VSRC1", 10)], None), // x += group
+        ("V_LSHRREV_B32", "ENC_VOP2", vec![("VDST", 22), ("SRC0", 134), ("VSRC1", 0)], None), // wave = thread >> 6
+        ("V_CVT_F32_U32", "ENC_VOP1", vec![("VDST", 14), ("SRC0", V + 22)], None), // param0.x = wave
+        ("V_CVT_F32_U32", "ENC_VOP1", vec![("VDST", 15), ("SRC0", V)], None), // param0.y = thread
+        ("V_MOV_B32", "ENC_VOP1", vec![("VDST", 16), ("SRC0", 128)], None),
+        ("V_MOV_B32", "ENC_VOP1", vec![("VDST", 17), ("SRC0", 242)], None),
+    ];
+    list.push(exp(12, 0xF, [10, 11, 12, 13], 1));
+    list.push(exp(32, 0xF, [14, 15, 16, 17], 0));
+    list.push(("V_MOV_B32", "ENC_VOP1", vec![("VDST", 21), ("SRC0", 255)], Some(0x8000_0000))); // every thread's primitive is null
+    list.push(exp(20, 1, [21, 0, 0, 0], 1));
+    list.push(("V_CMPX_EQ_U32", "ENC_VOPC", vec![("SRC0", 192), ("VSRC1", 0)], None)); // console thread 64
+    list.push(("V_MOV_B32", "ENC_VOP1", vec![("VDST", 21), ("SRC0", 255)], Some(64 | 65 << 10 | 66 << 20)));
+    list.push(exp(20, 1, [21, 0, 0, 0], 1)); // overwrites slot 64
+    let refs: Vec<(&str, &str, &[(&str, u64)], Option<u32>)> = list.iter().map(|(a, b, c, d)| (*a, *b, c.as_slice(), *d)).collect();
+    // vertex table at byte 0x100, V# in s[16:19] (stride 16, 128 records), the triangle at 64..66
+    let mut mem = vec![0u32; 0x900 / 4];
+    for (i, (x, y)) in [(-1.0f32, -1.0f32), (-1.0, 1.0), (0.0, -1.0)].iter().enumerate() {
+        let at = 0x40 + 4 * (64 + i);
+        mem[at..at + 4].copy_from_slice(&[f(*x), f(*y), f(0.0), f(1.0)]);
+    }
+    let mut sg = vec![0u32; 128];
+    sg[16..20].copy_from_slice(&[0x100, 16 << 16, 128, 0]);
+    (prog(&refs), ms, sg, mem)
+}
+
+/// `XCL_MESH_MULTI_WAVE` end to end: a 128-thread group whose triangle is exported by console
+/// threads 64..66 (the second console wave), with the group's allocation request from console
+/// thread 0. The second wave sends no request, so its own counts are 0; counted per wave, its
+/// exports fall past a zero bound and the triangle disappears. The host mesh shader must draw
+/// what the two passes draw.
+#[test]
+fn gpu_mesh_multi_wave_counts_carry_the_second_wave() {
+    if !gpu_ready() || !mesh_ready() {
+        return;
+    }
+    let Some(split) = mesh_native_ready() else { return };
+    let (code, ms, sg, mem) = ngg_triangle_in_the_second_wave();
+    let ps = super::dxc::compile(MESH_TEST_PS, "main", "ps_6_6", &[]).unwrap();
+    let t = translate(&code, &Options {
+        mode: Mode::Mesh(ms.clone()),
+        wave64: true,
+        split_wave64: split,
+        mesh_native: Some(super::MeshNative { ps_inputs: None, lds_bytes: 0 }),
+        mesh_multi_wave: true,
+        ..Default::default()
+    })
+    .unwrap();
+    assert!(t.complete(), "{:?}", t.unsupported_why);
+    let dxil = super::dxc::compile(&t.hlsl, "main", "ms_6_6", &[]).unwrap_or_else(|e| panic!("{e}\n{}", t.hlsl));
+    let px = runner::mesh_draw_native(&dxil, &ps, runner::MeshGroups::Direct(1), &sg, &mem, 32, [-1.0; 4]).unwrap();
+    let at = |x: usize, y: usize| px[y * 32 + x];
+    assert_eq!((at(3, 29)[0], at(3, 29)[3]), (1.0, 1.0), "the second wave's triangle, drawn with the group's counts");
+    // the same program in two passes: the same pixels
+    let t = translate(&code, &on_gpu(Options { mode: Mode::Mesh(ms.clone()), wave64: true, ..Default::default() })).unwrap();
+    assert!(t.complete(), "{:?}", t.unsupported_why);
+    let cs = super::dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).unwrap();
+    let pass = super::dxc::compile(&super::mesh_passthrough(&ms), "main", "ms_6_6", &[]).unwrap();
+    let (px2, _) = runner::mesh_draw(&cs, &pass, &ps, 1, ms.record_dwords(), &sg, &mem, 32, [-1.0; 4]).unwrap();
+    assert!(px == px2, "the host mesh shader and the two passes draw the same pixels");
 }
 
 #[test]

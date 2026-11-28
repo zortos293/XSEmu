@@ -1,3 +1,5 @@
+// stencil::native_plane has no caller until the bridge is wired; kept for the next fix.
+#[allow(dead_code)]
 pub(super) fn native_plane(guest: u32, host: u32, flags: u32, samples: u32, usage: u32) -> Option<u32> {
     let stencil_usage = if flags & 2 == 0 { 6 } else { 8 };
     (guest == 118 && host == 44 && samples == 1 && usage == stencil_usage).then_some(1)

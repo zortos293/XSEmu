@@ -30,6 +30,10 @@ const PRELOAD_PRIORITY: i32 = windows_sys::Win32::System::Threading::THREAD_PRIO
 /// … and while the title loads (`pso_sched::Tempo::low`): behind title threads that run below
 /// normal themselves, as loaders do.
 const LOADING_PRIORITY: i32 = windows_sys::Win32::System::Threading::THREAD_PRIORITY_LOWEST;
+/// … and while the title draws (`title_drawing`): idle, behind everything its frame runs. The
+/// driver's compiler takes what the worker's thread gets, so a compile the title needs keeps its
+/// own priority through `BoostToken` and this one gives way.
+const LIVE_PRIORITY: i32 = windows_sys::Win32::System::Threading::THREAD_PRIORITY_IDLE;
 /// the priority a preload worker has now while no bind waits for what it builds (`pace`)
 static REST_PRIORITY: AtomicI32 = AtomicI32::new(PRELOAD_PRIORITY);
 
@@ -143,15 +147,25 @@ struct Pending {
     done: Mutex<bool>,
     cv: Condvar,
     compute: bool,
+    /// the stage it is made for (`pso_fail`'s summary)
+    stage: super::pso_fail::Stage,
     image_only: std::sync::atomic::AtomicBool,
     depth_only: std::sync::atomic::AtomicBool,
     /// a pass over the screen (`mark_screen_pass`): its binds wait within `screen_budget`
     screen: std::sync::atomic::AtomicBool,
+    /// a pass into this pipeline renders into a lighting target (`light_wait`): the target, as the
+    /// log names it (None: no pass of it did)
+    light: Mutex<Option<String>>,
+    /// its wait as a lighting target's pipeline was taken (`XCL_LIGHT_WAIT`: one a pipeline)
+    light_waited: std::sync::atomic::AtomicBool,
     /// a ray pass built with every ray a miss (`rt_pass_last`): built behind every other one
     rt_pass: std::sync::atomic::AtomicBool,
     /// of its shaders (`used`); 0 = none
     key: u64,
     record: u64,
+    /// a hash of its shaders for the failure log when `key` is 0 (a lazy pipeline is scheduled by
+    /// its record)
+    log_key: u64,
     /// it was used (`used::note` is told once)
     used: std::sync::atomic::AtomicBool,
     /// the stand-in was released before the real pipeline was built
@@ -172,6 +186,9 @@ struct Pending {
     retired: AtomicUsize,
     /// a bind (or a lookup made for one) took it: its real pipeline stays (`release_idle`)
     bound: std::sync::atomic::AtomicBool,
+    /// when a bind (or a lookup made for one) last took it, in `since_start` ms – what
+    /// `XCL_PSO_FREE_IDLE` measures a pipeline state's rest by (0: never bound)
+    last_take: AtomicU64,
     /// when its real pipeline was built (`since_start`, ms; 0: not built)
     built_at: std::sync::atomic::AtomicU64,
     /// its real pipeline was released, nothing having bound it (`release_idle`)
@@ -232,6 +249,7 @@ impl Pending {
     /// A bind (or a lookup for one) takes this pipeline: from now on its real pipeline stays.
     fn note_bind(&self) {
         self.bound.store(true, Ordering::SeqCst);
+        self.last_take.store(since_start().max(1), Ordering::Release);
         note_bound_group(self.group);
         if self.released_idle.swap(false, Ordering::AcqRel) {
             REBUILT.fetch_add(1, Ordering::Relaxed);
@@ -274,6 +292,7 @@ static PENDING: Mutex<Option<HashMap<usize, Arc<Pending>>>> = Mutex::new(None);
 /// A failed fast build leaves the pipeline waiting for its full-quality build.
 fn complete(p: &Pending, real: usize, fast: bool) {
     let never_fit = if real == 0 && !fast { super::real::take_never_fit() } else { 0 };
+    let mut failed = 0;
     let drop_now = {
         let mut done = p.done.lock().unwrap();
         if !fast {
@@ -303,7 +322,7 @@ fn complete(p: &Pending, real: usize, fast: bool) {
                 _ => drop_now = real,
             }
         } else if !fast && !*done {
-            FAILED.fetch_add(1, Ordering::Relaxed);
+            failed = FAILED.fetch_add(1, Ordering::Relaxed) as u64 + 1;
         }
         if real != 0 || !fast {
             if p.counted.swap(false, Ordering::AcqRel) {
@@ -314,6 +333,10 @@ fn complete(p: &Pending, real: usize, fast: bool) {
         }
         drop_now
     };
+    if failed != 0 {
+        let why = super::pso_fail::take().unwrap_or_else(super::pso_fail::Failure::unexplained);
+        super::pso_fail::counted(failed, p.stage, p.log_key, &p.what, &why);
+    }
     // outside `done`: the Release override takes PENDING (`counts` takes PENDING, then `done`)
     release(drop_now);
     // (one nothing bound keeps its build: its pipeline may be released and built again; so does
@@ -437,7 +460,14 @@ fn release_idle(p: &Pending, limit: std::time::Duration) -> bool {
 /// its build after a bind too: `release_used` may take its pipeline away, and its next bind
 /// builds it again.
 fn keeps_build(p: &Pending) -> bool {
-    super::shader_code::budget() != 0 && (p.compute || super::shader_code::graphics())
+    if super::shader_code::budget() != 0 && (p.compute || super::shader_code::graphics()) {
+        return true;
+    }
+    // a bound pipeline whose driver blob is on disk may be taken away while the memory is short
+    // (`XCL_PSO_FREE_IDLE`) and built again at its next bind; one without keeps nothing to build
+    // from, so its build goes as before (its descriptor and console shader bytes are a few KB
+    // against the 400 KB its pipeline state takes in the driver)
+    super::real::pso_free_idle() && (p.compute || super::shader_code::graphics()) && super::real::pso_from_disk(p.real.load(Ordering::Acquire))
 }
 
 /// Take `real` away from `p`, a pipeline that lists have used: a compute one, or with `graphics`
@@ -699,7 +729,7 @@ fn start_giant_lane() {
 fn park(q: &Preload, dxil_len: usize, p: &Arc<Pending>) {
     let first_use = if p.compute { used::rank(p.key) } else { None };
     let mut list = q.lock();
-    list.park(dxil_len, p.group, p.preload_seq.load(Ordering::Relaxed), first_use, Arc::downgrade(p));
+    list.park(dxil_len, p.group, p.preload_seq.load(Ordering::Relaxed), first_use, rt_class(p), Arc::downgrade(p));
     LEAST_PARKED.store(list.least_parked(), Ordering::Release);
 }
 
@@ -719,13 +749,13 @@ pub fn title_held() -> bool {
 }
 
 /// A bind's wait for a pipeline still being built (`title_held`).
-struct Held<'a>(&'a Pending);
+struct Held<'a>(&'a Pending, std::time::Instant);
 
 impl<'a> Held<'a> {
     fn new(p: &'a Pending) -> Self {
         HELD.fetch_add(1, Ordering::AcqRel);
         p.active_waiters.fetch_add(1, Ordering::AcqRel);
-        Self(p)
+        Self(p, std::time::Instant::now())
     }
 }
 
@@ -733,7 +763,47 @@ impl Drop for Held<'_> {
     fn drop(&mut self) {
         self.0.active_waiters.fetch_sub(1, Ordering::AcqRel);
         HELD.fetch_sub(1, Ordering::AcqRel);
+        note_frame_wait(self.0.key, self.0.compute, self.1.elapsed(), frame_waited());
     }
+}
+
+static PIPE_WAIT_LINES: AtomicU64 = AtomicU64::new(0);
+
+/// `XCL_PIPE_WAIT_LOG_MS`: the wait at which a frame held by a pipeline build is logged (None: not
+/// logged). 50 ms by default, the master plan's threshold; 0 turns it off.
+fn pipe_wait_log() -> Option<std::time::Duration> {
+    static MS: OnceLock<Option<std::time::Duration>> = OnceLock::new();
+    *MS.get_or_init(|| {
+        let ms = std::env::var("XCL_PIPE_WAIT_LOG_MS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(50u64);
+        (ms > 0).then(|| std::time::Duration::from_millis(ms))
+    })
+}
+
+/// A frame that waits on a pipeline still being built: a bind's wait at `pipe_wait_log`, or a
+/// thread's waits in one frame reaching it, is logged with the pipeline, the frame and the
+/// thread's total for that frame. The analyzer counts these as the frames a pipeline build held;
+/// `pso_manifest::note_blocked` keeps the per-pipeline totals. The first 20 lines and then every
+/// 100th, so a title waiting every frame does not flood its log.
+fn note_frame_wait(key: u64, compute: bool, waited: std::time::Duration, frame_total: std::time::Duration) {
+    let Some(threshold) = pipe_wait_log() else { return };
+    let crossed = frame_total >= threshold && frame_total.saturating_sub(waited) < threshold;
+    if waited < threshold && !crossed {
+        return;
+    }
+    let n = PIPE_WAIT_LINES.fetch_add(1, Ordering::Relaxed) + 1;
+    if n > 20 && n % 100 != 0 {
+        return;
+    }
+    let long = waited >= threshold;
+    crate::xlog_info!(
+        "D3D12.X: frame {} waited {} ms on pipelines still being built ({}, {} pipeline {key:016x}, {} such lines, XCL_PIPE_WAIT_LOG_MS={})",
+        super::present::presents(),
+        frame_total.as_millis(),
+        if long { format!("a bind's wait of {} ms", waited.as_millis()) } else { format!("a bind's longest wait {} ms", waited.as_millis()) },
+        if compute { "compute" } else { "graphics" },
+        n,
+        threshold.as_millis()
+    );
 }
 
 pub fn enabled() -> bool {
@@ -748,6 +818,7 @@ type JobFn = dyn Fn() -> usize + Send + Sync;
 /// Run a job; a panic in it is a failed build (a worker must not die with it, and whoever
 /// waits for the pipeline must be woken).
 fn run(p: &Pending, job: &JobFn) -> usize {
+    let _build = crate::gpu::recomp::pso::pipeline_build();
     super::real::take_never_fit();
     let (started, waited) = (std::time::Instant::now(), super::real::memory_waited());
     let real = crate::live_stall::with_job(p.record, p.key, || {
@@ -859,6 +930,9 @@ struct BuildQueue {
     /// passes over the screen (`mark_screen_pass`): after `first`, and the only builds the
     /// screen workers take
     screen: VecDeque<Arc<Pending>>,
+    /// ray-tracing pipelines (`rt_class`): after every other build, `pso_sched::RT_AT_ONCE` of
+    /// them at once, so a title's hundreds of them never take the workers a frame's builds need
+    rt: VecDeque<Arc<Pending>>,
 }
 
 impl BuildQueue {
@@ -883,7 +957,18 @@ static QUEUE: Mutex<BuildQueue> = Mutex::new(BuildQueue {
     bound: VecDeque::new(),
     first: VecDeque::new(),
     screen: VecDeque::new(),
+    rt: VecDeque::new(),
 });
+
+/// The place one of the bind queue's ray-tracing builds holds (`pso_sched::rt_take`), free when
+/// the build is over.
+struct RtOut;
+
+impl Drop for RtOut {
+    fn drop(&mut self) {
+        super::pso_sched::rt_done();
+    }
+}
 
 /// pipelines the bind queue holds at most: the ones bound longest ago fall out (a later bind
 /// sends a pipeline again)
@@ -896,6 +981,12 @@ fn enqueue_bound(p: Arc<Pending>) {
     start_workers();
     crate::progress::PIPELINES.queue();
     let mut queue = QUEUE.lock().unwrap();
+    if rt_class(&p) {
+        queue.rt.push_back(p);
+        drop(queue);
+        READY.notify_all();
+        return;
+    }
     queue.bound.push_back(p);
     if queue.bound.len() > BOUND_QUEUE {
         if let Some(old) = queue.bound.pop_front() {
@@ -1039,12 +1130,12 @@ fn start_workers() {
                 format!("xcl-pso-{k}")
             };
             let _ = std::thread::Builder::new().name(name).stack_size(64 << 20).spawn(move || loop {
-                let (p, upgrade, asked) = {
+                let (p, upgrade, asked, rt) = {
                     let mut queue = QUEUE.lock().unwrap();
                     loop {
                         if screen_only {
                             match queue.screen.pop_front() {
-                                Some(p) => break (p, false, None),
+                                Some(p) => break (p, false, None, false),
                                 None => {
                                     queue = SCREEN_READY.wait(queue).unwrap();
                                     continue;
@@ -1052,12 +1143,12 @@ fn start_workers() {
                             }
                         }
                         if let Some(p) = queue.first.pop_front() {
-                            break (p, false, None);
+                            break (p, false, None, false);
                         }
                         if let Some(p) = queue.screen.pop_front() {
-                            break (p, false, None);
+                            break (p, false, None, false);
                         }
-                        let next = queue.urgent.pop_front().map(|(p, at)| (p, false, Some(at)));
+                        let next = queue.urgent.pop_front().map(|(p, at)| (p, false, Some(at), false));
                         if let Some(next) = next {
                             break next;
                         }
@@ -1067,7 +1158,7 @@ fn start_workers() {
                                 continue;
                             }
                             if let Some(p) = take_bound(&mut queue.bound) {
-                                break (p, false, None);
+                                break (p, false, None, false);
                             }
                         }
                         if !urgent_only && (!queue.compute.is_empty() || !queue.graphics.is_empty() || !queue.upgrades.is_empty()) {
@@ -1075,13 +1166,34 @@ fn start_workers() {
                                 queue = READY.wait_timeout(queue, PARKED_POLL).unwrap().0;
                                 continue;
                             }
-                            if let Some(next) = queue.pop().map(|p| (p, false, None)).or_else(|| queue.upgrades.pop_front().map(|p| (p, true, None))) {
-                                break next;
+                            if let Some(p) = queue.pop() {
+                                if rt_class(&p) {
+                                    // (classed after it reached the queue: `rt_pass_last`)
+                                    queue.rt.push_back(p);
+                                    continue;
+                                }
+                                break (p, false, None, false);
                             }
+                            if let Some(p) = queue.upgrades.pop_front() {
+                                break (p, true, None, false);
+                            }
+                        }
+                        if !urgent_only && !queue.rt.is_empty() {
+                            if let Some(p) = queue.rt.pop_back() {
+                                if super::pso_sched::rt_take() {
+                                    p.in_bound.store(false, Ordering::Release);
+                                    break (p, false, None, true);
+                                }
+                                queue.rt.push_front(p);
+                            }
+                            // (a place the other queue's builds held wakes nothing here: look again)
+                            queue = READY.wait_timeout(queue, PARKED_POLL).unwrap().0;
+                            continue;
                         }
                         queue = READY.wait(queue).unwrap();
                     }
                 };
+                let _rt = rt.then_some(RtOut);
                 let _task = crate::progress::PIPELINES.take();
                 BUILDING.with(|b| *b.borrow_mut() = Some(p.clone()));
                 let started = std::time::Instant::now();
@@ -1342,7 +1454,13 @@ pub(super) fn blocking_waiter() -> bool {
 fn enqueue(p: Arc<Pending>) {
     start_workers();
     crate::progress::PIPELINES.queue();
-    QUEUE.lock().unwrap().push(p);
+    let mut queue = QUEUE.lock().unwrap();
+    if rt_class(&p) {
+        queue.rt.push_back(p);
+    } else {
+        queue.push(p);
+    }
+    drop(queue);
     READY.notify_one();
 }
 
@@ -1613,6 +1731,8 @@ pub(super) fn give_up(pso: usize) {
     p.left_out.store(true, Ordering::Release);
     p.sent.store(true, Ordering::Release);
     *p.job.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    // (a caller that knows more sets it first: the reason ray tracing left it out, the FSR4 stand-in)
+    super::pso_fail::note_if_absent(super::pso_fail::NOT_ATTEMPTED, "left out unbuilt");
     complete(&p, 0, false);
 }
 
@@ -1626,6 +1746,7 @@ pub(super) fn drop_build(pso: usize) -> Option<bool> {
         return None;
     }
     let started = p.full_started.load(Ordering::Acquire) || p.tiered_started.load(Ordering::Acquire) || p.preload.lock().unwrap_or_else(|e| e.into_inner()).worker.is_some();
+    super::pso_fail::note(super::pso_fail::NOT_ATTEMPTED, "the FSR4 stand-in takes its place");
     give_up(pso);
     Some(started)
 }
@@ -1640,6 +1761,7 @@ pub(super) fn building_left_out() -> bool {
 /// Release a pipeline state XCL owns (raw pointer, 0 = none).
 pub fn release(p: usize) {
     if p != 0 {
+        super::real::forget_pso_from_disk(p);
         super::shader_code::gone(p);
         unsafe { drop(<windows::Win32::Graphics::Direct3D12::ID3D12PipelineState as windows::core::Interface>::from_raw(p as *mut std::ffi::c_void)) };
     }
@@ -1647,7 +1769,12 @@ pub fn release(p: usize) {
 
 /// `standin` went to the title; `job` builds the real pipeline on a worker.
 pub fn submit(standin: usize, compute: bool, job: Job) {
-    submit_as(standin, compute, job, true, (0, 0), String::new(), 0, 0);
+    submit_as(standin, compute, stage_of(compute), job, true, (0, 0), 0, String::new(), 0, 0);
+}
+
+/// The stage of a pipeline submitted without one (`submit`, `submit_lazy`).
+fn stage_of(compute: bool) -> super::pso_fail::Stage {
+    if compute { super::pso_fail::Stage::Compute } else { super::pso_fail::Stage::Graphics }
 }
 
 /// Lazy pipeline creation (`XCL_LAZY_PSO=0`: off): a title's pipelines with console shaders get
@@ -1687,23 +1814,24 @@ pub(super) fn is_standin(pso: usize) -> bool {
 /// ahead of all of them. (`XCL_PSO_PRELOAD=0`: built at its first `resolve`, its shaders prepared
 /// before.)
 pub fn submit_lazy(standin: usize, compute: bool, job: Job, key: u64) {
-    submit_as(standin, compute, job, false, (key, 0), String::new(), 0, 0);
+    submit_as(standin, compute, stage_of(compute), job, false, (key, 0), key, String::new(), 0, 0);
 }
 
 /// `submit_lazy` with what the pipeline is made of (`what`: its shaders, for the log;
 /// `shader_bytes`: its console shaders' size).
 #[cfg(test)]
 pub fn submit_lazy_described(standin: usize, compute: bool, job: Job, key: u64, what: String, shader_bytes: usize, group: u64) {
-    submit_as(standin, compute, job, false, (key, 0), what, shader_bytes, group);
+    submit_as(standin, compute, stage_of(compute), job, false, (key, 0), key, what, shader_bytes, group);
 }
 
-pub(super) fn submit_recorded(standin: usize, compute: bool, job: Job, (key, record): (u64, u64), what: String, shader_bytes: usize, group: u64) {
+pub(super) fn submit_recorded(standin: usize, compute: bool, stage: super::pso_fail::Stage, job: Job, (key, record): (u64, u64), what: String, shader_bytes: usize, group: u64) {
     let send = !lazy();
-    submit_as(standin, compute, job, send, (if send { 0 } else { key }, record), what, shader_bytes, group);
+    // (the key still names the pipeline in the failure log while a lazy one is scheduled by its record)
+    submit_as(standin, compute, stage, job, send, (if send { 0 } else { key }, record), key, what, shader_bytes, group);
 }
 
 #[allow(clippy::too_many_arguments)]
-fn submit_as(standin: usize, compute: bool, job: Job, send: bool, (key, record): (u64, u64), what: String, shader_bytes: usize, group: u64) {
+fn submit_as(standin: usize, compute: bool, stage: super::pso_fail::Stage, job: Job, send: bool, (key, record): (u64, u64), log_key: u64, what: String, shader_bytes: usize, group: u64) {
     let p = Arc::new(Pending {
         created: std::time::Instant::now(),
         last_bound: AtomicU64::new(0),
@@ -1714,12 +1842,16 @@ fn submit_as(standin: usize, compute: bool, job: Job, send: bool, (key, record):
         done: Mutex::new(false),
         cv: Condvar::new(),
         compute,
+        stage,
         image_only: Default::default(),
         depth_only: Default::default(),
         screen: Default::default(),
+        light: Default::default(),
+        light_waited: Default::default(),
         rt_pass: Default::default(),
         key,
         record,
+        log_key,
         used: Default::default(),
         orphan: Default::default(),
         full_started: Default::default(),
@@ -1730,6 +1862,7 @@ fn submit_as(standin: usize, compute: bool, job: Job, send: bool, (key, record):
         counted: Default::default(),
         retired: Default::default(),
         bound: Default::default(),
+        last_take: Default::default(),
         built_at: Default::default(),
         released_idle: Default::default(),
         never_fit: Default::default(),
@@ -2203,6 +2336,53 @@ static PACE_OTHERS: AtomicU64 = AtomicU64::new(0);
 /// the title loads through its storage API (`pso_sched::loading`, set by `pace`; until it has
 /// run it does: a title starts by loading)
 static TITLE_LOADING: AtomicBool = AtomicBool::new(true);
+/// whether the title was drawing at the last pace step (`title_drawing`): the change is logged once
+#[cfg(not(test))]
+static DRAWING: AtomicBool = AtomicBool::new(false);
+
+/// `XCL_PRELOAD_LIVE` (default 1): background compiles give way while the title draws. A title
+/// that presents a frame is drawing now, and its own threads are what the frame waits on: the
+/// preload builds what a bind asks for, at the priority a bind gives it, and stops speculating
+/// until the title stops presenting for `live_after`.
+#[cfg(not(test))]
+fn live_preload() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = std::env::var("XCL_PRELOAD_LIVE").map_or(true, |v| v.trim() != "0");
+        if !on {
+            crate::xlog_info!("D3D12.X: background compiles go on at their own pace while the title draws (XCL_PRELOAD_LIVE=0)");
+        }
+        on
+    })
+}
+
+/// How long after the last present the title still counts as drawing (`XCL_PRELOAD_LIVE_MS`,
+/// default 2000): at 0.8 fps a frame is 1.25 s apart, so a shorter window would let the preload
+/// back in between frames.
+#[cfg(not(test))]
+fn live_after() -> std::time::Duration {
+    static MS: OnceLock<u64> = OnceLock::new();
+    std::time::Duration::from_millis(*MS.get_or_init(|| {
+        std::env::var("XCL_PRELOAD_LIVE_MS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(2000)
+    }))
+}
+
+/// background compiles at once while the title draws (`XCL_PRELOAD_LIVE_WORKERS`, default 2; at
+/// least one, since a build a bind is waiting for runs on a worker)
+#[cfg(not(test))]
+fn live_workers() -> usize {
+    static N: OnceLock<usize> = OnceLock::new();
+    (*N.get_or_init(|| {
+        std::env::var("XCL_PRELOAD_LIVE_WORKERS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(2)
+    }))
+    .max(1)
+}
+
+/// Whether the title draws now: it presented a frame within `live_after` (`live_preload`).
+#[cfg(not(test))]
+fn title_drawing() -> bool {
+    live_preload() && super::present::since_present().is_some_and(|age| age < live_after())
+}
 
 /// Whether the title loads now, as far as its storage API tells.
 pub fn title_loading() -> bool {
@@ -2235,13 +2415,25 @@ fn pace(pool: usize, workers: mpsc::Receiver<Arc<BoostToken>>) {
         let loading = super::pso_sched::loading(read.0.saturating_sub(ran.0), read.1.saturating_sub(ran.1), (now - at).as_millis() as u64);
         TITLE_LOADING.store(loading, Ordering::Relaxed);
         let tempo = pace.step(others, loading);
-        let rest = if tempo.low { LOADING_PRIORITY } else { PRELOAD_PRIORITY };
+        // A title that draws gets the cores: `live_workers` compiles at once, at idle priority,
+        // until it stops presenting. What a bind waits for keeps its own priority (BoostToken),
+        // and a bind that finds no worker builds on its own thread (`resolve_wait`).
+        let drawing = title_drawing();
+        if DRAWING.swap(drawing, Ordering::AcqRel) != drawing {
+            if drawing {
+                crate::xlog_info!("D3D12.X: the title draws: background compiles go to {} at a time at idle priority, and back to their own pace once it stops presenting for {} ms (XCL_PRELOAD_LIVE=0: as before)", live_workers(), live_after().as_millis());
+            } else {
+                crate::xlog_info!("D3D12.X: the title stopped drawing: background compiles go back to their own pace");
+            }
+        }
+        let at_once = if drawing { tempo.workers.min(live_workers()) } else { tempo.workers };
+        let rest = if drawing { LIVE_PRIORITY } else if tempo.low { LOADING_PRIORITY } else { PRELOAD_PRIORITY };
         if REST_PRIORITY.swap(rest, Ordering::AcqRel) != rest {
             for w in &workers {
                 w.rest(rest);
             }
         }
-        PACE_WORKERS.store(tempo.workers, Ordering::Release);
+        PACE_WORKERS.store(at_once, Ordering::Release);
         PACE_OTHERS.store(others, Ordering::Relaxed);
         super::real::sample_background_headroom();
         (at, before, ran) = (now, after, read);
@@ -2265,7 +2457,11 @@ pub fn ahead_summary() -> String {
         PUT_OFFS.load(Ordering::Relaxed),
         BUILDING_AHEAD.load(Ordering::Relaxed),
         PACE_WORKERS.load(Ordering::Relaxed).min(pool),
-        if REST_PRIORITY.load(Ordering::Relaxed) == LOADING_PRIORITY { " at the lowest priority" } else { "" },
+        match REST_PRIORITY.load(Ordering::Relaxed) {
+            p if p == LIVE_PRIORITY => " at idle priority, the title drawing",
+            p if p == LOADING_PRIORITY => " at the lowest priority",
+            _ => "",
+        },
         PACE_OTHERS.load(Ordering::Relaxed) as f64 / 1000.0,
         super::real::background_memory_summary(),
         if title_loading() { ", the title loads" } else { "" },
@@ -2362,7 +2558,11 @@ fn preload() -> Option<&'static Preload> {
                     }
                     let _taken = Taken(q, lane);
                     // (a parked one was counted as taken when it was first taken)
-                    let _task = (!matches!(lane, super::pso_sched::Lane::Parked | super::pso_sched::Lane::ParkedPeer)).then(|| crate::progress::PIPELINES.take());
+                    let _task = (!matches!(
+                        lane,
+                        super::pso_sched::Lane::Parked | super::pso_sched::Lane::ParkedPeer | super::pso_sched::Lane::RtParked
+                    ))
+                    .then(|| crate::progress::PIPELINES.take());
                     let Some(p) = p.upgrade() else { continue };
                     if p.orphan.load(Ordering::Acquire) {
                         continue;
@@ -2794,8 +2994,7 @@ mod used_tests {
         *p.job.lock().unwrap() = Some(build());
         assert_eq!(p.real.load(Ordering::SeqCst), 0, "taken away: the caller keeps it until its lists are through");
         assert!(!p.skipped.load(Ordering::Acquire) && !p.submit_gave_up.load(Ordering::Acquire), "its next bind waits for it and queues its build as a first bind does");
-        // (the idle thread may rebuild it before the next bind gets there; that the bind builds it
-        // again is what this proves, and the assertion below is that)
+        assert!(is_pending(draw), "waiting for a bind again");
         let second = resolve_wait(draw);
         assert!(second >= 0x7E57_9000 && second != first, "a bind builds it again: {second:#x}");
         assert!(p.rebuild.load(Ordering::Acquire), "logged as a rebuild");
@@ -3117,7 +3316,7 @@ mod ahead_tests {
             real
         }), 0);
         let count = AtomicUsize::new(0);
-        let Err(PendingComputeSkip::Deadline { waited_ms, .. }) = resolve_with_deadline(standin, &count, Some(Duration::from_millis(10))) else {
+        let Err(PendingComputeSkip::Deadline { waited_ms, .. }) = resolve_with_deadline(standin, &count, Some(Duration::from_millis(10)), None) else {
             panic!("pending compute did not hit its deadline");
         };
         assert!(waited_ms >= 10);
@@ -3175,7 +3374,7 @@ mod ahead_tests {
 
         let used = std::thread::spawn(move || {
             let count = AtomicUsize::new(0);
-            (resolve_wait_from(standin, &count), count.load(Ordering::Relaxed))
+            (resolve_wait_from(standin, &count, None), count.load(Ordering::Relaxed))
         });
         wait_until("compute use makes the unfinished build urgent", || pending.urgent.load(Ordering::Acquire));
         assert!(!used.is_finished());
@@ -3354,6 +3553,16 @@ fn entry(pso: usize) -> Option<Arc<Pending>> {
     PENDING.lock().unwrap().as_ref()?.get(&pso).cloned()
 }
 
+/// `pso`'s PC pipeline once it is built, without asking for one (None: a stand-in still being
+/// built, or one that was never submitted). For a reader that must not start work, such as the
+/// removal's record of the pipelines in flight.
+pub(super) fn built_real(pso: usize) -> Option<usize> {
+    entry(pso).map_or(Some(pso), |p| match p.real.load(Ordering::Acquire) {
+        0 => None,
+        real => Some(real),
+    })
+}
+
 /// The pipeline to use for `pso` now: the real one once built, else `pso` itself.
 pub fn resolve(pso: usize) -> usize {
     let Some(p) = entry(pso) else { return pso };
@@ -3384,7 +3593,7 @@ static WORST_WAIT: AtomicUsize = AtomicUsize::new(0);
 /// binds now), and the bind waits until it is built (`LONG_WAIT`). A build that failed leaves
 /// the stand-in (its failure is logged where it failed).
 pub fn resolve_wait(pso: usize) -> usize {
-    resolve_wait_from(pso, &USE_WAITS)
+    resolve_wait_from(pso, &USE_WAITS, None)
 }
 
 fn compute_skip_pending() -> Option<std::time::Duration> {
@@ -3422,9 +3631,16 @@ pub(super) fn allow_image_skip(pso: usize) {
 /// frame wait budgets (`frame_budget`) before they are skipped at once.
 const DEPTH_ONLY_BUDGETS: u32 = 4;
 
-/// Ray tracing off with every ray a miss (`raytracing::miss_pass`): `pso`'s build goes behind every
-/// other one, in the bind queue and in the preload's backlog, so it never takes a worker or a
-/// driver slot a pipeline the frame draws with is waiting for.
+/// `p` is a ray-tracing pipeline (`raytracing::rt_pipeline`, `XCL_RT_COMPILE_QUEUE`): its build
+/// goes in the class's own queue, `pso_sched::RT_AT_ONCE` of them at once.
+fn rt_class(p: &Pending) -> bool {
+    super::pso_sched::rt_compile_queue() && p.rt_pass.load(Ordering::Acquire)
+}
+
+/// A ray-tracing pipeline (`raytracing::rt_pipeline`): `pso`'s build goes behind every other one,
+/// in the bind queue and in the preload's backlog, in a queue of its own of
+/// `pso_sched::RT_AT_ONCE` builds at once (`XCL_RT_COMPILE_QUEUE=1`; unset: with the others), so it never
+/// takes the workers or the driver slots a pipeline the frame draws with is waiting for.
 pub(super) fn rt_pass_last(pso: usize) {
     if let Some(p) = entry(pso) {
         p.rt_pass.store(true, Ordering::Release);
@@ -3441,6 +3657,45 @@ pub(super) fn allow_depth_wait(pso: usize) {
             q.change(Change::DepthOnly(p.preload_seq.load(Ordering::Relaxed)));
         }
     }
+}
+
+/// A pass with `pso`, still being built, renders into the lighting target `target`
+/// (`light_wait`): its bind waits within `XCL_LIGHT_WAIT` rather than skipping it (`light_left`).
+pub(super) fn allow_light_wait(pso: usize, target: &str) {
+    if let Some(p) = entry(pso) {
+        let mut light = p.light.lock().unwrap();
+        if light.is_none() {
+            *light = Some(target.to_owned());
+        }
+    }
+}
+
+/// The lighting target a pass with `pso` renders into (`light_wait`), for the log.
+pub(super) fn light_target(pso: usize) -> Option<String> {
+    entry(pso)?.light.lock().unwrap().clone()
+}
+
+/// The wait a pass into a lighting target takes now, where it would be skipped for its pipeline
+/// (`XCL_LIGHT_WAIT`): once a pipeline (`light_waited`), within the frame's wait
+/// (`light_wait::left`) and never a bundle's, whose binds wait for the build itself. None: no wait
+/// – the pass is skipped as before.
+fn light_left(p: &Pending) -> Option<std::time::Duration> {
+    if super::light_wait::budget().is_none() || WAIT_FOR_BUILD.with(Cell::get) || p.light_waited.load(Ordering::Acquire) || p.submit_gave_up.load(Ordering::Acquire) {
+        return None;
+    }
+    if p.light.lock().unwrap().is_none() {
+        return None;
+    }
+    if p.light_waited.swap(true, Ordering::AcqRel) {
+        return None;
+    }
+    let Some(left) = super::light_wait::left() else {
+        // the frame's wait is used up: the pipeline keeps its chance for a frame with room
+        p.light_waited.store(false, Ordering::Release);
+        return None;
+    };
+    start_status();
+    Some(left)
 }
 
 /// Workers that build passes over the screen alone, besides the others (`mark_screen_pass`).
@@ -3536,22 +3791,28 @@ pub(super) enum PendingComputeSkip {
 }
 
 pub(super) fn resolve_for_compute_use(pso: usize) -> Result<usize, PendingComputeSkip> {
-    resolve_with_deadline(pso, &USE_WAITS, compute_skip_pending())
+    resolve_with_deadline(pso, &USE_WAITS, compute_skip_pending(), None)
 }
 
 pub(super) fn resolve_wait_at_bind(pso: usize) -> usize {
-    resolve_wait_from(pso, &BIND_WAITS)
+    resolve_wait_from(pso, &BIND_WAITS, None)
 }
 
-fn resolve_wait_from(pso: usize, site_waits: &AtomicUsize) -> usize {
-    match resolve_with_deadline(pso, site_waits, None) {
+/// `resolve_wait`, with the wait a pass into a lighting target takes instead of being skipped
+/// (`XCL_LIGHT_WAIT`; `pass` is the call the log names).
+pub(super) fn resolve_wait_light(pso: usize, pass: &'static str) -> usize {
+    resolve_wait_from(pso, &USE_WAITS, Some(pass))
+}
+
+fn resolve_wait_from(pso: usize, site_waits: &AtomicUsize, pass: Option<&'static str>) -> usize {
+    match resolve_with_deadline(pso, site_waits, None, pass) {
         Ok(real) => real,
         Err(PendingComputeSkip::ImageOnly) => pso,
         Err(PendingComputeSkip::Deadline { .. }) => unreachable!("no compute skip deadline"),
     }
 }
 
-fn resolve_with_deadline(pso: usize, site_waits: &AtomicUsize, compute_limit: Option<std::time::Duration>) -> Result<usize, PendingComputeSkip> {
+fn resolve_with_deadline(pso: usize, site_waits: &AtomicUsize, compute_limit: Option<std::time::Duration>, pass: Option<&'static str>) -> Result<usize, PendingComputeSkip> {
     let Some(p) = entry(pso) else { return Ok(pso) };
     if p.left_out.load(Ordering::Acquire) {
         if !super::fsr4_standin::member(pso) {
@@ -3578,7 +3839,11 @@ fn resolve_with_deadline(pso: usize, site_waits: &AtomicUsize, compute_limit: Op
             return Err(PendingComputeSkip::ImageOnly);
         }
         let screen = if p.screen.load(Ordering::Acquire) { screen_left() } else { None };
-        if screen.is_none() && skip_until_built() && if p.compute { super::bind::skip_failed_dispatches() } else { super::bind::skip_failed_draws() } {
+        let skipping = screen.is_none() && skip_until_built() && if p.compute { super::bind::skip_failed_dispatches() } else { super::bind::skip_failed_draws() };
+        // (`XCL_LIGHT_WAIT`: a pass into a lighting target that would be skipped now waits for its
+        // pipeline first – once a pipeline, within the frame's wait, `light_wait`)
+        let light = if p.compute || !skipping || pass.is_none() { None } else { light_left(&p) };
+        if skipping && light.is_none() {
             start_status();
             p.sent.store(true, Ordering::Release);
             let by_skips = bound_by_skips();
@@ -3614,6 +3879,8 @@ fn resolve_with_deadline(pso: usize, site_waits: &AtomicUsize, compute_limit: Op
             compute_limit.or_else(backstop)
         } else if screen.is_some() {
             screen
+        } else if let Some(light) = light {
+            Some(light)
         } else if p.skipped.load(Ordering::Acquire) || over_budget {
             Some(std::time::Duration::ZERO)
         } else {
@@ -3639,14 +3906,19 @@ fn resolve_with_deadline(pso: usize, site_waits: &AtomicUsize, compute_limit: Op
                             t0.elapsed().as_millis()
                         );
                     }
+                    add_frame_wait(t0.elapsed());
+                } else if let (Some(granted), Some(pass)) = (light, pass) {
+                    // (its own wait, not the frame's: `light_wait` keeps that budget)
+                    super::light_wait::waited(pass, pso, t0.elapsed(), granted, false);
+                } else {
+                    add_frame_wait(t0.elapsed());
                 }
-                add_frame_wait(t0.elapsed());
                 let ms = t0.elapsed().as_millis() as usize;
                 super::pso_manifest::note_blocked(p.record, ms);
                 site_waits.fetch_add(1, Ordering::Relaxed);
                 WAIT_MS.fetch_add(ms, Ordering::Relaxed);
                 SKIPS.fetch_add(1, Ordering::Relaxed);
-                if over_budget && !p.skipped.load(Ordering::Acquire) {
+                if over_budget && light.is_none() && !p.skipped.load(Ordering::Acquire) {
                     let n = BUDGET_SKIPS.fetch_add(1, Ordering::Relaxed) + 1;
                     if n <= 8 || n.is_power_of_two() {
                         crate::xlog_warn!(
@@ -3667,10 +3939,12 @@ fn resolve_with_deadline(pso: usize, site_waits: &AtomicUsize, compute_limit: Op
                     if p.key != 0 {
                         used::note_skipped(p.key);
                     }
-                    crate::xlog_warn!(
-                        "D3D12.X: a draw skipped: graphics pipeline {pso:#x} ({}) not built after {ms} ms of waiting (XCL_BIND_BACKSTOP_MS) – its build goes on ahead of the others; draws with it are skipped until it is built, then use it",
-                        if p.what.is_empty() { "shaders unknown" } else { &p.what }
-                    );
+                    if light.is_none() {
+                        crate::xlog_warn!(
+                            "D3D12.X: a draw skipped: graphics pipeline {pso:#x} ({}) not built after {ms} ms of waiting (XCL_BIND_BACKSTOP_MS) – its build goes on ahead of the others; draws with it are skipped until it is built, then use it",
+                            if p.what.is_empty() { "shaders unknown" } else { &p.what }
+                        );
+                    }
                 }
                 return Ok(pso);
             } else if compute_limit.is_some() {
@@ -3697,7 +3971,9 @@ fn resolve_with_deadline(pso: usize, site_waits: &AtomicUsize, compute_limit: Op
         }
         drop(done);
         let waited = t0.elapsed();
-        if screen.is_some() {
+        if let (Some(granted), Some(pass)) = (light, pass) {
+            super::light_wait::waited(pass, pso, waited, granted, true);
+        } else if screen.is_some() {
             add_screen_wait(waited);
         } else {
             add_frame_wait(waited);
@@ -3818,6 +4094,12 @@ pub fn compute_bound_pending() -> bool {
 /// (its pipeline key, its shaders) of stand-in `pso` (0 and nothing: not built in the background).
 pub fn key_of(pso: usize) -> (u64, String) {
     entry(pso).map_or((0, String::new()), |p| (p.key, p.what.clone()))
+}
+
+/// The pipeline key of `pso` alone: `key_of` without the shader text's copy, for a caller that
+/// counts by it.
+pub(super) fn key_only(pso: usize) -> u64 {
+    entry(pso).map_or(0, |p| p.key)
 }
 
 /// draws and dispatches skipped as their pipeline was still being built
@@ -4096,12 +4378,16 @@ mod tests {
             done: Default::default(),
             cv: Default::default(),
             compute,
+            stage: stage_of(compute),
             image_only: Default::default(),
             depth_only: Default::default(),
             screen: Default::default(),
+            light: Default::default(),
+            light_waited: Default::default(),
             rt_pass: Default::default(),
             key: 0,
             record: 0,
+            log_key: 0,
             used: Default::default(),
             orphan: Default::default(),
             full_started: Default::default(),
@@ -4112,6 +4398,7 @@ mod tests {
             counted: Default::default(),
             retired: Default::default(),
             bound: Default::default(),
+            last_take: Default::default(),
             built_at: Default::default(),
             released_idle: Default::default(),
             never_fit: Default::default(),
@@ -4164,12 +4451,16 @@ mod tests {
             done: Default::default(),
             cv: Default::default(),
             compute,
+            stage: stage_of(compute),
             image_only: Default::default(),
             depth_only: Default::default(),
             screen: Default::default(),
+            light: Default::default(),
+            light_waited: Default::default(),
             rt_pass: Default::default(),
             key: 0,
             record: 0,
+            log_key: 0,
             used: Default::default(),
             orphan: Default::default(),
             full_started: Default::default(),
@@ -4180,6 +4471,7 @@ mod tests {
             counted: Default::default(),
             retired: Default::default(),
             bound: Default::default(),
+            last_take: Default::default(),
             built_at: Default::default(),
             released_idle: Default::default(),
             never_fit: Default::default(),
@@ -4295,4 +4587,50 @@ mod tests {
         assert_eq!(released(standin), 0);
         assert_eq!(released(again), 0x7300_0130);
     }
+}
+/// How many pipeline states a memory-short round gives up: the round is repeated every second
+/// while the pressure holds (`real::start_unload`), and a title that comes back to a pass gets its
+/// builds back one at a time rather than all at once.
+const FREE_PER_ROUND: usize = 64;
+
+/// Gives up the real pipeline of every pipeline a bind has not taken for `limit` while the memory
+/// is short (`real::unload_pressure`), whatever the compiled-code budget says: those whose driver
+/// blob or library entry is on disk (`real::pso_from_disk`), so the next bind builds them again
+/// without compiling their shaders. Every one is retired (`shader_code::retire`), not released:
+/// lists that took it may still run, and `shader_code::through` gives it back once they are
+/// through. Returns (released, kept because nothing of them is on disk).
+pub(super) fn free_idle_psos(limit: std::time::Duration) -> (usize, usize) {
+    let now = since_start();
+    let limit_ms = limit.as_millis() as u64;
+    let all: Vec<(usize, Arc<Pending>)> = PENDING.lock().unwrap_or_else(|e| e.into_inner()).as_ref().map_or_else(Vec::new, |m| m.iter().map(|(&standin, p)| (standin, p.clone())).collect());
+    let mut candidates = Vec::new();
+    for (at, (standin, p)) in all.iter().enumerate() {
+        if p.real.load(Ordering::Acquire) == 0 || p.orphan.load(Ordering::Acquire) || p.builder.load(Ordering::Acquire) || p.real_fast.load(Ordering::Acquire) {
+            continue;
+        }
+        // (a member of a pass chain stays: while one is not built no pass of its chain runs)
+        if super::pass_chain::member(*standin) || job_of(p).is_none() {
+            continue;
+        }
+        let taken = p.last_take.load(Ordering::Acquire);
+        let at_ms = if taken != 0 { taken } else { p.built_at.load(Ordering::Acquire) };
+        if at_ms == 0 {
+            continue;
+        }
+        candidates.push((at, at_ms, super::real::pso_from_disk(p.real.load(Ordering::Acquire))));
+    }
+    let (free, kept) = super::pso_sched::idle_binds_to_free(&mut candidates, now, limit_ms, FREE_PER_ROUND);
+    let listed = free.len();
+    let mut released = 0;
+    for at in free {
+        let p = &all[at].1;
+        let real = p.real.load(Ordering::Acquire);
+        // (looked at again: a bind may have taken it since the candidates were listed)
+        if real != 0 && super::real::pso_from_disk(real) && release_used(p, real, true) {
+            super::shader_code::retire(real);
+            released += 1;
+        }
+    }
+    // (a candidate a bind took between the listing and here stays built: kept, not released)
+    (released, kept + listed.saturating_sub(released))
 }

@@ -1,7 +1,7 @@
 //! In-process HLSL → DXIL compilation with DXC.
 //!
 //! `dxcompiler.dll` is not part of Windows, so it is loaded at run time from
-//! `%XCL_DXC_DIR%`, the folder of XSEmu.exe, or the Windows SDK with the newest DXC
+//! `%XCL_DXC_DIR%`, the folder of xcl.exe, or the Windows SDK with the newest DXC
 //! (`Windows Kits\10\bin\<ver>\x64`). `dxil.dll` from the same folder is loaded first so
 //! the compiler can sign the DXIL (unsigned DXIL is rejected by D3D12).
 //!

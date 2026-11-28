@@ -6,9 +6,13 @@ type Result<T> = std::result::Result<T, &'static str>;
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub(crate) enum PageKey {
     Physical(u64),
+    // Allocation-keyed page pinning has no caller yet; kept for the next fix.
+    #[allow(dead_code)]
     Allocation { generation: u64, page: u64 },
 }
 
+// Allocation-keyed page pinning has no caller yet; kept for the next fix.
+#[allow(dead_code)]
 pub(crate) struct PinnedPage {
     pub key: PageKey,
     pub readable: bool,
@@ -47,6 +51,8 @@ impl BindingIndex {
         Ok(())
     }
 
+    // Allocation-keyed page pinning has no caller yet; kept for the next fix.
+    #[allow(dead_code)]
     pub(crate) fn pin(
         &self,
         uav: u32,

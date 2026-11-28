@@ -14,13 +14,27 @@ use std::sync::Arc;
 use windows::core::{IUnknown, Interface};
 use windows::Win32::Graphics::{Direct3D12::*, Dxgi::Common::DXGI_SAMPLE_DESC};
 
+// Image-bridge command recording is not wired into the title path yet; kept for the next fix.
+#[allow(dead_code)]
 type Result<T> = std::result::Result<T, String>;
+// Image-bridge command recording is not wired into the title path yet; kept for the next fix.
+#[allow(dead_code)]
 const ALL: u32 = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+// Image-bridge command recording is not wired into the title path yet; kept for the next fix.
+#[allow(dead_code)]
 const COMMON: D3D12_RESOURCE_STATES = D3D12_RESOURCE_STATE_COMMON;
+// Image-bridge command recording is not wired into the title path yet; kept for the next fix.
+#[allow(dead_code)]
 const UAV: D3D12_RESOURCE_STATES = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+// Image-bridge command recording is not wired into the title path yet; kept for the next fix.
+#[allow(dead_code)]
 const SRC: D3D12_RESOURCE_STATES = D3D12_RESOURCE_STATE_COPY_SOURCE;
+// Image-bridge command recording is not wired into the title path yet; kept for the next fix.
+#[allow(dead_code)]
 const DST: D3D12_RESOURCE_STATES = D3D12_RESOURCE_STATE_COPY_DEST;
 
+// Image-bridge command recording is not wired into the title path yet; kept for the next fix.
+#[allow(dead_code)]
 fn unique_id() -> Result<u64> {
     static NEXT: AtomicU64 = AtomicU64::new(1);
     NEXT.try_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
@@ -29,6 +43,8 @@ fn unique_id() -> Result<u64> {
 
 /// The three real SM 6.6 PSOs use one directly indexed root signature:
 /// eight constants b0, raw SRV t0, raw UAVs u0 and u1 (all root descriptors).
+// Image-bridge command recording is not wired into the title path yet; kept for the next fix.
+#[allow(dead_code)]
 pub(crate) struct Kernels {
     pub signature: ID3D12RootSignature,
     pub capture: ID3D12PipelineState,
@@ -36,6 +52,8 @@ pub(crate) struct Kernels {
     pub scatter: ID3D12PipelineState,
 }
 
+// Image-bridge command recording is not wired into the title path yet; kept for the next fix.
+#[allow(dead_code)]
 pub(crate) struct Directory {
     pub root_srv: u32,
     pub uma_base_hi: u32,
@@ -44,6 +62,8 @@ pub(crate) struct Directory {
 }
 
 impl Directory {
+    // Image-bridge command recording is not wired into the title path yet; kept for the next fix.
+    #[allow(dead_code)]
     fn valid(&self, heap_len: u32) -> bool {
         (1..heap_len).contains(&self.root_srv)
             && (1..=4).contains(&self.windows)
@@ -56,6 +76,8 @@ impl Directory {
 
 /// Entry/exit states for one selected native subresource.
 #[derive(Clone, Copy)]
+// Image-bridge command recording is not wired into the title path yet; kept for the next fix.
+#[allow(dead_code)]
 pub(crate) struct States {
     pub before: D3D12_RESOURCE_STATES,
     pub after: D3D12_RESOURCE_STATES,
@@ -65,6 +87,8 @@ pub(crate) struct States {
 /// submitter must pin the referenced physical runs and immutable descriptors
 /// through the final gather/scatter fence, including work on other queues.
 #[derive(Clone)]
+// Image-bridge command recording is not wired into the title path yet; kept for the next fix.
+#[allow(dead_code)]
 pub(crate) struct CapturedPages {
     id: u64,
     recorder: u64,
@@ -76,11 +100,15 @@ pub(crate) struct CapturedPages {
 }
 
 impl CapturedPages {
+    // Image-bridge command recording is not wired into the title path yet; kept for the next fix.
+    #[allow(dead_code)]
     pub(crate) fn capture_id(&self) -> u64 {
         self.id
     }
 }
 
+// Image-bridge command recording is not wired into the title path yet; kept for the next fix.
+#[allow(dead_code)]
 pub(crate) struct Plane {
     native: ID3D12Resource,
     native_id: usize,
@@ -89,6 +117,8 @@ pub(crate) struct Plane {
     footprint: ID3D12Resource,
 }
 
+// Image-bridge command recording is not wired into the title path yet; kept for the next fix.
+#[allow(dead_code)]
 unsafe fn buffer(dev: &ID3D12Device, width: u64, heap: D3D12_HEAP_TYPE) -> Result<ID3D12Resource> {
     let state = match heap {
         D3D12_HEAP_TYPE_UPLOAD => D3D12_RESOURCE_STATE_GENERIC_READ,
@@ -124,6 +154,8 @@ unsafe fn buffer(dev: &ID3D12Device, width: u64, heap: D3D12_HEAP_TYPE) -> Resul
 }
 
 impl Plane {
+    // Image-bridge command recording is not wired into the title path yet; kept for the next fix.
+    #[allow(dead_code)]
     pub(super) fn index(&self, sub: u32) -> Result<usize> {
         self.plan
             .subs
@@ -132,10 +164,14 @@ impl Plane {
     }
 
     /// COM identity of the actual native texture, not a physical page identity.
+    // Image-bridge command recording is not wired into the title path yet; kept for the next fix.
+    #[allow(dead_code)]
     pub(crate) fn native_id(&self) -> usize {
         self.native_id
     }
 
+    // Image-bridge command recording is not wired into the title path yet; kept for the next fix.
+    #[allow(dead_code)]
     pub(crate) fn request(&self, topology: &CapturedTopology, sub: u32, write: bool, evidence: PayloadEvidence) -> Result<Request> {
         if u64::from(topology.first_vpn()) != self.plan.page_base >> 16 || topology.len() != self.plan.page_count as usize {
             return Err("captured topology does not cover this native image".into());
@@ -148,6 +184,8 @@ impl Plane {
 
     /// `plan` must have been created by Plan::expanded_plane for this exact texture.
     /// Fence or serialize reuse of this plane's private footprint.
+    // Image-bridge command recording is not wired into the title path yet; kept for the next fix.
+    #[allow(dead_code)]
     pub(crate) unsafe fn new(dev: &ID3D12Device, native: &ID3D12Resource, plan: Plan) -> Result<Self> {
         let data_bytes = plan.subs.len().checked_mul(size_of::<[u32; 68]>()).ok_or("image plan too large")?;
         if data_bytes == 0 || plan.page_count == 0 {
@@ -173,6 +211,8 @@ impl Plane {
 }
 
 /// Only creates fresh lists. The open list isn't exposed to native recorders.
+// Image-bridge command recording is not wired into the title path yet; kept for the next fix.
+#[allow(dead_code)]
 pub(crate) struct Recorder<'a, 'grant> {
     grants: PhantomData<&'grant WritePermit>,
     id: u64,
@@ -185,6 +225,8 @@ pub(crate) struct Recorder<'a, 'grant> {
 }
 
 impl<'a, 'grant> Recorder<'a, 'grant> {
+    // Image-bridge command recording is not wired into the title path yet; kept for the next fix.
+    #[allow(dead_code)]
     pub(crate) unsafe fn begin(
         dev: &'a ID3D12Device,
         allocator: &ID3D12CommandAllocator,
@@ -216,6 +258,8 @@ impl<'a, 'grant> Recorder<'a, 'grant> {
         })
     }
 
+    // Image-bridge command recording is not wired into the title path yet; kept for the next fix.
+    #[allow(dead_code)]
     pub(crate) unsafe fn finish(self) -> Result<Recorded<'grant>> {
         self.list.Close().map_err(|e| format!("closing image bridge list: {e}"))?;
         Ok(Recorded {
@@ -230,6 +274,8 @@ impl<'a, 'grant> Recorder<'a, 'grant> {
     /// Record at the consumer or producer boundary, after all PTE updates.
     /// The directory and leaves must be shader-readable, and canonical raw
     /// page buffers UAV-accessible; queue waits and their states belong to the submitter.
+    // Image-bridge command recording is not wired into the title path yet; kept for the next fix.
+    #[allow(dead_code)]
     pub(crate) unsafe fn capture(&self, plane: &Plane, dir: &Directory) -> Result<CapturedPages> {
         let plan = &plane.plan;
         if !dir.valid(self.heap.GetDesc().NumDescriptors) {
@@ -257,6 +303,8 @@ impl<'a, 'grant> Recorder<'a, 'grant> {
 
     /// Seal this capture list with a copy of its GPU-produced owner records.
     /// Requiring the original recorder prevents certifying an unsubmitted capture.
+    // Image-bridge command recording is not wired into the title path yet; kept for the next fix.
+    #[allow(dead_code)]
     pub(crate) unsafe fn read_owners(self, pages: &CapturedPages) -> Result<OwnerReadback<'grant>> {
         if self.id != pages.recorder {
             return Err("owner readback must seal the list that captured the pages".into());
@@ -278,6 +326,8 @@ impl<'a, 'grant> Recorder<'a, 'grant> {
 
     /// Seed from the current native owner, then replace mapped bytes and
     /// explicit holes. An ordinary absent page outside UMA retains native data.
+    // Image-bridge command recording is not wired into the title path yet; kept for the next fix.
+    #[allow(dead_code)]
     pub(crate) unsafe fn materialize(
         &mut self,
         plane: &Plane,
@@ -319,6 +369,8 @@ impl<'a, 'grant> Recorder<'a, 'grant> {
     /// the current directory. Each dirty native subresource must own all its
     /// mapped bytes exclusively until publication. This is not a partial
     /// write mask and cannot merge unordered writes through a raw alias.
+    // Image-bridge command recording is not wired into the title path yet; kept for the next fix.
+    #[allow(dead_code)]
     pub(crate) unsafe fn publish(
         &mut self,
         plane: &Plane,
@@ -353,6 +405,8 @@ impl<'a, 'grant> Recorder<'a, 'grant> {
         Ok(())
     }
 
+    // Image-bridge command recording is not wired into the title path yet; kept for the next fix.
+    #[allow(dead_code)]
     fn select(&self, plane: &Plane, pages: &CapturedPages, native_subs: &[(u32, States)]) -> Result<Vec<(usize, States)>> {
         if pages.native != plane.native
             || pages.heap != *self.heap
@@ -364,6 +418,8 @@ impl<'a, 'grant> Recorder<'a, 'grant> {
         select(&plane.plan.subs, self.kind, native_subs)
     }
 
+    // Image-bridge command recording is not wired into the title path yet; kept for the next fix.
+    #[allow(dead_code)]
     unsafe fn bind(&self, plane: &Plane, pages: &CapturedPages, sub: usize) {
         self.list
             .SetComputeRootShaderResourceView(1, plane.params.GetGPUVirtualAddress() + (sub * size_of::<[u32; 68]>()) as u64);
@@ -371,6 +427,8 @@ impl<'a, 'grant> Recorder<'a, 'grant> {
         self.list.SetComputeRootUnorderedAccessView(3, plane.footprint.GetGPUVirtualAddress());
     }
 
+    // Image-bridge command recording is not wired into the title path yet; kept for the next fix.
+    #[allow(dead_code)]
     unsafe fn dispatch(&self, params: [u32; 8], dims: [u32; 3]) {
         tiles(dims, |base, groups| {
             let mut constants = params;
@@ -382,6 +440,8 @@ impl<'a, 'grant> Recorder<'a, 'grant> {
         });
     }
 
+    // Image-bridge command recording is not wired into the title path yet; kept for the next fix.
+    #[allow(dead_code)]
     unsafe fn run_plane(&self, plane: &Plane, pages: &CapturedPages, selected: &[(usize, States)], scatter: bool) {
         self.list.SetPipelineState(if scatter { &self.kernels.scatter } else { &self.kernels.gather });
         for (n, &(i, _)) in selected.iter().enumerate() {
@@ -397,6 +457,8 @@ impl<'a, 'grant> Recorder<'a, 'grant> {
 
 /// No raw list escapes. A recorded capture or certified scatter can execute
 /// only once; replay would resolve a newer directory or reuse a retired permit.
+// Image-bridge command recording is not wired into the title path yet; kept for the next fix.
+#[allow(dead_code)]
 pub(crate) struct Recorded<'a> {
     list: ID3D12CommandList,
     _allocator: ID3D12CommandAllocator,
@@ -406,6 +468,8 @@ pub(crate) struct Recorded<'a> {
 }
 
 impl Recorded<'_> {
+    // Image-bridge command recording is not wired into the title path yet; kept for the next fix.
+    #[allow(dead_code)]
     unsafe fn enqueue(&self, queue: &ID3D12CommandQueue, native: Option<ID3D12CommandList>) -> Result<()> {
         let mut dev: Option<ID3D12Device> = None;
         queue.GetDevice(&mut dev).map_err(|e| e.to_string())?;
@@ -420,24 +484,32 @@ impl Recorded<'_> {
 
     /// Caller retains the allocator, resources, descriptor pins and access
     /// grants through its own successful queue signal and fence completion.
+    // Image-bridge command recording is not wired into the title path yet; kept for the next fix.
+    #[allow(dead_code)]
     pub(crate) unsafe fn execute(self, queue: &ID3D12CommandQueue) -> Result<()> {
         self.enqueue(queue, None)
     }
 
     /// Submit gather and the native consumer in one ExecuteCommandLists so
     /// promoted resources do not decay between them.
+    // Image-bridge command recording is not wired into the title path yet; kept for the next fix.
+    #[allow(dead_code)]
     pub(super) unsafe fn execute_before(self, queue: &ID3D12CommandQueue, native: ID3D12CommandList) -> Result<()> {
         self.enqueue(queue, Some(native))
     }
 }
 
 #[derive(PartialEq)]
+// Image-bridge command recording is not wired into the title path yet; kept for the next fix.
+#[allow(dead_code)]
 enum ReadbackState {
     Recorded,
     Unconfirmed,
     Signalled,
 }
 
+// Image-bridge command recording is not wired into the title path yet; kept for the next fix.
+#[allow(dead_code)]
 pub(crate) struct OwnerReadback<'a> {
     list: Recorded<'a>,
     pages: CapturedPages,
@@ -448,24 +520,34 @@ pub(crate) struct OwnerReadback<'a> {
 
 /// Only constructed from a completed owner readback. This is resolver output,
 /// not a PFN declaration; the backend must join it to pinned run metadata.
+// Image-bridge command recording is not wired into the title path yet; kept for the next fix.
+#[allow(dead_code)]
 pub(crate) struct OwnerRecords {
     pages: CapturedPages,
     records: Vec<[u32; 4]>,
 }
 
 impl OwnerRecords {
+    // Image-bridge command recording is not wired into the title path yet; kept for the next fix.
+    #[allow(dead_code)]
     pub(crate) fn capture_id(&self) -> u64 {
         self.pages.capture_id()
     }
+    // Image-bridge command recording is not wired into the title path yet; kept for the next fix.
+    #[allow(dead_code)]
     pub(crate) fn first_vpn(&self) -> u32 {
         self.pages.first
     }
+    // Image-bridge command recording is not wired into the title path yet; kept for the next fix.
+    #[allow(dead_code)]
     pub(crate) fn records(&self) -> &[[u32; 4]] {
         &self.records
     }
 }
 
 impl OwnerReadback<'_> {
+    // Image-bridge command recording is not wired into the title path yet; kept for the next fix.
+    #[allow(dead_code)]
     pub(crate) unsafe fn try_topology(
         &self,
         resolve: impl FnMut(u32, Location) -> std::result::Result<Arc<PinnedPage>, &'static str>,
@@ -481,6 +563,8 @@ impl OwnerReadback<'_> {
     /// Keep the handle and all other submission resources until completion.
     /// On a signal failure the queue may have accepted the list: retain it
     /// through an independent retirement proof or device teardown, never replay.
+    // Image-bridge command recording is not wired into the title path yet; kept for the next fix.
+    #[allow(dead_code)]
     pub(crate) unsafe fn submit(&mut self, queue: &ID3D12CommandQueue) -> Result<()> {
         if self.state != ReadbackState::Recorded {
             return Err("owner readback already submitted".into());
@@ -492,6 +576,8 @@ impl OwnerReadback<'_> {
         Ok(())
     }
 
+    // Image-bridge command recording is not wired into the title path yet; kept for the next fix.
+    #[allow(dead_code)]
     pub(crate) unsafe fn try_records(&self) -> Result<Option<OwnerRecords>> {
         if self.state != ReadbackState::Signalled {
             return Err("owner readback has no confirmed queue signal".into());
@@ -522,6 +608,8 @@ impl OwnerReadback<'_> {
     }
 }
 
+// Image-bridge command recording is not wired into the title path yet; kept for the next fix.
+#[allow(dead_code)]
 fn select(subs: &[Subresource], kind: D3D12_COMMAND_LIST_TYPE, native_subs: &[(u32, States)]) -> Result<Vec<(usize, States)>> {
     let mut selected = Vec::with_capacity(native_subs.len());
     for &(sub, s) in native_subs {
@@ -540,6 +628,8 @@ fn select(subs: &[Subresource], kind: D3D12_COMMAND_LIST_TYPE, native_subs: &[(u
     Ok(selected)
 }
 
+// Image-bridge command recording is not wired into the title path yet; kept for the next fix.
+#[allow(dead_code)]
 fn tiles([w, h, d]: [u32; 3], mut emit: impl FnMut([u32; 3], [u32; 3])) {
     const MAX: u32 = D3D12_CS_DISPATCH_MAX_THREAD_GROUPS_PER_DIMENSION;
     for z in (0..d).step_by(MAX as usize) {
@@ -551,6 +641,8 @@ fn tiles([w, h, d]: [u32; 3], mut emit: impl FnMut([u32; 3], [u32; 3])) {
     }
 }
 
+// Image-bridge command recording is not wired into the title path yet; kept for the next fix.
+#[allow(dead_code)]
 pub(super) fn state_ok(kind: D3D12_COMMAND_LIST_TYPE, s: D3D12_RESOURCE_STATES) -> bool {
     let direct = kind == D3D12_COMMAND_LIST_TYPE_DIRECT;
     if !direct && kind != D3D12_COMMAND_LIST_TYPE_COMPUTE {
@@ -575,6 +667,8 @@ pub(super) fn state_ok(kind: D3D12_COMMAND_LIST_TYPE, s: D3D12_RESOURCE_STATES) 
     reads.contains(s)
 }
 
+// Image-bridge command recording is not wired into the title path yet; kept for the next fix.
+#[allow(dead_code)]
 unsafe fn uav_order(list: &ID3D12GraphicsCommandList) {
     list.ResourceBarrier(&[D3D12_RESOURCE_BARRIER {
         Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,
@@ -585,6 +679,8 @@ unsafe fn uav_order(list: &ID3D12GraphicsCommandList) {
     }]);
 }
 
+// Image-bridge command recording is not wired into the title path yet; kept for the next fix.
+#[allow(dead_code)]
 unsafe fn transition(list: &ID3D12GraphicsCommandList, r: &ID3D12Resource, sub: u32, before: D3D12_RESOURCE_STATES, after: D3D12_RESOURCE_STATES) {
     if before == after {
         return;
@@ -605,6 +701,8 @@ unsafe fn transition(list: &ID3D12GraphicsCommandList, r: &ID3D12Resource, sub: 
     ManuallyDrop::drop(&mut (*b.Anonymous.Transition).pResource);
 }
 
+// Image-bridge command recording is not wired into the title path yet; kept for the next fix.
+#[allow(dead_code)]
 unsafe fn copy(list: &ID3D12GraphicsCommandList, texture: &ID3D12Resource, scratch: &ID3D12Resource, sub: &Subresource, to_texture: bool) {
     let mut tex = D3D12_TEXTURE_COPY_LOCATION {
         pResource: ManuallyDrop::new(Some(texture.clone())),

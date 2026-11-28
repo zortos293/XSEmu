@@ -36,6 +36,8 @@ impl Scope {
     pub(crate) fn new(heaps:Vec<ID3D12DescriptorHeap>,predicate:Option<(ID3D12Resource,u64,D3D12_PREDICATION_OP)>)->Self {
         Self{heaps,predicate}
     }
+    // live::Live::packet has no caller yet; kept for the next fix.
+    #[allow(dead_code)]
     pub(crate) fn packet()->Self { Self::new(Vec::new(),None) }
     pub(crate) fn predicated(&self)->bool { self.predicate.is_some() }
 }

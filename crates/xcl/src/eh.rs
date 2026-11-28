@@ -158,10 +158,24 @@ unsafe extern "system" fn hk_nt_terminate_process(h: isize, status: i32) -> i32 
         } else {
             crate::hle::d3d12x::real::save_pipeline_libraries();
             crate::xlog_info!("process ends (thread {tid}); on the stack: {stack}");
+            if h == 0 && skip_loader_shutdown() {
+                crate::xlog_info!("process ends without the DLLs' shutdown (XCL_EXIT_SKIP_DETACH=1)");
+                crate::log::flush();
+                return orig(-1, status);
+            }
         }
         crate::log::flush();
     }
     orig(h, status)
+}
+
+/// `XCL_EXIT_SKIP_DETACH=1`: a clean end (status 0) goes straight to the process's termination,
+/// without the loader's DLL shutdown. ExitProcess ends every other thread first, xcl-trim
+/// included, and the NVIDIA driver then walks its shader cache views during its
+/// DLL_PROCESS_DETACH with nothing taking them out of the working set: play-117's close took
+/// available memory from 3.7 GB to 19 MB in 9 s with every title thread already gone.
+fn skip_loader_shutdown() -> bool {
+    std::env::var("XCL_EXIT_SKIP_DETACH").is_ok_and(|v| v.trim() == "1")
 }
 
 pub fn install_crash_handler() {

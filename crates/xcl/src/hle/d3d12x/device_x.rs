@@ -332,6 +332,7 @@ static LINEAGE_DEPTH_WRITE_PSOS: Mutex<Option<std::collections::HashSet<usize>>>
 
 pub(super) fn note_lineage_depth_pso(pso: usize, enabled: bool, mask: D3D12_DEPTH_WRITE_MASK, func: D3D12_COMPARISON_FUNC) {
     super::dsv_trace::pso(pso, enabled && mask == D3D12_DEPTH_WRITE_MASK_ALL && func != D3D12_COMPARISON_FUNC_NEVER);
+    super::census::pso(pso, enabled && mask == D3D12_DEPTH_WRITE_MASK_ALL && func != D3D12_COMPARISON_FUNC_NEVER);
     if super::depth_lineage::enabled() && pso != 0 && enabled
         && mask == D3D12_DEPTH_WRITE_MASK_ALL && func != D3D12_COMPARISON_FUNC_NEVER
     {
@@ -673,6 +674,13 @@ pub(super) unsafe extern "system" fn unregister_page_pool_x(_this: *mut c_void, 
     }
 }
 
+/// `XCL_ANISO_PASS=1`: the console desc's own filters and its maximum anisotropy reach the PC
+/// sampler (`0`: every console sampler is the PC's anisotropic one, as before).
+fn aniso_pass() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("XCL_ANISO_PASS").is_ok_and(|v| v.trim() == "1"))
+}
+
 /// device #61 CreateSamplerX(desc, destination): the title uses it for anisotropic samplers;
 /// the console desc (0x6C bytes) carries the PC fields at other offsets (+0x18 address U / V /
 /// W, +0x24 / +0x28 min / max LOD, +0x2C bias, +0x34 max anisotropy, +0x40 comparison); its
@@ -682,7 +690,7 @@ pub(super) unsafe extern "system" fn create_sampler_x(this: *mut c_void, x: *con
         return;
     }
     let u = |o: usize| (x.add(o) as *const u32).read_unaligned();
-    let d = D3D12_SAMPLER_DESC {
+    let mut d = D3D12_SAMPLER_DESC {
         Filter: D3D12_FILTER_ANISOTROPIC,
         AddressU: D3D12_TEXTURE_ADDRESS_MODE(u(0x18) as i32),
         AddressV: D3D12_TEXTURE_ADDRESS_MODE(u(0x1C) as i32),
@@ -694,6 +702,30 @@ pub(super) unsafe extern "system" fn create_sampler_x(this: *mut c_void, x: *con
         MinLOD: f32::from_bits(u(0x24)),
         MaxLOD: f32::from_bits(u(0x28)),
     };
+    if aniso_pass() {
+        // the console desc's filters: magnification at +0x04 and minification at +0x08,
+        // numbered as in an S# (0 point, 1 bilinear, 2 aniso point, 3 aniso bilinear). The mip
+        // filter (and the filter along Z, which the PC has no word for) stays linear, as the
+        // anisotropic filter above had it.
+        let (mag, min) = (u(0x04) & 3, u(0x08) & 3);
+        let anisotropic = (mag == 3 || min == 3) && d.MaxAnisotropy > 1;
+        d.Filter = if anisotropic { D3D12_FILTER_ANISOTROPIC } else { D3D12_FILTER((((min & 1) << 4) | ((mag & 1) << 2) | 1) as i32) };
+        // the maximum anisotropy is the title's own, capped only at the host's 16; the PC reads
+        // it for an anisotropic filter alone, so a sampler that did not ask for one says 1
+        d.MaxAnisotropy = if anisotropic { d.MaxAnisotropy } else { 1 };
+        static N: AtomicU64 = AtomicU64::new(0);
+        let n = N.fetch_add(1, Ordering::Relaxed) + 1;
+        if n <= 4 || n.is_power_of_two() {
+            crate::xlog_info!(
+                "D3D12.X: XCL_ANISO_PASS: console sampler #{n}: min/mag {} {}, maximum anisotropy {}; PC filter {:#x}, maximum anisotropy {}",
+                min,
+                mag,
+                u(0x34),
+                d.Filter.0,
+                d.MaxAnisotropy
+            );
+        }
+    }
     real::dev_create_sampler_x(this, &d, dest);
 }
 
@@ -999,11 +1031,6 @@ pub(super) unsafe extern "system" fn get_resource_allocation_info2_x(a: *mut c_v
         size = offset + r[0];
         align = align.max(r[1]);
     }
-    // D3D12 returns a size that is a multiple of the alignment it returns with it, so a caller can
-    // reserve one and place the next resource at the end of it.
-    if size != u64::MAX && align != 0 {
-        size = size.next_multiple_of(align);
-    }
     if !ret.is_null() {
         *ret = [size, align];
     }
@@ -1071,6 +1098,7 @@ pub(super) unsafe extern "system" fn create_placed_resource_layout_x(
             let clear = pc_clear(clear, &mut clear_buf, Some((&x, &d)));
             let hr = super::vram::place(this, va as usize, &pc, super::vram::TextureInitial::Undefined, clear, None, riid, ppv).unwrap_or(E_NOTIMPL);
             if hr >= 0 {
+                super::tex_census::note(&x, &d, None);
                 super::texture_alias::placed(this as usize, *ppv as usize, va as usize, &pc);
                 note_depth_resource_created(*ppv as usize, pc.Flags, || format!(
                     "route=console_placed_layout_vram host_layout={} title_address={va:#x} format={}", layout.0, pc.Format.0,
@@ -1169,6 +1197,7 @@ pub(super) unsafe extern "system" fn create_placed_resource_x(this: *mut c_void,
         let pc = std::ptr::read_unaligned(d.as_ptr() as *const D3D12_RESOURCE_DESC);
         let console_texture = crate::hle::xg::Texture::new(&x).ok();
         let console_bytes = console_texture.as_ref().map(|t| t.size()).filter(|&s| s != u64::MAX && s != 0);
+        super::tex_census::note(&x, &d, console_bytes);
         if super::vram::gpu_owned(flags) {
             if let Some(hr) = super::vram::place(this, va as usize, &pc, super::vram::TextureInitial::Legacy(state), clear, console_bytes, riid, ppv) {
                 if hr >= 0 && !(*ppv).is_null() {

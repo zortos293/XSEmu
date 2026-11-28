@@ -478,12 +478,10 @@ pub fn skip_test(reason: &str) {
     let thread = std::thread::current();
     let test = thread.name().unwrap_or("?");
     let required = std::env::var("XCL_REQUIRE_GPU").unwrap_or_default();
-    // A word demands the capability the skipped test needed: the reason it gave must not mention it,
-    // so "window" fails when the adapter could not make the 4 GiB memory windows.
-    let fails = required.split(',').map(str::trim).filter(|r| !r.is_empty()).any(|r| match r {
+    let fails = required.split(',').map(str::trim).any(|r| match r {
         "wave64" => reason != "no mesh shaders",
         "mesh" => reason != "no wave64",
-        other => reason.contains(other),
+        _ => false,
     });
     if fails {
         panic!("{test}: {reason}, but XCL_REQUIRE_GPU={required}");

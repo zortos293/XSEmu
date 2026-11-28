@@ -11,7 +11,7 @@ fn disasm_honors_byte_range_options() {
         std::env::temp_dir().join(format!("xcl-disasm-{}-{nonce}.bin", std::process::id()));
     std::fs::write(&shader, [0, 0, 0x80, 0xbf, 0, 0, 0x81, 0xbf]).unwrap();
     let run = |args: &[&str]| {
-        Command::new(env!("CARGO_BIN_EXE_XSEmu"))
+        Command::new(env!("CARGO_BIN_EXE_xcl"))
             .arg("disasm")
             .arg(&shader)
             .args(args)

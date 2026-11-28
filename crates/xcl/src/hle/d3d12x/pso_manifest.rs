@@ -10,6 +10,13 @@
 //! warm-up translates the shaders with the XCL it runs, so after a translator change it builds
 //! every pipeline from the new translation. `XCL_PSO_MANIFEST=0`: nothing is kept.
 //!
+//! `xcl warm-up --full` and `--blocking` note each pipeline a pass went through, so a pass stopped
+//! part way goes on from there (`full-progress.bin`, `blocking-progress.bin`). The record holds
+//! keys, and a key covers the description and the shaders, which a translator change does not
+//! move: a pass of another translation goes on from the same record. The translation era in the
+//! record is a note for the log. A blocking record belongs to one driver as well, because the
+//! blobs its keys made ready are that driver's.
+//!
 //! Each game run also notes every kept pipeline it made, once, with the run and the translation
 //! era it was made in (`created.bin`; the runs counted in `runs`): a pipeline no run made in the
 //! last `STALE_AFTER_RUNS` is left out of the budgeted warm-up (`xcl warm-up --full` still builds
@@ -398,12 +405,14 @@ impl Creations {
     }
 }
 
-/// `xcl warm-up --full`'s record of the pipelines it went through in one translation era
-/// (`Store::progress`): a pass stopped part way goes on from there.
+/// `xcl warm-up --full`'s record of the pipelines it went through (`Store::progress`): a pass
+/// stopped part way goes on from there, in this translation or in another one.
 pub struct Progress {
     file: Mutex<std::fs::File>,
     /// keys gone through by an earlier pass
     pub done: HashSet<u64>,
+    /// the translation the record was written in, when it was not this one (for the log)
+    pub earlier: Option<u64>,
 }
 
 impl Progress {
@@ -655,16 +664,18 @@ impl Store {
         std::fs::rename(&tmp, &path)
     }
 
-    /// `xcl warm-up --full`'s progress in translation era `era`: what a pass of this era went
-    /// through already; a record of another era is started again.
+    /// `xcl warm-up --full`'s record in translation `era`: the pipelines an earlier pass went
+    /// through, in this translation or in another one (a key covers what a translator change does
+    /// not move). The translation that wrote the record is noted for the log.
     pub fn progress(&self, era: u64) -> std::io::Result<Progress> {
         self.progress_in("full-progress.bin", era)
     }
 
-    /// `xcl warm-up --blocking`'s record of the keys it made ready in translation era `era` with
-    /// adapter and driver `driver`; true: a record of another driver was dropped (the driver
-    /// refuses the blobs of another). A record kept before the driver was noted is taken as this
-    /// driver's.
+    /// `xcl warm-up --blocking`'s record of the keys an earlier pass made ready with adapter and
+    /// driver `driver`; true: a record of another driver was dropped (the driver refuses the blobs
+    /// of another). A record kept before the driver was noted is taken as this driver's. Another
+    /// translation keeps the keys: a driver blob is named by its DXIL, which a translator change
+    /// may leave as it was.
     pub(super) fn blocking_progress(&self, era: u64, driver: &str) -> std::io::Result<(Progress, bool)> {
         std::fs::create_dir_all(&self.dir)?;
         let noted = self.dir.join("blocking-progress.driver");
@@ -681,18 +692,25 @@ impl Store {
         let _ = std::fs::remove_file(self.dir.join("blocking-progress.bin"));
     }
 
+    /// A pass's record in file `name`: the keys an earlier pass went through, whatever translation
+    /// wrote them (a key covers its pipeline's description and shaders, which a translator change
+    /// does not move). The first word is this translation, rewritten when the record came from
+    /// another one: a note for the log, and `earlier` for the caller.
     fn progress_in(&self, name: &str, era: u64) -> std::io::Result<Progress> {
         std::fs::create_dir_all(&self.dir)?;
         let path = self.dir.join(name);
         let mut bytes = std::fs::read(&path).unwrap_or_default();
-        if bytes.get(..8) != Some(&era.to_le_bytes()[..]) {
+        let earlier = bytes.get(..8).map(|h| u64::from_le_bytes(h.try_into().unwrap())).filter(|&e| e != era);
+        if bytes.len() < 8 {
             bytes = era.to_le_bytes().to_vec();
+        } else {
+            bytes[..8].copy_from_slice(&era.to_le_bytes());
+            bytes.truncate(8 + (bytes.len() - 8) / 8 * 8);
         }
-        bytes.truncate(8 + (bytes.len() - 8) / 8 * 8);
         std::fs::write(&path, &bytes)?;
         let done = bytes[8..].chunks_exact(8).map(|k| u64::from_le_bytes(k.try_into().unwrap())).collect();
         let file = std::fs::OpenOptions::new().append(true).open(&path)?;
-        Ok(Progress { file: Mutex::new(file), done })
+        Ok(Progress { file: Mutex::new(file), done, earlier })
     }
 
     /// A `--full` pass went through everything: the next starts from the beginning.
@@ -1046,7 +1064,6 @@ mod tests {
     fn temp_dir(name: &str) -> PathBuf {
         let d = std::env::temp_dir().join(format!("xcl-pso-manifest-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&d);
-        std::fs::create_dir_all(&d).expect("a temporary folder for the manifest test");
         d
     }
 
@@ -1329,10 +1346,11 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// A `--full` pass stopped part way goes on where it left off in the same translation era, and
-    /// starts again in another or once it went through everything.
+    /// A blocking pass goes on where it stopped in another translation (its keys' driver blobs are
+    /// named by their DXIL, not by the translation), and starts again on another driver.
+    /// (Before: it started again on another translation too. The era is a note in the record now.)
     #[test]
-    fn a_blocking_pass_starts_again_on_another_driver() {
+    fn a_blocking_pass_goes_on_in_another_translation_and_starts_again_on_another_driver() {
         let dir = temp_dir("blocking-progress");
         let store = Store::open(dir.clone());
         store.progress_in("blocking-progress.bin", 5).unwrap().note(1);
@@ -1343,19 +1361,27 @@ mod tests {
         let (p, changed) = store.blocking_progress(5, "10de-2684-a").unwrap();
         assert!(!changed && p.done == [1, 2].into_iter().collect());
         drop(p);
-        let (p, changed) = store.blocking_progress(5, "10de-2684-b").unwrap();
+        let (p, changed) = store.blocking_progress(6, "10de-2684-a").unwrap();
+        assert!(!changed && p.done == [1, 2].into_iter().collect(), "another translation keeps the keys");
+        assert_eq!(p.earlier, Some(5));
+        p.note(3);
+        drop(p);
+        let (p, changed) = store.blocking_progress(6, "10de-2684-b").unwrap();
         assert!(changed && p.done.is_empty(), "another driver starts again");
         drop(p);
-        assert!(!store.blocking_progress(5, "10de-2684-b").unwrap().1);
+        assert!(!store.blocking_progress(6, "10de-2684-b").unwrap().1);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// A `--full` pass stopped part way goes on where it left off, in another translation too, and
+    /// starts again once it went through everything.
+    /// (Before: another era started it again. The era is a note in the record now.)
     #[test]
-    fn a_full_pass_goes_on_where_it_stopped_in_its_era() {
+    fn a_full_pass_goes_on_where_it_stopped_in_any_translation() {
         let dir = temp_dir("progress");
         let store = Store::open(dir.clone());
         let p = store.progress(5).unwrap();
-        assert!(p.done.is_empty());
+        assert!(p.done.is_empty() && p.earlier.is_none());
         p.note(1);
         p.note(2);
         drop(p);
@@ -1365,11 +1391,43 @@ mod tests {
         p.note(3);
         drop(p);
         assert_eq!(store.progress(5).unwrap().done, [1, 2, 3].into_iter().collect(), "a torn key is dropped, not misread");
-        assert!(store.progress(6).unwrap().done.is_empty(), "another era starts again");
-        assert!(store.progress(5).unwrap().done.is_empty(), "the record of era 5 was replaced");
-        store.progress(5).unwrap().note(4);
+        let p = store.progress(6).unwrap();
+        assert_eq!(p.done, [1, 2, 3].into_iter().collect(), "another translation goes on from the same keys");
+        assert_eq!(p.earlier, Some(5));
+        p.note(4);
+        drop(p);
+        assert_eq!(&std::fs::read(dir.join("full-progress.bin")).unwrap()[..8], &6u64.to_le_bytes()[..], "the era is kept for the log");
+        assert_eq!(store.progress(6).unwrap().done, [1, 2, 3, 4].into_iter().collect());
         store.progress_complete();
-        assert!(store.progress(5).unwrap().done.is_empty());
+        assert!(store.progress(6).unwrap().done.is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A record written in one translation is honoured in the next while its pipelines are kept,
+    /// and a pipeline whose key changed is built: it is not in the record.
+    #[test]
+    fn a_pass_record_of_another_translation_is_honoured_while_its_keys_are_kept() {
+        let dir = temp_dir("progress-keys");
+        let store = Store::open(dir.clone());
+        let (a, b) = (sample(Kind::Graphics, b"shader a", b"A"), sample(Kind::Compute, b"shader b", b"B"));
+        for r in [&a, &b] {
+            store.add(r).unwrap();
+        }
+        let p = store.progress(5).unwrap();
+        p.note(a.key());
+        p.note(b.key());
+        drop(p);
+        let p = store.progress(6).unwrap();
+        let walked: Vec<u64> = store.load().records.iter().map(Record::key).filter(|key| !p.done.contains(key)).collect();
+        assert!(walked.is_empty(), "nothing era 5 built is built again in era 6");
+        p.note(a.key());
+        drop(p);
+        let changed = sample(Kind::Graphics, b"shader c", b"A");
+        assert_ne!(changed.key(), a.key(), "same description, another shader: another key");
+        store.add(&changed).unwrap();
+        let p = store.progress(7).unwrap();
+        let walked: Vec<u64> = store.load().records.iter().map(Record::key).filter(|key| !p.done.contains(key)).collect();
+        assert_eq!(walked, [changed.key()], "the pipeline whose shader changed is not in the record, so the pass builds it");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

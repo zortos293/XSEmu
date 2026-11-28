@@ -473,7 +473,7 @@ impl Lease {
                 if groups!=1 {return unavailable("producer pairing requires exactly one observed group")}
                 if let Err(e)=describe_producer(producer,*pcs,*hits,&key,&data[HEAD..HEAD+l.gw()],l,self.provenance.as_ref()){return unavailable(e)}
             }
-            if COMPLETE.fetch_update(Ordering::Relaxed,Ordering::Relaxed,|n|(n<8).then_some(n+1)).is_err(){return}
+            if COMPLETE.try_update(Ordering::Relaxed,Ordering::Relaxed,|n|(n<8).then_some(n+1)).is_err(){return}
             let semantics=l.distances.iter().map(|d|d.2.as_str()).collect::<Vec<_>>();
             if prims>rows.len(){crate::xlog_info!("mesh record probe: {key} triangle_rows_shown={} triangle_rows_omitted={} (all {} primitive records checked)",rows.len(),prims-rows.len(),prims);}
             crate::xlog_info!("mesh record probe: complete {key} grid={grid:?} stats={stats:?} passed={occ} mv={} mp={} record_dwords={} record_vert_dwords={} record_header_dwords=4 tri_base_dwords={} distance_semantics={semantics:?} headers_nv_np={headers:?} vertices={verts} primitives={prims} raw_null={null} raw_out_of_range={oor} emitted_repeat={repeated} nonfinite_position={nonfinite} nonpositive_w={nonpositive_w} valid_target_area2_zero_pos_neg=[{zero_area},{pos_area},{neg_area}] viewport={:?} scissor={:?}; {desc}",l.mv,l.mp,l.rd,l.vd,4+l.mv*l.vd,self.viewport,self.scissor);

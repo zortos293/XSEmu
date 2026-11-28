@@ -1,6 +1,6 @@
 use super::{HEAPS, SLOT};
 use crate::hle::{
-    d3d12x::{external_buffers, page_mappings, real, title_textures},
+    d3d12x::{external_buffers, page_mappings, title_textures},
     kernelx,
 };
 use std::collections::HashMap;
@@ -26,6 +26,8 @@ pub(crate) fn enabled() -> bool {
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum Writer {
     Other,
+    // Written by the vsharp trace; its report does not read these fields yet.
+    #[allow(dead_code)]
     Api {
         kind: &'static str,
         input: u64,
@@ -38,6 +40,8 @@ pub(crate) enum Writer {
 }
 
 #[derive(Clone, Copy, Debug)]
+// Written by the vsharp trace; its report does not read these fields yet.
+#[allow(dead_code)]
 struct Event {
     first_slot: usize,
     first_serial: u64,

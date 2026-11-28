@@ -477,6 +477,15 @@ pub(super) fn rect_list_state(list: *mut c_void) -> Option<Vec<(u32, (u64, u32, 
     b.rect_list.then(|| b.vertex_titles.iter().map(|(&k, &v)| (k, v, b.vertex_buffers.get(&k).copied())).collect())
 }
 
+/// The render targets `list` has bound since its last reset, for `light_wait`: the handles the
+/// title gave, and whether it bound a depth view and no colour target (a shadow map, a depth
+/// prepass).
+pub(super) fn targets(list: *mut c_void) -> Option<(Vec<usize>, bool)> {
+    let g = LISTS.lock().unwrap();
+    let rt = g.as_ref()?.get(&(list as usize))?.bindings.render_targets.as_ref()?;
+    Some((rt.handles.clone(), rt.handles.is_empty() && rt.dsv.is_some()))
+}
+
 /// `pc_va` for other modules.
 pub(super) fn pc_va_of(va: u64) -> u64 {
     pc_va(va)
@@ -4055,6 +4064,7 @@ pub unsafe extern "system" fn kickoff_x(this: *mut c_void) {
     super::page_mappings::queue::submit(q_raw, &one, || super::gpu_timing::submit(q_raw, &one, || exec(q_raw, 1, one.as_ptr())));
     super::present::submit_plane_writes(q_raw, &one);
     super::residency::after_submit(q_raw, submission);
+    super::vram::submitted(q_raw);
     signal_write64_pairs(q_raw, &write64_signals);
     super::image_writeback::submitted(q_raw, &one);
     // what ran is in the textures' states; the list records anew after its Reset below
@@ -4173,6 +4183,58 @@ pub unsafe extern "system" fn kickoff_x(this: *mut c_void) {
             s.pred_in_state = true;
         }
     }
+}
+
+/// A console command-list method this XCL does not model, answered as its stub was (`S_OK`, no
+/// out-parameter written) but named, so a run says which slot the title calls instead of "a stub"
+/// (`XCL_LIST_SLOT_LOG=0`: answered, not logged).
+macro_rules! console_slot_noop {
+    ($fn:ident, $slot:literal, $what:literal) => {
+        pub(super) unsafe extern "system" fn $fn(_this: *mut c_void) -> crate::util::HRESULT {
+            static N: AtomicU64 = AtomicU64::new(0);
+            let n = N.fetch_add(1, Ordering::Relaxed) + 1;
+            if (n <= 3 || n.is_power_of_two()) && super::real::list_slot_log() {
+                crate::xlog_info!("D3D12.X: command list #{} called ({}; no-op, #{} calls)", $slot, $what, n);
+            }
+            crate::util::S_OK
+        }
+    };
+}
+
+console_slot_noop!(slot_75_x, 75, "pixel-shader depth order, console-only (the newer layout's #75 = base #73)");
+console_slot_noop!(slot_101_x, 101, "DriverHintX(feature, value), console-only (#101 = base #99)");
+console_slot_noop!(slot_142_x, 142, "a newer-layout state method with one u64, console-only");
+
+/// command list #124 RSSetShadingRate(base rate, combiners[2]), the console's own slot (PC #77);
+/// a retail title on the newer layout calls it at #126 (`NEWER_LIST_SLOTS`). The two combiner
+/// enums are passed in a pointer at r8. Forwarded to the PC method only with
+/// `XCL_NEWER_SHADING_RATE=1`: our VRS state has never reached the PC list, so a run has to prove
+/// that turning it on changes nothing but shading resolution.
+pub(super) unsafe extern "system" fn set_shading_rate_x(this: *mut c_void, base: u32, combiners: *const u32) {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    static N: AtomicU64 = AtomicU64::new(0);
+    let n = N.fetch_add(1, Ordering::Relaxed) + 1;
+    if !*ON.get_or_init(|| std::env::var("XCL_NEWER_SHADING_RATE").is_ok_and(|v| v.trim() == "1")) {
+        if (n == 1 || n.is_power_of_two()) && super::real::list_slot_log() {
+            crate::xlog_info!(
+                "D3D12.X: shading rate {} ignored (#{} calls, XCL_NEWER_SHADING_RATE=0)",
+                base,
+                n
+            );
+        }
+        return;
+    }
+    let pair = if combiners.is_null() { (0u32, 0u32) } else { unsafe { (*combiners, *combiners.add(1)) } };
+    if n == 1 {
+        crate::xlog_info!(
+            "D3D12.X: shading rate {base} (combiners {}/{}) forwarded to the PC list (XCL_NEWER_SHADING_RATE=1)",
+            pair.0,
+            pair.1
+        );
+    }
+    let f: unsafe extern "system" fn(*mut c_void, u32, *const u32) =
+        std::mem::transmute(real::orig_fn(this, 77));
+    f(this, base, combiners);
 }
 
 /// command list #94 RSSetDepthBiasX(depthBias, depthBiasClamp, slopeScaledDepthBias):
@@ -5525,10 +5587,6 @@ mod tests {
             crate::gpu::recomp::runner::skip_test("no unified memory");
             return;
         }
-        if !crate::hle::d3d12x::sparse::windows_ready() {
-            crate::gpu::recomp::runner::skip_test("no 4 GiB sparse memory window: this adapter cannot reserve one");
-            return;
-        }
         unsafe {
             let Ok(factory) = CreateDXGIFactory1::<IDXGIFactory4>() else {
                 crate::gpu::recomp::runner::skip_test("no WARP");
@@ -6244,12 +6302,6 @@ mod tests {
 
     #[test]
     fn resolve_query_data_applies_buffer_delta_to_pc_resolve_and_occlusion_writeback() {
-        if !crate::hle::d3d12x::sparse::windows_ready() {
-            // The resolve reaches its PC data through a console heap, which needs window-0 storage a
-            // software adapter cannot make; without it the whole buffer goes instead.
-            return crate::gpu::recomp::runner::skip_test(
-                "no 4 GiB sparse memory window: this adapter cannot reserve one, and the resolve needs a console heap");
-        }
         use std::cell::RefCell;
 
         thread_local! {

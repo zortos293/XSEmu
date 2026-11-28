@@ -158,6 +158,12 @@ impl Tally {
     fn show(&self) -> String {
         format!("{}/{} MB", self.count.load(Relaxed), self.bytes.load(Relaxed) >> 20)
     }
+
+    /// (objects, bytes) as the line shows them, for the tests that watch a counter move.
+    #[cfg(test)]
+    pub fn counts(&self) -> (i64, i64) {
+        (self.count.load(Relaxed), self.bytes.load(Relaxed))
+    }
 }
 
 impl Default for Tally {
@@ -173,6 +179,14 @@ pub static TITLE_HEAPS: [Tally; 6] = [const { Tally::new() }; 6];
 /// Of them, heaps that hold only buffers and were also given a block of unified memory, where
 /// their buffers are placed (real::heap_block).
 pub static BUFFER_HEAPS_IN_UMA: Tally = Tally::new();
+/// Of them, the title heaps whose PC heap is one alignment unit instead of the title's size
+/// (`XCL_HEAP_LAZY`, real::lazy_placeholder) and whose full PC heap has not been made: the bytes,
+/// and the commit behind them, that CreateHeap did not take. Alive now: a heap whose full PC heap
+/// is made leaves for `LAZY_HEAP_MATERIALIZED`, and one the title releases leaves both.
+pub static LAZY_HEAP_PLACEHOLDERS: Tally = Tally::new();
+/// Of `LAZY_HEAP_PLACEHOLDERS`, the heaps whose full-size PC heap was made because something was
+/// placed in them (real::materialize_lazy), alive now: the video memory and commit that came back.
+pub static LAZY_HEAP_MATERIALIZED: Tally = Tally::new();
 /// Committed resources the title made that reached the PC as committed resources, by class
 /// (made, never counted down).
 pub static TITLE_COMMITTED: [Tally; 6] = [const { Tally::new() }; 6];
@@ -200,8 +214,14 @@ pub fn heap_class(props: &windows::Win32::Graphics::Direct3D12::D3D12_HEAP_PROPE
     }
 }
 
+/// A diagnostic that is on by default: off in a production build (`--features production`), where
+/// the variable still turns it on. An alpha build measures exactly as before.
 fn on(name: &str) -> bool {
-    std::env::var(name).map_or(true, |v| v.trim() != "0")
+    match std::env::var(name).ok().map(|v| v.trim().to_string()).as_deref() {
+        Some("0") => false,
+        Some("1") => true,
+        _ => !cfg!(feature = "production"),
+    }
 }
 
 /// Starts the thread that logs the lines (once).
@@ -336,15 +356,20 @@ fn report(seen: Option<&[Seen; 4]>) {
     let classes = |t: &[Tally; 6]| CLASSES.iter().zip(t).map(|(n, t)| format!("{n} {}", t.show())).collect::<Vec<_>>().join(", ");
     let (local, non_local) = crate::hle::d3d12x::real::video_memory().unwrap_or((0, 0));
     crate::xlog_info!(
-        "memdiag: D3D12: video memory {} MB local, {} MB non-local; title heaps made (count/MB): {}; buffer-only heaps also given unified memory {}; title committed resources made on the PC: {}; imported title page segments alive {}; {}",
+        "memdiag: D3D12: video memory {} MB local, {} MB non-local; title heaps made (count/MB): {}; lazy PC heaps still placeholders {} (their PC heap and the commit behind it never made), materialized {}; buffer-only heaps also given unified memory {}; title committed resources made on the PC: {}; imported title page segments alive {}; {}",
         mb(local),
         mb(non_local),
         classes(&TITLE_HEAPS),
+        LAZY_HEAP_PLACEHOLDERS.show(),
+        LAZY_HEAP_MATERIALIZED.show(),
         BUFFER_HEAPS_IN_UMA.show(),
         classes(&TITLE_COMMITTED),
         IMPORTED_SEGMENTS.show(),
         crate::gpu::rebar::summary()
     );
+    if let Some(census) = crate::hle::d3d12x::tex_census::line() {
+        crate::xlog_info!("memdiag: {census}");
+    }
     let (live_psos, idle, again) = crate::hle::d3d12x::pso_async::live();
     crate::xlog_info!(
         "memdiag: title physical pages: {}; caches: compute blobs {} MB; pipelines live {live_psos} (released unbound {idle}, built again {again}); XCL maps (entries): {}",

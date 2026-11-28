@@ -30,6 +30,7 @@ use std::sync::Mutex;
 use crate::util::{E_INVALIDARG, HRESULT, S_OK};
 
 pub(super) mod queue;
+mod pages;
 use super::physical_directory::{self, Change, Mapping, Plane};
 
 /// Paths where the GPU directory keeps what it had before (an entry inherits the canonical
@@ -349,6 +350,7 @@ pub(super) unsafe fn copy_batch(queue: *mut std::ffi::c_void, count: u32, batche
             v.unmap(at);
             gpu.remove(at);
             held.unmap(at);
+            pages::gone(at);
             let Some(slot) = slot.filter(|&p| p != at) else { continue };
             let page = held.page_at(slot);
             if let Some(p) = page {
@@ -364,6 +366,7 @@ pub(super) unsafe fn copy_batch(queue: *mut std::ffi::c_void, count: u32, batche
                 continue;
             }
             copied += 1;
+            pages::placed(at);
             let source = page.map_or(Source::Address(slot), Source::Page);
             let now = place(held, source);
             copy_to(at, now);
@@ -376,6 +379,7 @@ pub(super) unsafe fn copy_batch(queue: *mut std::ffi::c_void, count: u32, batche
             s.views.insert(at);
             v.written.push(at);
         }
+        pages::evict(held);
         SHOWN.store(v.shown.len(), Ordering::Release);
         VIEWED.store(gpu.at.len(), Ordering::Release);
     });
@@ -406,6 +410,7 @@ pub(crate) fn forget(at: usize, len: usize) {
             let pages: Vec<usize> = v.shown.range(at..end).map(|(&a, _)| a).collect();
             for a in pages {
                 v.unmap(a);
+                pages::gone(a);
             }
             SHOWN.store(v.shown.len(), Ordering::Release);
         }
@@ -519,6 +524,12 @@ pub(super) fn generation() -> u64 {
 
 static POOLS_GEN: AtomicU64 = AtomicU64::new(0);
 
+/// A title submission was issued on `queue`: the placed pages of the look before it (`pages`) are
+/// ordered after its fence.
+pub(super) unsafe fn submitted(queue: *mut std::ffi::c_void) {
+    pages::submitted(queue);
+}
+
 #[link(name = "kernel32")]
 extern "system" {
     fn ResetWriteWatch(base: *const std::ffi::c_void, size: usize) -> u32;
@@ -573,6 +584,7 @@ pub(super) unsafe fn after_look(dirty: &mut Vec<usize>, watched: &[(usize, usize
     let (swept, changed) = sweep(dirty);
     let (mut copied, mut compared, mut moved) = (0usize, 0usize, 0usize);
     let (mut views, mut sources, mut written_n) = (0, 0, 0);
+    let mut used: Vec<usize> = Vec::new();
     if SHOWN.load(Ordering::Acquire) > 0 {
         let written_now = |at: usize, dirty: &[usize]| {
             let i = dirty[..found].partition_point(|&p| p < at);
@@ -582,9 +594,9 @@ pub(super) unsafe fn after_look(dirty: &mut Vec<usize>, watched: &[(usize, usize
             let i = watched.partition_point(|&(base, size)| base + size <= at);
             watched.get(i).is_some_and(|&(base, size)| base <= at && at + PAGE <= base + size)
         };
-        let (written, v_n, s_n) = crate::hle::kernelx::hold_physical_pages(|held| {
+        let (written, v_n, s_n, looked_at) = crate::hle::kernelx::hold_physical_pages(|held| {
             let mut g = VIEWS.lock().unwrap();
-            let Some(v) = g.as_mut() else { return (Vec::new(), 0, 0) };
+            let Some(v) = g.as_mut() else { return (Vec::new(), 0, 0, Vec::new()) };
             let mut written = std::mem::take(&mut v.written);
             for (&source, s) in v.sources.iter_mut() {
                 let now = place(held, source);
@@ -622,7 +634,8 @@ pub(super) unsafe fn after_look(dirty: &mut Vec<usize>, watched: &[(usize, usize
                     written.push(at);
                 }
             }
-            (written, v.shown.len(), v.sources.len())
+            let looked_at: Vec<usize> = if pages::on() { v.shown.keys().copied().collect() } else { Vec::new() };
+            (written, v.shown.len(), v.sources.len(), looked_at)
         });
         if moved > 0 {
             // the places to watch changed (`pool_ranges`)
@@ -634,7 +647,9 @@ pub(super) unsafe fn after_look(dirty: &mut Vec<usize>, watched: &[(usize, usize
             dirty.extend((at..at + PAGE).step_by(0x1000));
         }
         (views, sources, written_n) = (v_n, s_n, written.len());
+        used = looked_at;
     }
+    pages::look(&used);
     static LOOKS: AtomicUsize = AtomicUsize::new(0);
     if LOOKS.fetch_add(1, Ordering::Relaxed) % 2000 == 0 && VIEWED.load(Ordering::Relaxed) + SHOWN.load(Ordering::Relaxed) > 0 {
         crate::xlog_info!(

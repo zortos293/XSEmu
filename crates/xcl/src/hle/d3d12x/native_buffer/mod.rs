@@ -19,23 +19,31 @@ pub(crate) struct Operand {
     pub(crate) native_offset: u64,
 }
 
+// Prebuilt native-input assembly has no caller yet; kept for the next fix.
+#[allow(dead_code)]
 pub(crate) struct NativeIa<L> {
     vertex: Vec<(u32, D3D12_VERTEX_BUFFER_VIEW)>,
     index: Option<D3D12_INDEX_BUFFER_VIEW>,
     leases: Vec<L>,
 }
 
+// Prebuilt native-input assembly has no caller yet; kept for the next fix.
+#[allow(dead_code)]
 pub(crate) enum IaDomain {
     Guest,
     Native(ID3D12Resource),
 }
 
+// Prebuilt native-input assembly has no caller yet; kept for the next fix.
+#[allow(dead_code)]
 pub(crate) enum IaInput {
     Null,
     Native(ID3D12Resource),
     Gather(Read),
 }
 
+// Prebuilt native-input assembly has no caller yet; kept for the next fix.
+#[allow(dead_code)]
 pub(crate) fn prebuilt_ia(
     recipe: &[recipes::Address],
     locator: u32,
@@ -72,6 +80,8 @@ pub(crate) fn prebuilt_ia(
 }
 
 impl<L> NativeIa<L> {
+    // Prebuilt native-input assembly has no caller yet; kept for the next fix.
+    #[allow(dead_code)]
     pub(crate) fn resolve(
         recipe: &[recipes::Address],
         mut resolver: impl FnMut(recipes::Address) -> Option<recipes::Resolved<L>>,
@@ -111,6 +121,8 @@ impl<L> NativeIa<L> {
         Some(native)
     }
 
+    // Prebuilt native-input assembly has no caller yet; kept for the next fix.
+    #[allow(dead_code)]
     pub(crate) unsafe fn bind(&self, list: &ID3D12GraphicsCommandList) {
         for (slot, view) in &self.vertex {
             list.IASetVertexBuffers(*slot, Some(std::slice::from_ref(view)));

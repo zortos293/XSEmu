@@ -2,9 +2,15 @@ use super::commands::Kernels;
 use crate::gpu::recomp::{dxc, GPU_PAGE_DIRECTORY_HLSL};
 use windows::Win32::Graphics::Direct3D12::*;
 
+// These kernels are not compiled until the bridge is wired; kept for the next fix.
+#[allow(dead_code)]
 const TRANSFER: &str = include_str!("transfer.hlsl");
+// These kernels are not compiled until the bridge is wired; kept for the next fix.
+#[allow(dead_code)]
 const ROOT: &str = r#"#define IMAGE_BRIDGE_ROOT [RootSignature("RootFlags(CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED),RootConstants(num32BitConstants=8,b0),SRV(t0),UAV(u0),UAV(u1)")]
 "#;
+// These kernels are not compiled until the bridge is wired; kept for the next fix.
+#[allow(dead_code)]
 const RESOLVE: &str = r#"
 uint4 ResolveImagePage(uint vpn, uint directory, uint umaHi, uint umaViews, uint windows) {
     uint2 va = uint2(vpn << 16, vpn >> 16);
@@ -22,6 +28,8 @@ uint4 ResolveImagePage(uint vpn, uint directory, uint umaHi, uint umaViews, uint
 "#;
 
 impl Kernels {
+    // These kernels are not compiled until the bridge is wired; kept for the next fix.
+    #[allow(dead_code)]
     pub(crate) unsafe fn compile(dev: &ID3D12Device) -> Result<Self, String> {
         let capture_source = format!("{ROOT}#define IMAGE_BRIDGE_SNAPSHOT\n{}",
             TRANSFER.replace("#include \"image_page_resolver.hlsli\"", &format!("{GPU_PAGE_DIRECTORY_HLSL}\n{RESOLVE}")));

@@ -90,6 +90,8 @@ pub(crate) fn classify(guest_format: u32, host_format: u32, guest_flags: u32, sa
     }
 }
 
+// classes::transfer has no caller until the bridge is wired; kept for the next fix.
+#[allow(dead_code)]
 pub(crate) fn transfer(guest_format: u32, host_format: u32, guest_flags: u32, samples: u32, xg_usage: u32) -> Result<(u32, u32), Unsupported> {
     if samples == 1 && xg_usage == 1 && guest_flags & 2 == 0 && guest_flags & 5 != 0 {
         match (guest_format, host_format) {

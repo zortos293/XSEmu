@@ -18,8 +18,10 @@
 //! depends on the flags alone.
 //!
 //! --binding victory (the default) is CGBJ's own resource binding. --binding xcl translates
-//! under the XCL binding (xcl_cgbj::xcl::translate_compute), which takes compute programs
-//! only, and adds what the binding emitted (XclStats) as a last column.
+//! under the XCL binding (xcl_cgbj::xcl::translate_compute, and translate_pixel without links
+//! for pixel programs, so their inputs take the rows xsemu's own translator gives them),
+//! which takes compute and pixel programs of either wave size, a wave32 one only where
+//! --host-wave is 32, and adds what the binding emitted (XclStats) as a last column.
 
 use std::collections::BTreeMap;
 use std::io::Read;
@@ -51,7 +53,14 @@ fn translate(bytes: &[u8], binding: &str) -> Result<(Vec<u8>, Form, String), xcl
     if binding == "victory" {
         return emit::translate(bytes).map(|h| (h.dxil, xcl_cgbj::xcl::take_form(), String::new()));
     }
-    let s = xcl_cgbj::xcl::translate_compute(bytes, &xcl_cgbj::xcl::XclConfig::default())?;
+    let cfg = xcl_cgbj::xcl::XclConfig::default();
+    let s = match program(bytes) {
+        Some((stage, _, _)) if stage == "Ps" => {
+            let p = xcl_cgbj::xcl::translate_pixel(bytes, &cfg, &[])?;
+            xcl_cgbj::xcl::XclShader { dxil: p.dxil, samplers: p.samplers, threads: [0; 3], form: None, stats: p.stats }
+        }
+        _ => xcl_cgbj::xcl::translate_compute(bytes, &cfg)?,
+    };
 
     let t = s.stats;
     let stats = format!(

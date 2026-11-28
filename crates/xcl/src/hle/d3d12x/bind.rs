@@ -581,7 +581,11 @@ fn parse_shader_skips(value: &str) -> Vec<u64> {
 
 fn shader_skips() -> &'static [u64] {
     static HASHES: std::sync::OnceLock<Vec<u64>> = std::sync::OnceLock::new();
-    HASHES.get_or_init(|| parse_shader_skips(&std::env::var("XCL_SKIP_SHADERS").unwrap_or_default()))
+    HASHES.get_or_init(|| {
+        let mut hashes = parse_shader_skips(&std::env::var("XCL_SKIP_SHADERS").unwrap_or_default());
+        hashes.extend_from_slice(super::hung_skip::hashes());
+        hashes
+    })
 }
 
 struct LiveShaderSkips {
@@ -662,7 +666,7 @@ fn watch_shader_skip_file(path: &std::path::Path) {
 }
 
 pub(super) fn draw_gate_hashes() -> bool {
-    live_shader_file_configured() || draw_gate_trace() || !shader_skips().is_empty()
+    live_shader_file_configured() || draw_gate_trace() || !shader_skips().is_empty() || super::hung_skip::enabled()
 }
 
 pub(super) fn draw_gate_calls() -> bool {
@@ -861,6 +865,7 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
     type F = unsafe extern "system" fn(*mut c_void, usize, u32, usize, u64, usize, u64);
     let pc: F = std::mem::transmute(super::real::orig_fn(this, 59));
     let title_pso = with(this, |s| s.pso);
+    let mesh_sig = super::indirect::dispatches_mesh(sig);
     let kind = super::indirect::note_call(sig);
     let requested = max;
     let max = indirect_max(requested);
@@ -874,31 +879,46 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
             Err(skip) => return note_pending_compute_skip(this, title_pso, "ExecuteIndirect(Dispatch)", skip),
         }
     } else {
-        super::pso_async::waiting_if(bundle, || super::pso_async::resolve_wait(title_pso))
+        super::light_wait::mark(this, title_pso);
+        super::pso_async::waiting_if(bundle, || super::pso_async::resolve_wait_light(title_pso, "ExecuteIndirect"))
     };
     let failed = super::real::is_standin_pso(pso) && if dispatches { skip_failed_dispatches() } else { skip_failed_draws() };
     if failed {
         note_failed_skip(title_pso, pso, if dispatches { "ExecuteIndirect(Dispatch)" } else { "ExecuteIndirect" });
     }
-    if skipped || shader_skip(pso) || failed {
+    let gated = skipped || shader_skip(pso);
+    if gated || failed {
         if dispatches {
             note_skipped_writer(this, pso, title_pso);
         }
         count(if dispatches { DISPATCHES_SKIPPED } else { DRAWS_SKIPPED });
+        if mesh_sig {
+            super::mesh_attrib::note(
+                if failed { super::mesh_attrib::Outcome::FailedPipeline } else { super::mesh_attrib::Outcome::Gate },
+                title_pso,
+                super::mesh_attrib::MESHLETS_ANY,
+                if failed { "pipeline-not-built" } else { "gate" },
+            );
+        }
         return;
     }
     note_named_use(title_pso, pso, "indirect call");
     // a mesh signature needs a mesh pipeline and a mesh pipeline a mesh signature: the PC call
     // with any other pair is invalid (a PC pipeline or a stand-in is the title's own pair)
-    let mesh_sig = super::indirect::dispatches_mesh(sig);
     let two_pass = super::real::two_pass_of(pso);
     if two_pass.as_ref().is_some_and(|tp| tp.kind != "MS") {
         mesh_skipped(this, pso, "an ExecuteIndirect", GS_TWO_PASS);
+        if mesh_sig {
+            super::mesh_attrib::note(super::mesh_attrib::Outcome::Dropped, title_pso, super::mesh_attrib::MESHLETS_ANY, "geometry-shader");
+        }
         return;
     }
     let mesh_pso = two_pass.is_some() || super::real::is_native_mesh(pso);
     if mesh_sig != mesh_pso && (mesh_pso || super::real::is_translated_graphics(pso) || super::real::is_translated_compute(pso)) {
         mesh_skipped(this, pso, "an ExecuteIndirect", if mesh_sig { "its pipeline has no mesh shader" } else { "its signature does not dispatch mesh work and its pipeline is a mesh pipeline" });
+        if mesh_sig || mesh_pso {
+            super::mesh_attrib::note(super::mesh_attrib::Outcome::Dropped, title_pso, super::mesh_attrib::MESHLETS_ANY, "signature-mismatch");
+        }
         return;
     }
     note_indirect(pso, sig, max, args, args_off, count_buf, count_off);
@@ -911,6 +931,9 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
         static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
         if N.fetch_add(1, Ordering::Relaxed) < 16 {
             crate::xlog_warn!("D3D12.X: ExecuteIndirect skipped (pipeline {pso:#x}, at most {max} commands): {why}");
+        }
+        if mesh_sig {
+            super::mesh_attrib::note(super::mesh_attrib::Outcome::Dropped, title_pso, super::mesh_attrib::MESHLETS_ANY, "indirect-guard");
         }
         return;
     }
@@ -955,6 +978,9 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
                     }
                 }
             }
+            if mesh_sig {
+                super::mesh_attrib::note(super::mesh_attrib::Outcome::FailedPipeline, title_pso, super::mesh_attrib::MESHLETS_ANY, "still-building");
+            }
             return;
         }
         // a PC pipeline: the title's root signature, as for a draw (`graphics_bound`)
@@ -964,6 +990,9 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
         }
         execute(None);
         mark(this, kind);
+        if mesh_sig {
+            super::mesh_attrib::indirect(title_pso, args_title, count_title, sig, max, "pc-pipeline");
+        }
         return;
     }
     // compute records on XCL's ABI, root arguments of their own included: rows of io built on the
@@ -1039,10 +1068,16 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
                 count(DRAWS);
                 mesh_ran(MESH_TWO_PASS);
                 mark(this, "ExecuteIndirect(mesh dispatch in two passes)");
+                if mesh_sig {
+                    super::mesh_attrib::indirect(title_pso, args_title, count_title, sig, max, "two-pass");
+                }
             }
             Err(e) => {
                 count(DRAWS_SKIPPED);
                 mesh_skipped(this, pso, "an ExecuteIndirect", &e);
+                if mesh_sig {
+                    super::mesh_attrib::note(super::mesh_attrib::bind_failure(pso, &e), title_pso, super::mesh_attrib::MESHLETS_ANY, "two-pass");
+                }
             }
         }
         return;
@@ -1056,6 +1091,7 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
         Ok(_) => {
             if mesh_sig {
                 mesh_ran(MESH_NATIVE);
+                super::mesh_attrib::indirect(title_pso, args_title, count_title, sig, max, "native");
             }
             count(if gfx { DRAWS } else { DISPATCHES });
             let position = capture.then(|| super::markers::position(this as usize)).flatten();
@@ -1085,6 +1121,9 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
             count(if gfx { DRAWS_SKIPPED } else { DISPATCHES_SKIPPED });
             if compute {
                 note_skipped_writer(this, pso, title_pso);
+            }
+            if mesh_sig {
+                super::mesh_attrib::note(super::mesh_attrib::bind_failure(pso, &e), title_pso, super::mesh_attrib::MESHLETS_ANY, "bind");
             }
             static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
             if N.fetch_add(1, Ordering::Relaxed) < 4 {
@@ -1676,8 +1715,11 @@ pub(super) unsafe fn emit_prepared_indexed_draw(
 unsafe fn graphics_bound(this: *mut c_void) -> Option<ID3D12GraphicsCommandList> {
     let list = ID3D12GraphicsCommandList::from_raw_borrowed(&this)?.clone();
     let pso = with(this, |s| s.pso);
+    // (`XCL_LIGHT_WAIT`: a draw into a lighting target waits once for its pipeline instead of
+    // being skipped for it)
+    super::light_wait::mark(this, pso);
     // a pipeline still being built in the background is waited for (its stand-in draws nothing)
-    let real = super::pso_async::waiting_if(in_bundle(this), || super::pso_async::resolve_wait(pso));
+    let real = super::pso_async::waiting_if(in_bundle(this), || super::pso_async::resolve_wait_light(pso, "draw"));
     if shader_skip(real) {
         count(DRAWS_SKIPPED);
         return None;
@@ -1691,6 +1733,12 @@ unsafe fn graphics_bound(this: *mut c_void) -> Option<ID3D12GraphicsCommandList>
     if two_pass.is_some() || super::real::is_native_mesh(real) {
         // the PC draw with a mesh pipeline is invalid; mesh pipelines draw through DispatchMesh
         mesh_skipped(this, real, "a draw", if two_pass.is_some_and(|tp| tp.kind != "MS") { GS_TWO_PASS } else { "its pipeline is a mesh pipeline" });
+        let (_, count, instances, _, _) = DRAW_ARGS.with(|d| d.get());
+        if count == 0 || instances == 0 {
+            super::mesh_attrib::note(super::mesh_attrib::Outcome::NotSubmitted, pso, super::mesh_attrib::MESHLETS_ANY, "draw-disabled");
+        } else {
+            super::mesh_attrib::note(super::mesh_attrib::Outcome::Dropped, pso, super::mesh_attrib::MESHLETS_ANY, "mesh-pipeline-drawn");
+        }
         return None;
     }
     if !super::real::is_translated_graphics(real) {
@@ -2198,12 +2246,13 @@ fn mesh_skipped(this: *mut c_void, pso: usize, what: &str, why: &str) {
     }
 }
 
-/// The mesh pipelines made so far and the mesh calls run, native (as host mesh shaders) and
-/// two-pass: a line of its own every 30 s, in the GPU snapshot and at the end.
+/// The mesh pipelines made so far, the driver compiles they cost, and the mesh calls run,
+/// native (as host mesh shaders) and two-pass: a line of its own every 30 s, in the GPU
+/// snapshot and at the end.
 pub fn mesh_counts() -> String {
     let c = |k: usize| MESH_CALLS[k].load(Ordering::Relaxed);
     let (native, two_pass) = super::real::mesh_pipeline_counts();
-    format!("mesh pipelines: {native} native, {two_pass} two-pass; mesh calls: {} native, {} two-pass, {} skipped", c(MESH_NATIVE), c(MESH_TWO_PASS), c(MESH_SKIPPED))
+    format!("mesh pipelines: {native} native, {two_pass} two-pass, {} driver compiles; mesh calls: {} native, {} two-pass, {} skipped", super::real::mesh_driver_compiles(), c(MESH_NATIVE), c(MESH_TWO_PASS), c(MESH_SKIPPED))
 }
 
 /// The indirect calls so far by type and how mesh calls ran, for the 30 s line.
@@ -2241,20 +2290,30 @@ unsafe fn pc_dispatch_mesh(this: *mut c_void) -> Option<unsafe extern "system" f
 pub(super) unsafe extern "system" fn dispatch_mesh(this: *mut c_void, x: u32, y: u32, z: u32) {
     super::depth_uav::note_op(this);
     let title_pso = with(this, |s| s.pso);
-    let pso = super::pso_async::waiting_if(in_bundle(this), || super::pso_async::resolve_wait(title_pso));
+    let groups = (x as u64).saturating_mul(y as u64).saturating_mul(z as u64);
+    super::light_wait::mark(this, title_pso);
+    let pso = super::pso_async::waiting_if(in_bundle(this), || super::pso_async::resolve_wait_light(title_pso, "DispatchMesh"));
     let failed = skip_failed_draws() && super::real::is_standin_pso(pso);
-    let skipped = shader_skip(pso) || failed;
+    let gated = shader_skip(pso);
+    let skipped = gated || failed;
     draw_gate_call(this, title_pso, "DispatchMesh", format_args!("groups {x} {y} {z}"), skipped);
     if failed {
         note_failed_skip(title_pso, pso, "DispatchMesh");
     }
     if skipped {
         count(DRAWS_SKIPPED);
+        super::mesh_attrib::note(
+            if failed { super::mesh_attrib::Outcome::FailedPipeline } else { super::mesh_attrib::Outcome::Gate },
+            title_pso,
+            super::mesh_attrib::meshlet_count(groups),
+            if failed { "pipeline-not-built" } else { "gate" },
+        );
         return;
     }
     note_named_use(title_pso, pso, "mesh dispatch");
     let (Some(list), Some(pc)) = (ID3D12GraphicsCommandList::from_raw_borrowed(&this), pc_dispatch_mesh(this)) else {
         mesh_skipped(this, pso, "a DispatchMesh", "the PC command list has no DispatchMesh");
+        super::mesh_attrib::note(super::mesh_attrib::Outcome::Dropped, title_pso, super::mesh_attrib::meshlet_count(groups), "no-host-dispatch-mesh");
         return;
     };
     reach(this);
@@ -2262,6 +2321,7 @@ pub(super) unsafe extern "system" fn dispatch_mesh(this: *mut c_void, x: u32, y:
         if tp.kind != "MS" {
             count(DRAWS_SKIPPED);
             mesh_skipped(this, pso, "a DispatchMesh", GS_TWO_PASS);
+            super::mesh_attrib::note(super::mesh_attrib::Outcome::Dropped, title_pso, super::mesh_attrib::meshlet_count(groups), "geometry-shader");
             return;
         }
         match two_pass_direct(this, list, pso, &tp, x, y, z, pc) {
@@ -2269,10 +2329,12 @@ pub(super) unsafe extern "system" fn dispatch_mesh(this: *mut c_void, x: u32, y:
                 count(DRAWS);
                 mesh_ran(MESH_TWO_PASS);
                 mark(this, "mesh dispatch in two passes");
+                super::mesh_attrib::ran("two-pass", title_pso, groups);
             }
             Err(e) => {
                 count(DRAWS_SKIPPED);
                 mesh_skipped(this, pso, "a DispatchMesh", &e);
+                super::mesh_attrib::note(super::mesh_attrib::bind_failure(pso, &e), title_pso, super::mesh_attrib::meshlet_count(groups), "two-pass");
             }
         }
         return;
@@ -2288,17 +2350,19 @@ pub(super) unsafe extern "system" fn dispatch_mesh(this: *mut c_void, x: u32, y:
         super::residency::note_list_untracked(this as usize);
         gpu_timing::op(this, Timed::Draw, || title_pso, || pc(this, x, y, z));
         mark(this, "mesh dispatch with a PC pipeline");
+        super::mesh_attrib::ran("pc-pipeline", title_pso, groups);
         return;
     }
     if !super::real::is_native_mesh(pso) {
         count(DRAWS_SKIPPED);
         mesh_skipped(this, pso, "a DispatchMesh", "its pipeline has no mesh shader");
+        super::mesh_attrib::note(super::mesh_attrib::Outcome::Dropped, title_pso, super::mesh_attrib::meshlet_count(groups), "no-mesh-shader");
         return;
     }
-    let groups = (x as u64).saturating_mul(y as u64).saturating_mul(z as u64);
     if groups > 65535 {
         count(DRAWS_SKIPPED);
         mesh_skipped(this, pso, "a DispatchMesh", &format!("{groups} groups are over what one host DispatchMesh takes on an axis"));
+        super::mesh_attrib::note(super::mesh_attrib::Outcome::Dropped, title_pso, super::mesh_attrib::meshlet_count(groups), "over-one-host-dispatch");
         return;
     }
     match bind_abi(this, list, pso, RootStage::Mesh, "mesh_dispatch") {
@@ -2311,10 +2375,12 @@ pub(super) unsafe extern "system" fn dispatch_mesh(this: *mut c_void, x: u32, y:
             }
             gpu_timing::op(this, Timed::Draw, || title_pso, || pc(this, groups as u32, 1, 1));
             mark(this, "mesh dispatch");
+            super::mesh_attrib::ran("native", title_pso, groups);
         }
         Err(e) => {
             count(DRAWS_SKIPPED);
             mesh_skipped(this, pso, "a DispatchMesh", &e);
+            super::mesh_attrib::note(super::mesh_attrib::bind_failure(pso, &e), title_pso, super::mesh_attrib::meshlet_count(groups), "bind");
         }
     }
 }
@@ -2330,6 +2396,7 @@ pub(super) unsafe extern "system" fn dispatch_mesh_x(this: *mut c_void, x: u32, 
         draw_gate_call(this, with(this, |s| s.pso), "DispatchMeshX", format_args!("groups {x} indirect {indirect:#x} (unsupported)"), false);
         count(DRAWS_SKIPPED);
         mesh_skipped(this, with(this, |s| s.pso), "a DispatchMeshX", "it takes its group count from memory");
+        super::mesh_attrib::note(super::mesh_attrib::Outcome::Dropped, with(this, |s| s.pso), super::mesh_attrib::MESHLETS_ANY, "groups-from-memory");
         return;
     }
     if payload != 0 {
@@ -2475,6 +2542,22 @@ fn note_two_pass_cut(args: u64, count: Option<u64>, stride: u64, max: u32, room:
         }
     }
     let calls = TWO_PASS_CUTS[0].fetch_add(1, Ordering::Relaxed) + 1;
+    // XCL_TWO_PASS_COUNTS=1: the groups each of the first commands asks for, for the first calls
+    static COUNTS_ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *COUNTS_ON.get_or_init(|| std::env::var("XCL_TWO_PASS_COUNTS").is_ok_and(|v| v.trim() == "1")) && calls <= 8 {
+        let mut asked = Vec::new();
+        for k in 0..commands.min(8) as u64 {
+            match crate::memmap::title_words((args + k * stride) as usize, 3) {
+                Some(w) => asked.push(format!("{}x{}x{}", w[0], w[1], w[2])),
+                None => break,
+            }
+        }
+        let count_at = count.map_or_else(|| "none".to_string(), |c| format!("{c:#x}"));
+        crate::xlog_info!(
+            "D3D12.X: indirect mesh call #{calls} in two passes: {commands} commands at {args:#x} (count {count_at}), groups asked {:?}, room {room} each (XCL_TWO_PASS_COUNTS)",
+            asked
+        );
+    }
     let before = TWO_PASS_CUTS[1].fetch_add(cut, Ordering::Relaxed);
     let past = TWO_PASS_CUTS[2].fetch_add(past, Ordering::Relaxed) + past;
     let after = before + cut;
@@ -3638,6 +3721,7 @@ unsafe fn bind_abi(this: *mut c_void, list: &ID3D12GraphicsCommandList, pso: usi
     }
     let rs = super::real::pso_root_signature(real).or_else(|| super::real::abi_rs_cached().map(|p| p as usize)).ok_or("no XCL ABI root signature")?;
     bind_views(this, list, rs, real, views, gfx)?;
+    super::depth_uav::probe_op(pso, call, layout.as_deref(), &args);
     let mut writer = (call == "dispatch").then(|| super::material_gate_views::writer::snapshot(this as usize, real, &io)).flatten();
     note_lineage_uavs(this, (real, real), call, layout.as_deref(), &args);
     if let Some(snapshot) = writer.as_mut().filter(|_| super::material_gate_capture::enabled() && crate::gpu::recomp::pso::material_gate::writer_mode()) {

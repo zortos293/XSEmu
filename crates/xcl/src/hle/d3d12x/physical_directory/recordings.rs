@@ -302,6 +302,8 @@ pub(in super::super) fn bundle_site(parent: usize, bundle: usize) -> Option<ID3D
     Some(list)
 }
 
+// Recording conflicts and native ids are not consumed yet; kept for the next fix.
+#[allow(dead_code)]
 pub(in super::super) struct Captured {
     direct: Vec<Arc<Recording>>,
     members: Vec<Arc<Lease>>,
@@ -310,6 +312,8 @@ pub(in super::super) struct Captured {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+// Recording conflicts and native ids are not consumed yet; kept for the next fix.
+#[allow(dead_code)]
 pub(in super::super) enum Conflict {
     DirectReplay,
     SharedScratch,
@@ -362,6 +366,8 @@ impl Captured {
     }
 
     /// A fresh grant for the exact native chunk; captures in pending software queues are not grants.
+    // Recording conflicts and native ids are not consumed yet; kept for the next fix.
+    #[allow(dead_code)]
     pub(in super::super) fn for_execution(parts: &[&Captured]) -> Self {
         Self::new(
             parts.iter().flat_map(|p| p.direct.iter().cloned()).collect(),
@@ -374,12 +380,16 @@ impl Captured {
         self.direct.is_empty()
     }
 
+    // Recording conflicts and native ids are not consumed yet; kept for the next fix.
+    #[allow(dead_code)]
     pub(in super::super) fn overlaps(&self, other: &Self) -> bool {
         self.direct
             .iter()
             .any(|a| other.direct.iter().any(|b| Arc::ptr_eq(a, b)))
     }
 
+    // Recording conflicts and native ids are not consumed yet; kept for the next fix.
+    #[allow(dead_code)]
     pub(in super::super) fn pre_enqueue_conflict(&self, other: &Self) -> Option<Conflict> {
         if self.overlaps(other) {
             return Some(Conflict::DirectReplay);

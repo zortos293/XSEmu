@@ -6,6 +6,8 @@ use windows::Win32::Graphics::Direct3D12::*;
 
 pub(crate) type Lease = Arc<dyn Send + Sync>;
 #[derive(Clone)]
+// Fixed native-buffer recipes have no caller yet; kept for the next fix.
+#[allow(dead_code)]
 pub(crate) enum Input {
     Native {
         resource: ID3D12Resource,
@@ -18,14 +20,20 @@ pub(crate) enum Input {
     },
 }
 #[derive(Clone)]
+// Fixed native-buffer recipes have no caller yet; kept for the next fix.
+#[allow(dead_code)]
 pub(crate) struct Need {
     pub(crate) input: Input,
     pub(crate) state: D3D12_RESOURCE_STATES,
 }
+// Fixed native-buffer recipes have no caller yet; kept for the next fix.
+#[allow(dead_code)]
 pub(crate) struct Bound {
     pub(crate) resource: ID3D12Resource,
     pub(crate) offset: u64,
 }
+// Fixed native-buffer recipes have no caller yet; kept for the next fix.
+#[allow(dead_code)]
 pub(crate) struct Packet {
     raw: ID3D12CommandList,
     capture: Arc<queue::Recordings>,
@@ -35,12 +43,16 @@ pub(crate) struct Packet {
     scratch_ids: Vec<usize>,
 }
 
+// Fixed native-buffer recipes have no caller yet; kept for the next fix.
+#[allow(dead_code)]
 pub(crate) struct Recipe {
     pub(crate) needs: Vec<Need>,
     pub(crate) predicate: Option<(Input, D3D12_PREDICATION_OP)>,
 }
 
 #[derive(Clone)]
+// Fixed native-buffer recipes have no caller yet; kept for the next fix.
+#[allow(dead_code)]
 pub(crate) enum GuestOp {
     Draw {
         count: u32,
@@ -62,6 +74,8 @@ pub(crate) enum GuestOp {
     },
 }
 
+// Fixed native-buffer recipes have no caller yet; kept for the next fix.
+#[allow(dead_code)]
 pub(crate) struct FixedConsumer {
     pub(crate) inputs: Recipe,
     pub(crate) ia: Vec<super::recipes::Binding>,
@@ -69,6 +83,8 @@ pub(crate) struct FixedConsumer {
 }
 
 impl FixedConsumer {
+    // Fixed native-buffer recipes have no caller yet; kept for the next fix.
+    #[allow(dead_code)]
     pub(crate) unsafe fn instantiate(
         &self,
         dev: &ID3D12Device,
@@ -221,6 +237,8 @@ impl FixedConsumer {
 }
 
 impl Recipe {
+    // Fixed native-buffer recipes have no caller yet; kept for the next fix.
+    #[allow(dead_code)]
     pub(crate) unsafe fn instantiate(
         &self,
         dev: &ID3D12Device,
@@ -251,6 +269,8 @@ impl Recipe {
 #[path = "fixed_test.rs"]
 mod tests;
 
+// Fixed native-buffer recipes have no caller yet; kept for the next fix.
+#[allow(dead_code)]
 struct Open(usize);
 impl Drop for Open {
     fn drop(&mut self) {
@@ -258,6 +278,8 @@ impl Drop for Open {
     }
 }
 
+// Fixed native-buffer recipes have no caller yet; kept for the next fix.
+#[allow(dead_code)]
 unsafe fn uav(dev: &ID3D12Device, bytes: u64) -> Result<ID3D12Resource, String> {
     let desc = D3D12_RESOURCE_DESC {
         Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
@@ -290,6 +312,8 @@ unsafe fn uav(dev: &ID3D12Device, bytes: u64) -> Result<ID3D12Resource, String> 
     out.ok_or("no native gather allocation".into())
 }
 
+// Fixed native-buffer recipes have no caller yet; kept for the next fix.
+#[allow(dead_code)]
 unsafe fn transition(
     list: &ID3D12GraphicsCommandList,
     r: &ID3D12Resource,
@@ -310,6 +334,8 @@ unsafe fn transition(
 }
 
 impl Packet {
+    // Fixed native-buffer recipes have no caller yet; kept for the next fix.
+    #[allow(dead_code)]
     pub(crate) unsafe fn record(
         dev: &ID3D12Device,
         ty: D3D12_COMMAND_LIST_TYPE,
@@ -436,6 +462,8 @@ impl Packet {
         })
     }
 
+    // Fixed native-buffer recipes have no caller yet; kept for the next fix.
+    #[allow(dead_code)]
     pub(crate) unsafe fn submit(self, q: &ID3D12CommandQueue) -> Result<(), String> {
         let mut device: Option<ID3D12Device> = None;
         q.GetDevice(&mut device).map_err(|e| e.to_string())?;

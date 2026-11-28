@@ -50,6 +50,9 @@ pub(super) struct Em {
     pub writes_lds: bool,
     /// scratch_* used: declare the per-lane private memory
     uses_scratch: bool,
+    /// `XCL_LDS_START`: the (dword, value) the program's first store leaves in the group's LDS
+    /// (`lds_start::lds_start`); stored by every lane before the program's code
+    pub lds_start: Vec<(u32, u32)>,
     /// split wave64 (`x64`): words one exchange carries (1: masks and lane reads, up to 16:
     /// coherent scalar loads, 32: `ds_bpermute`)
     x64_words: usize,
@@ -217,6 +220,26 @@ fn plain_memory() -> bool {
     std::env::var_os("XCL_RECOMP_PLAIN_MEMORY").is_some()
 }
 
+#[cfg(test)]
+thread_local! {
+    /// tests: 16-bit channels of a d16 access move unchanged (`XCL_RECOMP_D16_HALF_BITS`)
+    pub(super) static D16_HALF_BITS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+// xsemu: from fxceless/victory-fork d4b786f (PR 927, gpu/half-views) crates/victory-shader/src/emit/halves.rs, crates/victory-gpu/src/descriptor/host.rs (half_view), GPL-3.0
+/// `XCL_RECOMP_D16_HALF_BITS`: a d16 typed-buffer access moves each channel's 16 bits as
+/// they are, for a 16-bit float format too, as the console does. The face network keeps its
+/// halves and its 16-bit integers in `R16G16B16A16_UINT` views, which the translator already
+/// moves as bits; a view in a 16-bit *float* format still went through f32 (exact for every
+/// finite value and infinity, not for every NaN pattern). Off: the f32 round trip.
+fn d16_half_bits() -> bool {
+    #[cfg(test)]
+    if D16_HALF_BITS.get() {
+        return true;
+    }
+    std::env::var_os("XCL_RECOMP_D16_HALF_BITS").is_some()
+}
+
 /// The address before which a coherent program's loads cannot tell a coherent view of memory from
 /// one that is not: before its first memory write or atomic, its first access with a coherence
 /// flag, its first barrier and the head of its first loop. Such a load runs at most once and
@@ -278,7 +301,7 @@ fn pre_acquire_read_limit(insts: &[Decoded], input_sgprs: u32) -> Option<u64> {
     first_flagged
 }
 
-fn is_lds(name: &str) -> bool {
+pub(super) fn is_lds(name: &str) -> bool {
     name.starts_with("ds_") && !matches!(name, "ds_swizzle_b32" | "ds_bpermute_b32" | "ds_permute_b32" | "ds_nop")
 }
 
@@ -600,11 +623,20 @@ fn fmt_decode(q: u64, declare: bool) -> Vec<String> {
         format!("{}{c}_size = fmt_bytes({c}_info);", ty("uint")),
         format!("{}{c}_fi = min((({s} >> 12) & 0x7Fu), 77u) * 4u;", ty("uint")),
     ];
+    if d16_half_bits() {
+        v.push(format!(
+            "{}{c}_d16b = {c}_int || (((({c}_info >> 3) & 7u) == 6u) && ((({c}_info >> 8) & 63u) == 16u));",
+            ty("bool")
+        ));
+    }
     for k in 0..4 {
         let sel = format!("(({s} >> {}u) & 7u)", 3 * k);
         v.push(format!("{}{c}_e{k} = fmt_slot({c}_fi, {sel});", ty("uint4")));
         v.push(format!("{}{c}_d{k} = {sel} >= 2u;", ty("bool")));
         v.push(format!("{}{c}_v{k} = fmt_const({sel}, {c}_int);", ty("uint")));
+        if d16_half_bits() {
+            v.push(format!("{}{c}_hc{k} = fmt_const_half({sel}, {c}_int);", ty("uint")));
+        }
     }
     v
 }
@@ -1268,6 +1300,38 @@ fn gs_record_prim(maxv: u32) -> String {
     format!("select(any(uint3(t & 0x3FFu, (t >> 10) & 0x3FFu, (t >> 20) & 0x3FFu) + xcl_vb >= {maxv}u), 0x80000000u, {sums})")
 }
 
+/// How a group barrier may be written: the group's own (no branch spans it, so every wave of the
+/// group arrives), the early-exit-safe `xcl_s_barrier` (a wave may leave before it), or not at all.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(super) enum Barrier {
+    Group,
+    Safe,
+    Refused,
+}
+
+/// The form a group barrier takes: `converges` (`Em::group_sync_converges`: no branch spans it),
+/// `safe` (the program's prelude carries `xcl_s_barrier`), and `uniformity`
+/// (`barrier_uniformity`: an unproven barrier is refused rather than written).
+pub(super) fn barrier_form(converges: bool, safe: bool, uniformity: bool) -> Barrier {
+    if converges {
+        Barrier::Group
+    } else if safe {
+        Barrier::Safe
+    } else if uniformity {
+        Barrier::Refused
+    } else {
+        Barrier::Group
+    }
+}
+
+/// Whether a group barrier not every wave of the group reaches is refused. `XCL_BARRIER_UNIFORMITY=0`
+/// writes it anyway, for a bisect: it hangs where a wave of the group stays alive without reaching
+/// the barrier.
+fn barrier_uniformity() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| !std::env::var("XCL_BARRIER_UNIFORMITY").is_ok_and(|v| v.trim() == "0"))
+}
+
 impl Em {
     pub fn new(opt: Options) -> Self {
         let carry_check = opt.mem_windows > 1 && std::env::var("XCL_DS_VALIDATE").is_ok_and(|v| v != "0");
@@ -1292,6 +1356,7 @@ impl Em {
             ps_modes: BTreeMap::new(),
             ps_done: false,
             uses_lds: false,
+            lds_start: Vec::new(),
             // xsemu: from xcl-dev/xcl nvidia-dev 9b455a1a,67a08dbe crates/xcl/src/gpu/recomp/emit.rs
             writes_lds: false,
             uses_scratch: false,
@@ -1450,6 +1515,33 @@ impl Em {
             && self.group_sync_edges.iter().all(|&(a, b)| !(a < pc && pc < b || b <= a && b <= pc))
     }
 
+    /// The line for a group barrier at `d`'s `pc`, at `site`: the group's own barrier where no
+    /// branch spans the barrier, the early-exit-safe `xcl_s_barrier` where the prelude carries it,
+    /// and otherwise the same barrier refused (`unsupported`: the program is not translated),
+    /// because a `GroupMemoryBarrierWithGroupSync()` in control flow not every wave of the group
+    /// reaches hangs the GPU: `bar.sync` waits for warps that never arrive, where the console's
+    /// `S_BARRIER` never waits for a wave that has left. `XCL_BARRIER_UNIFORMITY=0` writes the
+    /// unproven form anyway, for a bisect.
+    fn barrier_line(&mut self, d: &Decoded, site: &'static str) -> &'static str {
+        match barrier_form(self.group_sync_converges(d.pc), self.safe_barrier, barrier_uniformity()) {
+            Barrier::Group => "GroupMemoryBarrierWithGroupSync();",
+            Barrier::Safe => "xcl_s_barrier();",
+            Barrier::Refused => {
+                self.unsupported(
+                    d,
+                    &format!("{site}: a group barrier in control flow not every wave of the group reaches, and no early-exit-safe barrier is available (XCL_BARRIER_UNIFORMITY=0 writes it unproven)"),
+                );
+                "GroupMemoryBarrierWithGroupSync();"
+            }
+        }
+    }
+
+    /// A kernel-mode launch that is one hardware wave: the group is that wave, so a group barrier
+    /// has nothing to wait for wherever in the program it sits.
+    fn kernel_one_wave(&self) -> bool {
+        matches!(self.opt.mode, Mode::Kernel) && !self.x64() && !(self.opt.hw_wave == 64 && !self.opt.wave64)
+    }
+
     pub fn take(&mut self) -> String {
         self.groups.clear();
         self.blocks_ended += 1;
@@ -1513,6 +1605,16 @@ impl Em {
 
     fn mesh_packed(&self) -> bool {
         self.opt.mesh_native.is_some() && self.opt.wave64 && self.x64_threads() > 32
+    }
+
+    /// A mesh group of more than one console wave as one host mesh shader
+    /// (`Options::mesh_multi_wave`): the host group holds ceil(threads / 32) waves of 32, each a
+    /// console wave.
+    fn mesh_multi(&self) -> bool {
+        let Mode::Mesh(ms) = &self.opt.mode else { return false };
+        self.opt.mesh_native.is_some()
+            && self.opt.mesh_multi_wave
+            && super::pso::mesh_native_host_threads(ms.threads, self.opt.wave64).is_some_and(|(waves, _)| waves > 1)
     }
 
     pub(super) fn packed_compute(&self) -> bool {
@@ -2087,7 +2189,7 @@ impl Em {
         }
         let lds = d.enc.name == "ENC_DS" && is_lds(&d.inst.name.to_ascii_lowercase());
         let fence = if lds && self.opt.mesh_native.is_some() {
-            Some("GroupMemoryBarrierWithGroupSync();")
+            Some(self.barrier_line(d, "LDS sync fence"))
         } else if lds && self.packed_compute() {
             Some("GroupMemoryBarrier();")
         } else {
@@ -2218,10 +2320,15 @@ impl Em {
                     } else if !self.packed_compute() && self.compute_or_mesh_hw_waves() == Some(1) {
                         self.line("GroupMemoryBarrier();");
                     } else {
-                        self.line("GroupMemoryBarrierWithGroupSync();");
+                        let line = self.barrier_line(d, "s_barrier");
+                        self.line(line);
                     }
-                } else if matches!(self.opt.mode, Mode::Kernel | Mode::Geometry(_)) {
+                } else if self.kernel_one_wave() {
+                    // one hardware wave: nothing a barrier could wait for, wherever it sits
                     self.line("GroupMemoryBarrierWithGroupSync();");
+                } else if matches!(self.opt.mode, Mode::Kernel | Mode::Geometry(_)) {
+                    let line = self.barrier_line(d, "s_barrier");
+                    self.line(line);
                 }
                 // xsemu: from xcl-dev/xcl nvidia-dev 9b455a1a,67a08dbe crates/xcl/src/gpu/recomp/emit.rs
                 // split wave64: both halves made their LDS accesses before the barrier (a half
@@ -3274,6 +3381,11 @@ impl Em {
                     self.line(&format!("bool {c}_int = ((({c}_info >> 3) & 7u) == 4u) || ((({c}_info >> 3) & 7u) == 5u);"));
                     self.line(&format!("uint {c}_size = fmt_bytes({c}_info);"));
                     self.line(&format!("uint {c}_fi = min({fmt}, 77u) * 4u;"));
+                    if d16_half_bits() && d16_format.is_some() {
+                        self.line(&format!(
+                            "bool {c}_d16b = {c}_int || (((({c}_info >> 3) & 7u) == 6u) && ((({c}_info >> 8) & 63u) == 16u));"
+                        ));
+                    }
                 }
                 self.line(&format!("bool {t}_ok = and(({c}_info & 7u) != 0u, {});", in_range(format!("{c}_size"))));
                 self.line(&format!("bool {t}_odd16 = {c}_size == 2u && ({t}_a & 1u) != 0u;"));
@@ -3285,6 +3397,9 @@ impl Em {
                     None => (0..count).collect(),
                 };
                 for k in picked {
+                    if d16_half_bits() && d16_format.is_some() && mtbuf {
+                        self.line(&format!("uint {t}_b{k} = fmt_pick_d16({t}_r, FMT_COMP[{c}_fi + {k}u], {c}_int, true, 0u, {t}_odd16);"));
+                    }
                     if mtbuf {
                         self.line(&format!("uint {t}_s{k} = select({t}_odd16, 0u, fmt_comp({t}_r, FMT_COMP[{c}_fi + {k}u]));"));
                         continue;
@@ -3294,13 +3409,23 @@ impl Em {
                         self.line(&format!("uint4 {c}_e{k} = fmt_slot({c}_fi, {sel});"));
                         self.line(&format!("bool {c}_d{k} = {sel} >= 2u;"));
                         self.line(&format!("uint {c}_v{k} = fmt_const({sel}, {c}_int);"));
+                        if d16_half_bits() && d16_format.is_some() {
+                            self.line(&format!("uint {c}_hc{k} = fmt_const_half({sel}, {c}_int);"));
+                        }
+                    }
+                    if d16_half_bits() && d16_format.is_some() {
+                        self.line(&format!("uint {t}_b{k} = fmt_pick_d16({t}_r, {c}_e{k}, {c}_int, {c}_d{k}, {c}_hc{k}, {t}_odd16);"));
                     }
                     self.line(&format!("uint {t}_s{k} = fmt_pick({t}_r, {c}_e{k}, {c}_d{k}, {c}_v{k}, {t}_odd16);"));
                 }
                 if let Some((_, components, high)) = d16_format {
                     let half = |component: u64| {
                         let selected = pick(component);
-                        format!("select({c}_int, {selected} & 0xFFFFu, f32tof16(asfloat({selected})))")
+                        if d16_half_bits() {
+                            format!("select({c}_d16b, {t}_b{component} & 0xFFFFu, f32tof16(asfloat({selected})))")
+                        } else {
+                            format!("select({c}_int, {selected} & 0xFFFFu, f32tof16(asfloat({selected})))")
+                        }
                     };
                     let mut assigns = Vec::new();
                     if high {
@@ -3330,14 +3455,29 @@ impl Em {
                 self.line(&format!("bool {t}_ok = and(({t}_info & 7u) != 0u, {});", in_range(format!("fmt_bytes({t}_info)"))));
                 if let Some((_, components, high)) = d16_format {
                     self.line(&format!("uint {t}_ty = ({t}_info >> 3) & 7u;"));
-                    let mut source = |component: u64| {
+                    let mut half = |component: u64| {
                         let v = self.vreg(vdata + if high { 0 } else { component / 2 });
                         let shift = if high || component & 1 != 0 { " >> 16" } else { "" };
-                        let h = format!("(({v}{shift}) & 0xFFFFu)");
+                        format!("(({v}{shift}) & 0xFFFFu)")
+                    };
+                    let mut source = |component: u64| {
+                        let h = half(component);
                         format!("select({t}_ty == 4u, {h}, select({t}_ty == 5u, (uint)(((int)({h} << 16)) >> 16), asuint(f16tof32({h}))))")
                     };
                     let vals: Vec<String> = (0..4).map(|i| if i < components { source(i) } else { "0u".into() }).collect();
-                    self.line(&format!("if (and({act}, {t}_ok)) st_bytes({t}_a, fmt_pack(uint4({}), {t}_info), fmt_bytes({t}_info));", vals.join(", ")));
+                    if d16_half_bits() {
+                        let bits: Vec<String> = (0..4).map(|i| if i < components { half(i) } else { "0u".into() }).collect();
+                        self.line(&format!(
+                            "bool {t}_h16 = (({t}_info >> 3) & 7u) == 6u && ((({t}_info >> 8) & 63u) == 16u);"
+                        ));
+                        self.line(&format!(
+                            "if (and({act}, {t}_ok)) st_bytes({t}_a, select({t}_h16, fmt_pack_d16(uint4({}), {t}_info), fmt_pack(uint4({}), {t}_info)), fmt_bytes({t}_info));",
+                            bits.join(", "),
+                            vals.join(", ")
+                        ));
+                    } else {
+                        self.line(&format!("if (and({act}, {t}_ok)) st_bytes({t}_a, fmt_pack(uint4({}), {t}_info), fmt_bytes({t}_info));", vals.join(", ")));
+                    }
                     return Ok(());
                 }
                 let vals: Vec<String> = (0..4).map(|i| if i < count { self.vreg(vdata + i) } else { "0u".into() }).collect();
@@ -3449,6 +3589,12 @@ impl Em {
                         (2, true) => format!("(((int)({raw} << 16)) >> 16)"),
                         (2, false) => format!("(int){raw}"),
                         (_, _) => raw,
+                    };
+                    let v = if e.component_type == 3 {
+                        let bits = format!("asuint({v})");
+                        scrubbed(&v, &bits, "0.0f", "a pixel shader's float colour export")
+                    } else {
+                        v
                     };
                     st.push(format!("xo.t{tgt}[{c}] = {v};"));
                 }
@@ -4100,8 +4246,9 @@ impl Em {
                 }
                 let v4 = format!("uint4({})", vals.join(", "));
                 let uav = |vt: &str| format!("RWTexture{rty}<{vt}4> {t}_U = ResourceDescriptorHeap[NonUniformResourceIndex({tw0} + 1u)];");
+                let f4 = scrubbed(&format!("asfloat({v4})"), &v4, "(float4)0", "a float image store");
                 self.line(&format!(
-                    "if ({act}) {{ if ({t}_cls == 1u) {{ {} {t}_U[{icoord}] = {v4}; }} else if ({t}_cls == 2u) {{ {} {t}_U[{icoord}] = (int4){v4}; }} else {{ {} {t}_U[{icoord}] = asfloat({v4}); }} }}",
+                    "if ({act}) {{ if ({t}_cls == 1u) {{ {} {t}_U[{icoord}] = {v4}; }} else if ({t}_cls == 2u) {{ {} {t}_U[{icoord}] = (int4){v4}; }} else {{ {} {t}_U[{icoord}] = {f4}; }} }}",
                     uav("uint"),
                     uav("int"),
                     uav("float")
@@ -6116,6 +6263,55 @@ impl Em {
         self.x64_threads() > 32
     }
 
+    /// The highest dword of `xcl_lds` the split form leaves to the program: above it sit the
+    /// exchange slots, their counters, the tick word and the optional barrier / wait words
+    /// (`x64_prelude`).
+    fn x64_lds_top(&self) -> usize {
+        let threads = self.x64_threads();
+        let waves = threads.div_ceil(64).max(1) as usize;
+        let (slots, counters) = (waves * 4 * self.x64_words, waves * 2);
+        let bar_words = if self.safe_barrier { 2 } else { 0 };
+        let prog_words = self.waits() as usize;
+        8192usize.saturating_sub(slots + counters + 1 + bar_words + prog_words + 1)
+    }
+
+    /// The highest dword of `xcl_lds` the program itself may address in this form; a word the
+    /// translation keeps for itself is never the program's.
+    pub(super) fn lds_top(&self) -> u32 {
+        if let (Mode::Mesh(_), Some(native)) = (&self.opt.mode, &self.opt.mesh_native) {
+            return native.lds_bytes.div_ceil(4).saturating_sub(1);
+        }
+        if self.x64_lds() {
+            return self.x64_lds_top() as u32;
+        }
+        // 8187: the top four words hold the split/safe-barrier state, or the thread counter of
+        // a reordered group (`XCL_WT`)
+        8187
+    }
+
+    /// `XCL_LDS_START`: the group's LDS dwords the program sets up (`lds_start`), stored by
+    /// every lane before the program's code, then a group barrier, so a group whose
+    /// setting-up lane is not live does not work with what the host's memory held. Empty when
+    /// the program has no such store or the store's dwords are not the program's own.
+    pub(super) fn lds_start_body(&self) -> String {
+        let top = self.lds_top();
+        let inits: Vec<(u32, u32)> = self.lds_start.iter().copied().filter(|&(dword, _)| dword <= top).collect();
+        if inits.len() != self.lds_start.len() || inits.is_empty() {
+            return String::new();
+        }
+        let mut h = String::new();
+        let mesh = matches!(self.opt.mode, Mode::Mesh(_)) && self.opt.mesh_native.is_some();
+        for (dword, value) in inits {
+            let _ = if mesh {
+                writeln!(h, "    xcl_mesh_lds_store({}u, {value:#010x}u);", 4 * dword)
+            } else {
+                writeln!(h, "    xcl_lds[{dword}u] = {value:#010x}u;")
+            };
+        }
+        h.push_str("    GroupMemoryBarrierWithGroupSync(); // XCL_LDS_START: the program's own set-up of its LDS\n");
+        h
+    }
+
     /// The console LDS block (`xcl_lds`) is declared before the split-wave64 prelude, which
     /// keeps its exchange in the top of it.
     fn x64_lds(&self) -> bool {
@@ -6130,7 +6326,7 @@ impl Em {
         if ms.max_vertices > ms.threads || ms.max_primitives > ms.threads {
             return Some("its vertices and primitives need more lanes than the guest mesh group has");
         }
-        if self.uses_lds && (native.lds_bytes == 0 || native.lds_bytes > 28 * 1024) {
+        if self.uses_lds && (native.lds_bytes == 0 || native.lds_bytes.div_ceil(4) * 4 + if self.mesh_multi() { 12 } else { 0 } > 28 * 1024) {
             return Some("its LDS allocation is missing or exceeds the native mesh limit (28 KB)");
         }
         if self.mesh_divergent_lds {
@@ -6161,9 +6357,8 @@ impl Em {
             // the D3D12 limit (32 KB) is the whole block already: the exchange (and optional
             // safe-barrier words at 8189..8190) takes its top, the program's LDS accesses stop
             // below it (`XCL_X_LDS_TOP`)
+            let base = self.x64_lds_top() + 1;
             let bar_words = if self.safe_barrier { 2 } else { 0 };
-            let prog_words = self.waits() as usize;
-            let base = 8192 - slots - counters - 1 - bar_words - prog_words;
             h.push_str("groupshared uint xcl_lds[8192]; // D3D12 limit: 32 KB (the console allows 64 KB); the top holds the wave64 exchange\n");
             let _ = writeln!(h, "#define XCL_X_LDS_TOP {}u", base - 1);
             let _ = writeln!(h, "#define XCL_XS(i) xcl_lds[{base}u + (i)]\n#define XCL_XC(i) xcl_lds[{}u + (i)]\n#define XCL_XW xcl_lds[8191u]", base + slots);
@@ -6324,6 +6519,9 @@ impl Em {
             .collect();
         let _ = writeln!(h, "static const uint4 FMT_COMP[{}] = {{ {} }};", comps.len(), comps.join(", "));
         h.push_str(PRELUDE_MEM);
+        if d16_half_bits() {
+            h.push_str(PRELUDE_D16_BITS);
+        }
         let fixed_mem_access;
         let mem_access = if self.opt.bvh_node_fix {
             let (_, helpers) = PRELUDE_MEM_ACCESS.split_once("
@@ -6626,6 +6824,7 @@ uint4 ld_raw(").unwrap();
             Mode::Mesh(ms) if self.opt.mesh_native.is_some() => {
                 let native = self.opt.mesh_native.as_ref().unwrap();
                 let packed = self.mesh_packed();
+                let multi = self.mesh_multi();
                 let (decl, fill) = native_mesh_vertex(ms, native.ps_inputs.as_deref());
                 h.push_str(&decl);
                 if self.uses_lds {
@@ -6633,15 +6832,40 @@ uint4 ld_raw(").unwrap();
                     let _ = writeln!(h, "#define XCL_LDS_WORDS {words}u\ngroupshared uint xcl_lds[{words}];");
                     h.push_str(super::wave_pack::LDS);
                 }
+                if multi {
+                    // the host wave ids, taken in arrival order (`xcl_wave`), and the group's
+                    // output counts, summed over the waves: the console's allocation request is
+                    // the group's, and every wave's export bound needs it
+                    h.push_str("groupshared uint xcl_ms_ticket;\ngroupshared uint xcl_ms_counts[2];\n");
+                }
                 let (t, mv, mp) = (ms.threads, ms.max_vertices, ms.max_primitives);
-                let threads = t.min(32);
+                // console lanes of one console wave, and with more than one console wave in the
+                // group the host's 32-lane waves, one per console wave
+                let lanes = if self.opt.wave64 { 64u32 } else { 32u32 };
+                let threads = if multi { t / lanes * 32 } else { t.min(32) };
+                let valid = if multi { lanes } else { t };
                 let _ = writeln!(
                     h,
                     "[outputtopology(\"triangle\")]\n[numthreads({threads}, 1, 1)]\nvoid main(uint gi : SV_GroupIndex, uint3 gid : SV_GroupID, out vertices XclVert verts[{mv}], out indices uint3 tris[{mp}])\n{{"
                 );
                 h.push_str("    lane_id = WaveGetLaneIndex();\n    uint xcl_slot = lane_id;\n    uint xcl_ms_nv = 0u;\n    uint xcl_ms_np = 0u;\n");
+                if multi {
+                    // A host need not give a host wave a wave-aligned run of flat thread ids
+                    // (NVIDIA fills 2-D groups from 16 x 2 tiles), so `gi / 32` is not this
+                    // wave's index: each wave takes the next id from an LDS counter. Ported
+                    // idea: VIctory-NVIDIA 854f57ff7a856aba3fc55540968289c2da7c4c86 (port of
+                    // Vice-Tay c125c0c05f62f8eefb9049048a936d7edacf505f, fxceless #1243),
+                    // GPL-3.0-or-later as this tree.
+                    h.push_str("    if (gi == 0u) { xcl_ms_ticket = 0u; xcl_ms_counts[0] = 0u; xcl_ms_counts[1] = 0u; }\n");
+                    h.push_str("    GroupMemoryBarrierWithGroupSync();\n");
+                    h.push_str("    uint xcl_ticket = 0u;\n    InterlockedAdd(xcl_ms_ticket, (xcl_slot == 0u) ? 1u : 0u, xcl_ticket);\n");
+                    let _ = writeln!(h, "    uint xcl_wave = WaveReadLaneFirst(xcl_ticket);\n    uint xcl_thread = xcl_wave * {lanes}u + xcl_slot;");
+                }
                 if packed {
-                    let _ = writeln!(h, "    xcl_valid_lanes = {t}u;\n    uint hi_xcl_slot = xcl_slot + 32u;");
+                    let _ = writeln!(h, "    xcl_valid_lanes = {valid}u;\n    uint hi_xcl_slot = xcl_slot + 32u;");
+                    if multi {
+                        h.push_str("    uint hi_xcl_thread = xcl_thread + 32u;\n");
+                    }
                 }
                 for prefix in if packed { &["", "hi_"][..] } else { &[""][..] } {
                     for k in 0..ms.vert_dwords() / 4 {
@@ -6651,26 +6875,52 @@ uint4 ld_raw(").unwrap();
                 }
                 load_sgprs(&mut h);
                 if sg.contains(&3) {
-                    h.push_str("    s3 &= 0xF0FFFFFFu;\n");
+                    if multi {
+                        // the console wave this thread is in (bits 24..27 of the group info SGPR)
+                        h.push_str("    s3 = (s3 & 0xF0FFFFFFu) | (xcl_wave << 24u);\n");
+                    } else {
+                        h.push_str("    s3 &= 0xF0FFFFFFu;\n");
+                    }
                 }
                 h.push_str("    uint scc = 0u;\n    exec_lo = WaveActiveBallot(true).x;\n");
                 if packed {
-                    let _ = writeln!(h, "    exec_hi = WaveActiveBallot(hi_xcl_slot < {t}u).x;");
+                    let _ = writeln!(h, "    exec_hi = WaveActiveBallot(hi_xcl_slot < {valid}u).x;");
                 } else {
                     h.push_str("    exec_hi = 0u;\n");
                 }
                 for &v in &self.vgprs {
-                    let init = if v == 5 { format!("gid.x * {t}u + xcl_slot") } else { "0u".into() };
+                    let init = if v != 5 {
+                        "0u".into()
+                    } else if multi {
+                        format!("gid.x * {t}u + xcl_thread")
+                    } else {
+                        format!("gid.x * {t}u + xcl_slot")
+                    };
                     let _ = writeln!(h, "    uint v{v} = {init};");
                     if packed {
                         let _ = writeln!(h, "    uint hi_v{v} = {};", super::wave_pack::lane_code(&init, true));
                     }
                 }
                 h.push_str(body);
-                let _ = writeln!(h, "    uint xcl_nv = min(WaveReadLaneFirst(xcl_ms_nv), {mv}u);\n    uint xcl_np = min(WaveReadLaneFirst(xcl_ms_np), {mp}u);");
+                if multi {
+                    // Each wave's counts are its own (0 for a wave the console gives no request);
+                    // the group's counts are their sum, and every wave needs them for its export
+                    // bound. D3D12 takes SetMeshOutputCounts from the group's first active thread
+                    // and requires the call to dominate every output write.
+                    h.push_str("    if (xcl_slot == 0u) { InterlockedAdd(xcl_ms_counts[0], xcl_ms_nv); InterlockedAdd(xcl_ms_counts[1], xcl_ms_np); }\n");
+                    h.push_str("    GroupMemoryBarrierWithGroupSync();\n");
+                    let _ = writeln!(h, "    uint xcl_nv = min(xcl_ms_counts[0], {mv}u);\n    uint xcl_np = min(xcl_ms_counts[1], {mp}u);");
+                } else {
+                    let _ = writeln!(h, "    uint xcl_nv = min(WaveReadLaneFirst(xcl_ms_nv), {mv}u);\n    uint xcl_np = min(WaveReadLaneFirst(xcl_ms_np), {mp}u);");
+                }
                 h.push_str("    SetMeshOutputCounts(xcl_nv, xcl_np);\n");
+                if multi {
+                    h.push_str("    GroupMemoryBarrierWithGroupSync();\n");
+                }
+                // the console thread this invocation exports vertex and primitive for
+                let slot = if multi { "xcl_thread" } else { "xcl_slot" };
                 let outputs = format!(
-                    "    if (xcl_slot < xcl_nv) {{\n{fill}        verts[xcl_slot] = o;\n    }}\n    if (xcl_slot < xcl_np) {{\n        uint3 x = {};\n        bool bad = or((xcl_op >> 31) != 0u, any(x >= xcl_nv));\n        tris[xcl_slot] = select(bad, uint3(0u, 0u, 0u), x);\n    }}\n",
+                    "    if ({slot} < xcl_nv) {{\n{fill}        verts[{slot}] = o;\n    }}\n    if ({slot} < xcl_np) {{\n        uint3 x = {};\n        bool bad = or((xcl_op >> 31) != 0u, any(x >= xcl_nv));\n        tris[{slot}] = select(bad, uint3(0u, 0u, 0u), x);\n    }}\n",
                     prim_indices("xcl_op")
                 );
                 h.push_str(&outputs);
@@ -8099,6 +8349,30 @@ uint fmt_const(uint sel, bool isint) { return select(sel == 1u, select(isint, 1u
 uint fmt_pick(uint4 r, uint4 e, bool decode, uint constant, bool zero) { return select(decode, select(zero, 0u, fmt_comp(r, e)), constant); }
 "#;
 
+// xsemu: from fxceless/victory-fork d4b786f (PR 927, gpu/half-views) crates/victory-shader/src/emit/lower.rs (component 0x409 to 0x405, bufferLoad.i32), crates/victory-gpu/src/descriptor/host.rs (half_view), GPL-3.0
+/// `XCL_RECOMP_D16_HALF_BITS` (`d16_half_bits`): the 16 bits a d16 access moves, as they are.
+pub(super) const PRELUDE_D16_BITS: &str = r#"
+// A d16 access's channel: the format's 16 bits as they are (an absent channel's and a
+// DST_SEL constant's converted as the format says: a half of 1.0, or the integer 1), and 0
+// at an odd address.
+uint fmt_pick_d16(uint4 r, uint4 e, bool isint, bool decode, uint constant, bool zero) {
+    uint raw = bits_at(r, e.x & 0xFFu, (e.x >> 8) & 63u);
+    uint absent = ((e.x >> 26) & 1u) != 0u;
+    uint v = select(absent, select(isint, e.w, f32tof16(asfloat(e.w))), raw);
+    v = select(zero, 0u, v);
+    return select(decode, v, constant);
+}
+// The half-bits value of a DST_SEL constant: the integer 1, or 1.0 as a half.
+uint fmt_const_half(uint sel, bool isint) { return select(sel == 1u, select(isint, 1u, 0x3C00u), 0u); }
+// Components placed as they are, without the format's conversion (an integer or a half is
+// already a channel's 16 bits).
+uint4 fmt_pack_d16(uint4 v, uint info) {
+    uint4 r = uint4(0u, 0u, 0u, 0u); uint n = info & 7u; uint off = 0u;
+    [unroll] for (uint c = 0u; c < 4u; c++) { if (c < n) { uint w = (info >> (8u + 6u * c)) & 63u; put_bits(r, off, w, v[c]); off += w; } }
+    return r;
+}
+"#;
+
 /// Unaligned and sub-dword memory access, BVH nodes. With several memory windows also
 /// emitted on the per-lane window (`lane_helpers`).
 pub(super) const PRELUDE_MEM_ACCESS: &str = r#"
@@ -8283,6 +8557,56 @@ fn note_lds_order() {
         crate::xlog_info!("[SHADER] XCL_X_LDS_ORDER: split wave64 LDS order engaged (an LDS read meets the other half after its writes, a write after its reads; XCL_X_LDS_ORDER=0 turns it off)");
     } else if 10u64.pow(n.ilog10()) == n {
         crate::xlog_info!("[SHADER] XCL_X_LDS_ORDER: {n} split wave64 translations kept the LDS order");
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// tests: the NaN scrub (`XCL_NAN_SCRUB`) on this thread
+    pub(super) static NAN_SCRUB: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+/// `XCL_NAN_SCRUB=1` (off by default): a NaN or an infinity that a pixel shader exports as a
+/// float colour, or stores to an image of the float class, is written as 0. One bad value that
+/// reaches the title's blur, bloom or temporal upscaler spreads into black patches that stay in
+/// its history. Not what the console does, so it is a switch, and part of the translation's
+/// identity (`pso::translated::identity_for_layout`).
+///
+/// xsemu: the behaviour of trustno1-coder/VIctory-NVIDIA 77e13a974aed142f5d9f8b80d54ed6de41bfa140
+/// `crates/victory-shader/src/emit/lower.rs` (`VICTORY_NAN_SCRUB`, `Lower::scrub_nan`), written
+/// for this translator's HLSL. SPDX-License-Identifier: GPL-3.0-or-later. This program is free
+/// software: you can redistribute it and/or modify it under the terms of the GNU General Public
+/// License as published by the Free Software Foundation, either version 3 of the License, or (at
+/// your option) any later version; see <https://www.gnu.org/licenses/gpl-3.0.html>.
+pub(super) fn nan_scrub() -> bool {
+    #[cfg(test)]
+    if let Some(on) = NAN_SCRUB.get() {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("XCL_NAN_SCRUB").is_ok_and(|v| v.trim() == "1"))
+}
+
+/// `v`, or `zero` where the bits `bits` say it is NaN or infinite (`nan_scrub`): the exponent
+/// field all ones covers an infinity and every NaN of a float, with no float compare involved
+/// (DXC's comparisons are IEEE-exact only under `-Gis`, and the direct DXIL backend is not DXC).
+/// One `and` and one compare per value.
+fn scrubbed(v: &str, bits: &str, zero: &str, what: &str) -> String {
+    if !nan_scrub() {
+        return v.to_string();
+    }
+    note_nan_scrub(what);
+    format!("select(({bits} & 0x7F800000u) == 0x7F800000u, {zero}, {v})")
+}
+
+/// NaN scrubs emitted: the first is logged (the switch engaged), then every power of ten.
+fn note_nan_scrub(what: &str) {
+    static SCRUBS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = SCRUBS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+    if n == 1 {
+        crate::xlog_info!("[SHADER] XCL_NAN_SCRUB: NaN scrub engaged: NaN and infinite colour exports and float image stores are written as 0 (first: {what}; unset XCL_NAN_SCRUB to turn it off)");
+    } else if 10u64.pow(n.ilog10()) == n {
+        crate::xlog_info!("[SHADER] XCL_NAN_SCRUB: {n} NaN scrubs emitted");
     }
 }
 
@@ -9013,3 +9337,38 @@ uint fclass64(double f) {
     return n ? 3u : 8u;
 }
 "#;
+
+#[cfg(test)]
+mod barrier_uniformity_tests {
+    use super::*;
+
+    /// The decision, exhaustively: a group barrier is the group's own only where no branch spans
+    /// it, the early-exit-safe form where the prelude carries one, and otherwise refused – never
+    /// written unproven, which hangs the GPU instead of slowing it down.
+    #[test]
+    fn a_group_barrier_is_written_only_where_every_wave_reaches_it() {
+        assert_eq!(barrier_form(true, false, true), Barrier::Group);
+        assert_eq!(barrier_form(true, true, true), Barrier::Group);
+        assert_eq!(barrier_form(false, true, true), Barrier::Safe);
+        assert_eq!(barrier_form(false, false, true), Barrier::Refused);
+        assert_eq!(barrier_form(false, true, false), Barrier::Safe);
+        assert_eq!(barrier_form(false, false, false), Barrier::Group, "XCL_BARRIER_UNIFORMITY=0 is the way back to the unproven form");
+    }
+
+    /// What makes a barrier unprovable is a branch edge over it, a barrier at or after the first
+    /// s_endpgm, or an indirect branch anywhere; nothing else does.
+    #[test]
+    fn a_branch_over_the_barrier_is_what_makes_it_unprovable() {
+        let mut em = Em::new(Options::default());
+        assert!(em.group_sync_converges(0x20), "no branch recorded: the barrier is on the only path");
+        em.group_sync_edges = vec![(0x10, 0x30)];
+        assert!(!em.group_sync_converges(0x20), "a branch from 0x10 to 0x30 spans 0x20");
+        assert!(em.group_sync_converges(0x40), "and not 0x40, past it");
+        em.group_sync_edges.clear();
+        em.group_sync_end = Some(0x20);
+        assert!(!em.group_sync_converges(0x20), "a barrier at the first s_endpgm or after it may not be reached at all");
+        em.group_sync_end = None;
+        em.group_sync_indirect = true;
+        assert!(!em.group_sync_converges(0x40), "an indirect branch says nothing about where a wave goes");
+    }
+}

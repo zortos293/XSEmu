@@ -58,7 +58,7 @@ impl Lease {
             refusal("no private coherent UMA arena");
             return None;
         };
-        let Ok(slot) = NEXT.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
+        let Ok(slot) = NEXT.try_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
             (n < SLOTS).then_some(n + 1)
         }) else {
             refusal("private UMA arena exhausted; slots are never reused by replayable lists");

@@ -63,7 +63,7 @@ pub(crate) fn snapshot(list: usize, pso: usize, io: &[u32]) -> Option<Snapshot> 
     if COUNT.load(Ordering::Relaxed) >= 24 || !c.arm.is_file() { return None }
     let generation = queue::recording(list);
     if generation == 0 { return None }
-    COUNT.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| (n < 24).then_some(n + 1)).ok()?;
+    COUNT.try_update(Ordering::Relaxed, Ordering::Relaxed, |n| (n < 24).then_some(n + 1)).ok()?;
     let (_, epoch) = present::counters();
     let views = super::describe_slots(io, &c.slots, true).1;
     Some(Snapshot { list, generation, epoch, pso, hash: c.shader, views, lease: None })
@@ -127,7 +127,7 @@ impl Snapshot {
             || s.owner == d.owner || u.resource != d.owner || u.view != (41,4) || (image.width,image.height) != (out.width,out.height) { return None }
         super::prepass::select(s.owner, src_stamp);
         static ISSUED: AtomicU32 = AtomicU32::new(0);
-        let ticket = ISSUED.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| (n < 6).then_some(n+1)).ok()?;
+        let ticket = ISSUED.try_update(Ordering::Relaxed, Ordering::Relaxed, |n| (n < 6).then_some(n+1)).ok()?;
         if ticket < 3 { depth_lineage::report_writer_input(s.owner, self.list, self.generation); }
         let (lease, va) = material_gate_capture::Lease::new(self.generation, di.checked_add(1)?, out.width, out.height, || {
             (Some(si), format!("epoch={} cs={:016x} input_owner={:#x}/{} native=21 plane=0 gfx10={} output_owner={:#x}/{} native=41 plane=0 gfx10={}; {}", self.epoch, self.hash, s.owner, src_stamp, image.format, d.owner, dst_stamp, out.format, self.views))

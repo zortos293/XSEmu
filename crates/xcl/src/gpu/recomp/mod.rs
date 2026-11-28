@@ -93,11 +93,18 @@ mod loop_guard_tests;
 mod lane_independent_tests;
 pub mod upper_lanes;
 mod loop_profile;
+mod lds_start;
 mod structure;
 mod lane_guards;
 mod lane_independent;
 #[cfg(test)]
 mod lane_independent_form_tests;
+#[cfg(test)]
+mod d16_tests;
+#[cfg(test)]
+mod lds_start_tests;
+#[cfg(test)]
+mod loop_skip_tests;
 pub use loop_profile::{loop_profile_enabled, LOOP_PROFILE_SITES, LOOP_PROFILE_WORDS};
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -640,6 +647,11 @@ pub struct Options {
     /// `Mode::Mesh` only: the program as a host mesh shader (ms_6_6) instead of the compute
     /// first pass (`MeshNative`)
     pub mesh_native: Option<MeshNative>,
+    /// `Mode::Mesh` only: a group of more than one console wave as one host mesh shader
+    /// (`pso::mesh_native_host_threads`), instead of two passes. Off: the gate in
+    /// `decode_program` refuses such a group, as it always has. `pso::mesh_multi_wave` reads
+    /// the switch.
+    pub mesh_multi_wave: bool,
     /// the constant data the console compiler put after the program in its code region
     /// (`code_data`): what a load through an `s_getpc_b64` address reads. None: such a load
     /// reads guest memory at the program-relative address, as a kernel test's `mem` holds it
@@ -674,7 +686,7 @@ pub fn code_data(f: &super::xbox::Fssm, p: &super::xbox::Program) -> Option<Code
 
 impl Default for Options {
     fn default() -> Self {
-        Options { mode: Mode::Kernel, wave64: true, hw_wave: 0, split_wave64: false, legacy_compute_wave64: legacy_compute_wave64(), lane_independent: false, compute_per_access_coherence: compute_per_access_coherence(), bvh_node_fix: bvh_node_fix(), rt_all_miss: rt_all_miss(), thread_limits: dispatch_thread_dimensions(), group_spread: dispatch_spread(), loop_profile: false, guard_trip_counters: true, static_sampler_base: 0, mem_windows: 1, no_outline: false, structured: true, exec_proof: true, nan_guards: true, mesh_native: None, code_data: None }
+        Options { mode: Mode::Kernel, wave64: true, hw_wave: 0, split_wave64: false, legacy_compute_wave64: legacy_compute_wave64(), lane_independent: false, compute_per_access_coherence: compute_per_access_coherence(), bvh_node_fix: bvh_node_fix(), rt_all_miss: rt_all_miss(), thread_limits: dispatch_thread_dimensions(), group_spread: dispatch_spread(), loop_profile: false, guard_trip_counters: true, static_sampler_base: 0, mem_windows: 1, no_outline: false, structured: true, exec_proof: true, nan_guards: true, mesh_native: None, mesh_multi_wave: false, code_data: None }
     }
 }
 
@@ -822,7 +834,9 @@ pub(super) fn compute_wave64_pack_max_insts() -> usize {
 ///
 /// HLSL has no `WaveSize` for mesh shaders, so the caller must know the host's wave size: 32
 /// lanes (one guest lane per thread for wave32, up to two for wave64).
-/// `pso::mesh_native_split` says whether the adapter qualifies.
+/// `pso::mesh_native_split` says whether the adapter qualifies. A group of more than one console
+/// wave is refused unless `Options::mesh_multi_wave` is set, which gives it one host wave per
+/// console wave (`pso::mesh_native_host_threads`).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct MeshNative {
     /// the pixel shader's input signature: the vertices carry exactly these (as
@@ -2050,7 +2064,10 @@ struct DecodedProgram<'a> {
 fn decode_program<'a>(code: &'a [u8], opt: &Options) -> Result<DecodedProgram<'a>, String> {
     if let (Mode::Mesh(ms), Some(_)) = (&opt.mode, &opt.mesh_native) {
         if ms.threads > if opt.wave64 { 64 } else { 32 } {
-            return Err("not a host mesh shader: the group has more than one console wave".into());
+            let multi = opt.mesh_multi_wave && pso::mesh_native_host_threads(ms.threads, opt.wave64).is_some();
+            if !multi {
+                return Err("not a host mesh shader: the group has more than one console wave".into());
+            }
         }
         if opt.wave64 && !opt.split_wave64 {
             return Err("not a host mesh shader: the packed entry requires a 32-lane host wave".into());
@@ -2265,6 +2282,14 @@ fn emit_program_with(program: &DecodedProgram<'_>, opt: &Options, kept: kept_pag
         }
     }
     em.max_vgpr = program.max_vgpr;
+    // `XCL_LDS_START`: what the program's first store leaves in the group's LDS, set before its
+    // code (`emit::Em::lds_start_body`)
+    if lds_start::lds_start_on() && gs_jump.is_none() && matches!(opt.mode, Mode::Kernel | Mode::Compute(_) | Mode::Mesh(_)) {
+        em.lds_start = lds_start::lds_start(insts, &leaders, &terms);
+        if log && !em.lds_start.is_empty() {
+            crate::xlog_info!("[SHADER] LDS start: {} dword(s) of the group's LDS set before the program's first store (XCL_LDS_START)", em.lds_start.len());
+        }
+    }
     if let Mode::Pixel(ps) = &opt.mode {
         em.ps_modes = emit::ps_attr_modes(insts, ps.input_ena);
     }
@@ -2324,6 +2349,10 @@ fn emit_program_with(program: &DecodedProgram<'_>, opt: &Options, kept: kept_pag
     *record = em.kept_record.take();
     if let Some(why) = em.mesh_native_blocker() {
         return Err(format!("not a host mesh shader: {why}"));
+    }
+    let lds_start = em.lds_start_body();
+    if !lds_start.is_empty() {
+        body.insert_str(0, &lds_start);
     }
     let hlsl = em.finish(&body);
     let static_samplers = em.static_used.clone();

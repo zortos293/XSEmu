@@ -278,7 +278,7 @@ pub(crate) unsafe fn prepare(
     let slot = if qualified {
         ticket(raw as usize, generation)?
     } else {
-        N.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
+        N.try_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
             (n < LIMIT).then_some(n + 1)
         })
         .ok()? as u32

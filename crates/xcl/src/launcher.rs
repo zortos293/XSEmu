@@ -138,10 +138,9 @@ pub fn read_game_config(root: &Path) -> (Vec<String>, Option<String>) {
     (xml_attrs(&xml, "Executable", "Name"), xml_attr(&xml, "Identity", "Name"))
 }
 
-/// The emulator itself (`XSEmu.exe`, or `xcl.exe` of older installs, by name, path or identical
-/// bytes) must never be picked as the game.
+/// `xcl.exe` itself (by name, path or identical bytes) must never be picked as the game.
 fn is_xcl_copy(p: &Path) -> bool {
-    if p.file_name().map(|n| ["XSEmu.exe", "xcl.exe"].iter().any(|own| n.to_string_lossy().eq_ignore_ascii_case(own))).unwrap_or(false) {
+    if p.file_name().map(|n| n.to_string_lossy().eq_ignore_ascii_case("xcl.exe")).unwrap_or(false) {
         return true;
     }
     let Ok(me) = std::env::current_exe() else { return false };
@@ -202,7 +201,7 @@ fn pick_exe(root: &Path) -> Result<PathBuf, String> {
         0 => Err(format!(
             "no game .exe file in {}{}",
             root.display(),
-            if skipped_self { " (only XSEmu.exe or xcl.exe – that is XCL itself; do not copy it into the game folder)" } else { "" }
+            if skipped_self { " (only xcl.exe – that is XCL itself; do not copy it into the game folder)" } else { "" }
         )),
         _ => Err(format!(
             "several .exe files ({}) – point to the game exe directly or set 'exe' in xcl.toml",
@@ -621,12 +620,10 @@ mod tests {
         let d = TempDir::new("self");
         let me = std::env::current_exe().unwrap();
         std::fs::copy(&me, d.0.join("xcl.exe")).unwrap();
-        std::fs::copy(&me, d.0.join("XSEmu.exe")).unwrap();
         std::fs::copy(&me, d.0.join("renamed_copy.exe")).unwrap(); // byte-identical copy of XCL
         let e = resolve_target(&d.0).unwrap_err();
         assert!(e.contains("xcl.exe") && e.contains("XCL itself"), "{e}");
         assert!(resolve_target(&d.0.join("xcl.exe")).unwrap_err().contains("XCL itself"));
-        assert!(resolve_target(&d.0.join("XSEmu.exe")).unwrap_err().contains("XCL itself"));
         // a real game exe next to it wins
         std::fs::write(d.0.join("game.exe"), b"MZ not really a game").unwrap();
         let (_, exe, _) = resolve_target(&d.0).unwrap();

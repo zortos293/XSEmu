@@ -10,6 +10,8 @@ pub(crate) mod lifecycle;
 mod shaders;
 mod stencil;
 
+// The image-bridge plan has no caller until the title path is wired; kept for the next fix.
+#[allow(dead_code)]
 pub(super) const PAGE: u64 = 1 << 16;
 
 const IMAGE_PLACEMENT: GUID = GUID::from_u128(0xec184eaa_aecd_4cd4_9712_73827aae2ce7);
@@ -24,9 +26,13 @@ pub(crate) struct GuestImage {
 }
 
 #[derive(Clone, Copy)]
+// The image-bridge plan has no caller until the title path is wired; kept for the next fix.
+#[allow(dead_code)]
 pub(crate) enum ImageUse { Sample, RenderTarget, DepthStencil, UnorderedAccess, Copy, Resolve }
 
 impl GuestImage {
+    // The image-bridge plan has no caller until the title path is wired; kept for the next fix.
+    #[allow(dead_code)]
     pub(crate) fn plane_for_sub(self, native:&D3D12_RESOURCE_DESC, sub:u32) -> Result<u32,Error> {
         if native.SampleDesc.Count!=1 { return Err(Error::Class(classes::Unsupported::Msaa)); }
         let mips=u32::from(native.MipLevels);
@@ -48,6 +54,8 @@ impl GuestImage {
         }
         found.ok_or(Error::Class(classes::Unsupported::PlaneUsage))
     }
+    // The image-bridge plan has no caller until the title path is wired; kept for the next fix.
+    #[allow(dead_code)]
     pub(crate) fn permits(&self, role:ImageUse) -> bool {
         let flags = u32::from_le_bytes(self.desc[48..52].try_into().unwrap());
         match role {
@@ -74,12 +82,16 @@ impl GuestImage {
     }
 }
 
+// The image-bridge plan has no caller until the title path is wired; kept for the next fix.
+#[allow(dead_code)]
 pub(crate) struct Subresource {
     pub sub: u32,
     pub footprint: D3D12_PLACED_SUBRESOURCE_FOOTPRINT,
     pub words: [u32; 68],
 }
 
+// The image-bridge plan has no caller until the title path is wired; kept for the next fix.
+#[allow(dead_code)]
 pub(crate) struct Plan {
     pub host: ownership::HostBacking,
     pub page_base: u64,
@@ -89,6 +101,8 @@ pub(crate) struct Plan {
 }
 
 #[derive(Debug)]
+// The image-bridge plan has no caller until the title path is wired; kept for the next fix.
+#[allow(dead_code)]
 pub(crate) enum Error {
     Class(classes::Unsupported),
     Layout,
@@ -97,6 +111,8 @@ pub(crate) enum Error {
     Footprint,
 }
 
+// The image-bridge plan has no caller until the title path is wired; kept for the next fix.
+#[allow(dead_code)]
 fn equation(layout: &Layout) -> [u32; 48] {
     let mut basis = [0; 48];
     for (axis, table) in basis.chunks_exact_mut(16).enumerate() {
@@ -110,6 +126,8 @@ fn equation(layout: &Layout) -> [u32; 48] {
     basis
 }
 
+// The image-bridge plan has no caller until the title path is wired; kept for the next fix.
+#[allow(dead_code)]
 fn words(surface: &xg::Surface, mip: usize, slice: u32, plane_at: u64, page_delta: u64,
          offset: u64, pitch: u32, rows: u32, row_bytes: u64, depth: u32, conversion: u32, basis: &[u32; 48]) -> Result<[u32; 68], Error> {
     let c = &surface.chain;
@@ -136,6 +154,8 @@ fn words(surface: &xg::Surface, mip: usize, slice: u32, plane_at: u64, page_delt
 }
 
 impl Plan {
+    // The image-bridge plan has no caller until the title path is wired; kept for the next fix.
+    #[allow(dead_code)]
     pub(crate) unsafe fn expanded_plane(dev: &ID3D12Device, native: &ID3D12Resource, image: GuestImage, plane: u32) -> Result<Self, Error> {
         let GuestImage { va, desc, host, .. } = image;
         let rd = native.GetDesc();

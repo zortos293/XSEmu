@@ -12,7 +12,9 @@ type CaptureNextFrame = unsafe extern "system" fn(PCWSTR, u32) -> HRESULT;
 type SetGlobalTargetWindow = unsafe extern "system" fn(HWND);
 
 struct Capture {
-    at_s: f64,
+    at_s: Option<f64>,
+    at_present: Option<u64>,
+    world: bool,
     frames: NonZeroU32,
     path: PathBuf,
     set_window: SetGlobalTargetWindow,
@@ -38,11 +40,23 @@ pub(crate) fn load_before_d3d12() {
 }
 
 fn load() -> Result<Capture, String> {
-    let at_s: f64 = std::env::var("XCL_PIX_CAPTURE_AT_S")
-        .ok()
-        .and_then(|value| value.parse().ok())
-        .filter(|value: &f64| value.is_finite() && *value >= 0.0)
-        .ok_or("XCL_PIX_CAPTURE_AT_S must be a finite, nonnegative number")?;
+    // `XCL_PIX_CAPTURE_AT_S` (seconds), or `XCL_PIX_CAPTURE_AT` (a present number, or `world`: the
+    // world entry the draw census sees)
+    let at_s: Option<f64> = match std::env::var("XCL_PIX_CAPTURE_AT_S") {
+        Ok(value) => {
+            let s = value.parse().ok().filter(|v: &f64| v.is_finite() && *v >= 0.0);
+            Some(s.ok_or("XCL_PIX_CAPTURE_AT_S must be a finite, nonnegative number")?)
+        }
+        Err(_) => None,
+    };
+    let (at_present, world) = match std::env::var("XCL_PIX_CAPTURE_AT") {
+        Ok(value) if value.trim().eq_ignore_ascii_case("world") => (None, true),
+        Ok(value) => (Some(value.trim().parse::<u64>().map_err(|_| "XCL_PIX_CAPTURE_AT must be a present number or `world`")?), false),
+        Err(_) => (None, false),
+    };
+    if at_s.is_none() && at_present.is_none() && !world {
+        return Err("nothing to trigger on: set XCL_PIX_CAPTURE_AT (a present number or `world`) or XCL_PIX_CAPTURE_AT_S".into());
+    }
     let frames = match std::env::var("XCL_PIX_CAPTURE_FRAMES") {
         Ok(value) => value
             .parse::<NonZeroU32>()
@@ -56,24 +70,39 @@ fn load() -> Result<Capture, String> {
         _ => return Err("XCL_PIX_CAPTURE_TAG must be 1–64 ASCII letters, digits, hyphens, or underscores".into()),
     };
     let dll_name = "WinPixGpuCapturer.dll";
-    let root = std::env::var_os("ProgramFiles")
-        .map(PathBuf::from)
-        .filter(|dir| dir.is_absolute())
-        .ok_or("ProgramFiles is not an absolute path")?
-        .join("Microsoft PIX");
-    let missing_dll = || format!("{dll_name} not found under {}; install Microsoft PIX", root.display());
-    let dll = std::fs::read_dir(&root)
-        .map_err(|_| missing_dll())?
-        .filter_map(Result::ok)
-        .filter(|entry| !entry.file_name().to_string_lossy().starts_with('.'))
-        .map(|entry| entry.path().join(dll_name))
-        .filter(|path| path.is_file())
-        .max()
-        .ok_or_else(missing_dll)?;
+    let dll = match std::env::var_os("XCL_PIX_DLL").map(PathBuf::from) {
+        Some(path) if path.is_file() => path,
+        Some(path) => return Err(format!("XCL_PIX_DLL {} is not a file", path.display())),
+        None => {
+            let root = std::env::var_os("ProgramFiles")
+                .map(PathBuf::from)
+                .filter(|dir| dir.is_absolute())
+                .ok_or("ProgramFiles is not an absolute path")?
+                .join("Microsoft PIX");
+            let missing_dll = || format!("{dll_name} not found under {}; install Microsoft PIX", root.display());
+            std::fs::read_dir(&root)
+                .map_err(|_| missing_dll())?
+                .filter_map(Result::ok)
+                .filter(|entry| !entry.file_name().to_string_lossy().starts_with('.'))
+                .map(|entry| entry.path().join(dll_name))
+                .filter(|path| path.is_file())
+                .max()
+                .ok_or_else(missing_dll)?
+        }
+    };
 
-    let dir = Path::new(r"D:\xsemu-capy-work-archive\pix");
-    std::fs::create_dir_all(dir).map_err(|error| format!("cannot create {}: {error}", dir.display()))?;
-    let path = dir.join(format!("{tag}.wpix"));
+    let out = std::env::var_os("XCL_PIX_OUT").map(PathBuf::from);
+    let path = match out {
+        Some(path) if path.extension().is_some_and(|e| e.eq_ignore_ascii_case("wpix")) => path,
+        Some(dir) => dir.join(format!("{tag}.wpix")),
+        None => {
+            let dir = Path::new(r"D:\xsemu-capy-work-archive\pix").to_path_buf();
+            dir.join(format!("{tag}.wpix"))
+        }
+    };
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir).map_err(|error| format!("cannot create {}: {error}", dir.display()))?;
+    }
     if path.exists() {
         return Err(format!("{} already exists; choose a new XCL_PIX_CAPTURE_TAG", path.display()));
     }
@@ -89,13 +118,15 @@ fn load() -> Result<Capture, String> {
             std::mem::transmute::<_, CaptureNextFrame>(next_frame),
         )
     };
-    crate::xlog_info!(
-        "PIX: loaded {}; will request {frames} frame(s) at {at_s:.3} s to {}",
-        dll.display(),
-        path.display()
-    );
+    match (at_s, at_present, world) {
+        (Some(s), _, _) => crate::xlog_info!("PIX: loaded {}; will request {frames} frame(s) at {s:.3} s to {}", dll.display(), path.display()),
+        (_, Some(n), _) => crate::xlog_info!("PIX: loaded {}; will request {frames} frame(s) at present {n} to {}", dll.display(), path.display()),
+        _ => crate::xlog_info!("PIX: loaded {}; will request {frames} frame(s) at the world entry to {}", dll.display(), path.display()),
+    }
     Ok(Capture {
         at_s,
+        at_present,
+        world,
         frames,
         path,
         set_window,
@@ -110,16 +141,35 @@ pub(crate) fn before_present(hwnd: HWND) {
         return;
     }
     let now = crate::log::uptime();
-    if now < capture.at_s || capture.requested.swap(true, Ordering::Relaxed) {
+    let frames = crate::hle::d3d12x::present::counters().1;
+    let due = match (capture.at_s, capture.at_present) {
+        (Some(s), _) => now >= s,
+        (_, Some(n)) => frames >= n,
+        _ => capture.world && WORLD.load(Ordering::Relaxed),
+    };
+    if !due || capture.requested.swap(true, Ordering::Relaxed) {
         return;
     }
     let wide: Vec<u16> = capture.path.as_os_str().encode_wide().chain([0]).collect();
+    crate::xlog_info!("PIX: capture of {} frame(s) to {} started (present {frames}, {now:.3} s)", capture.frames, capture.path.display());
     let result = unsafe {
         (capture.set_window)(hwnd);
         (capture.next_frame)(PCWSTR(wide.as_ptr()), capture.frames.get())
     };
     match result.ok() {
-        Ok(()) => crate::xlog_info!("PIX: queued {} GPU frame(s) at {now:.3} s", capture.frames),
+        Ok(()) => crate::xlog_info!("PIX: capture of {} frame(s) to {} requested; PIX writes it when the capture completes", capture.frames, capture.path.display()),
         Err(error) => crate::xlog_warn!("PIX: GPU capture request failed at {now:.3} s: {error}"),
+    }
+}
+
+/// The draw census saw the world entry (`XCL_PIX_CAPTURE_AT=world`): capture at the next present.
+static WORLD: AtomicBool = AtomicBool::new(false);
+
+pub(crate) fn world_entry() {
+    if WORLD.swap(true, Ordering::Relaxed) {
+        return;
+    }
+    if matches!(CAPTURE.get(), Some(Some(capture)) if capture.world) {
+        crate::xlog_info!("PIX: world entry seen; a capture follows at the next present");
     }
 }

@@ -32,6 +32,9 @@ Third-party parts inside the copied files keep their own notices: src/gfx10/opco
 - src/emit/lower/xcl_formats.rs: written for xsemu (M1). The buffer formats a V# names: constant tables of the 77 formats, and the code that decodes and encodes a component by them. A child module of src/emit/lower/xcl.rs.
 - src/emit/lower/xcl_tests.rs: written for xsemu (M1a, more in M1). Tests of the binding.
 - src/emit/lower/packed.rs: written for xsemu (M1d). The packed form of a console wave64 compute program on a host of 32-lane waves: one host wave runs one console wave, and each host lane holds console lanes i and i + 32. A vector instruction is lowered once per half and a scalar one once, and what crosses lanes (masks as data, wave-wide decisions, lane reads, permutes, whole-wave sections) takes both halves. It is a child module of the copied src/emit/lower.rs, like lower/xcl.rs.
+- src/emit/xcl_pixel_tests.rs: written for xsemu (M2a). Tests of pixel programs under the binding: the entry, the inputs, the exports and the signatures xsemu links. A child module of src/emit/xcl.rs.
+- M2a also changed these xsemu files: src/xcl.rs (translate_pixel, XclPixel; BINDING_VERSION 7, one bump shared with capa86-size2-xcl-binding), src/emit/xcl.rs (pixel programs: the stage checks, the retry with first halves evaluated as pairs that CGBJ's own translate makes, and the input rows and colour outputs xsemu links: LinkScope, link_inputs, ours, link_signatures; pixel() says a pixel program is translating, and a pixel program refused with the wave taking its discard idiom is retried with that branch per lane: per_lane_discard), src/emit/lower/xcl.rs (the entry code makes the thread limits only for a program with a thread-group size) and src/bin/xcl-cgbj-census.rs (--binding xcl translates pixel programs too, without links).
+- M2b also changed these xsemu files: src/xcl.rs (translate_pixel's doc: a wave64 program at either host wave size, and the host fact a wave32 one needs), src/emit/xcl_pixel_tests.rs (pixel_at of either wave size on a host of either width, and the tests of both) and src/bin/xcl-cgbj-census.rs (the doc: pixel programs of either wave size, a wave32 one only at --host-wave 32).
 
 ## Changes to copied files
 
@@ -84,6 +87,35 @@ capa86-m1d-xcl-binding (the packed form of a wave64 compute program on 32-lane w
 - src/emit/shader.rs: a new field host_threads, the declared numthreads when they differ from the console's, used for the metadata and PSV0.
 - src/emit/xcl_scc_tests.rs: tests of the packed form on the SCC fixtures, a ballot over both halves, a lane read past 32 and the declared numthreads.
 - src/xcl.rs: BINDING_VERSION 5, PACKED_FORM, packed_threads.
+
+capa86-m1e-xcl-binding (the packed form's LDS counter; with the binding not selected nothing changes):
+- src/emit/xcl.rs: packed() refuses a group of more than one console wave whose program already declares 32 KiB of LDS ("packed wave64 form needs an LDS dword past 32 KiB"). Before, the form added its counter dword past the limit and dxil.dll rejected the container.
+- src/emit/lower.rs: re-exports packed::claim_dword, which says where the counter goes or that it doesn't fit.
+
+capa86-size2-xcl-binding (fewer loops in the binding's code for the driver's compiler; only files of xsemu's changed, no CGBJ file; with the binding not selected nothing changes):
+- src/emit/lower/xcl.rs: the page directory reads both leaves in one block instead of a loop of two rounds, and reads the root at the high dword as it stands (a dropped access reads some root entry or 0). A page group reads the next page's first three dwords once, where it is resolved, when the program has no access past the caches; before, each member read them.
+- src/emit/lower/xcl_tests.rs: the counts of handles, loads and blocks of the new shape, and a test of the group's single read.
+- src/xcl.rs: BINDING_VERSION 7, one bump shared with capa86-m2a-cgbj-pixel below.
+
+capa86-size3-xcl-binding (fewer loops still, and one root handle instead of one per access; only files of xsemu's changed, no CGBJ file; with the binding not selected nothing changes):
+- src/emit/lower/xcl.rs: the directory's root index and the root's handle are made once in the entry block, and the read of the locator's first dword falls back to the null view's index, whose dwords are 0. Every resolver then walks the directory without a branch on "there is a table": a null root answers "no entry" for every page, which is the window rule's own answer. The entry block no longer splits in two.
+- src/emit/lower/xcl.rs: a page group's two pages are resolved one after the other instead of by a loop of two rounds, and an access of several dwords resolves the page of its first dword and the page after it in one block, each dword taken from whichever of the two holds it. Before, both were loops.
+- src/emit/lower/xcl_tests.rs: the counts of handles, loads, blocks and resolvers of the new shape, and the record load's new test name.
+
+capa86-size4-xcl-binding (fewer loads and fewer bytes in the binding's code, and one resolution for several buffer loads of one descriptor; only files of xsemu's changed, no CGBJ file; with the binding not selected nothing changes; BINDING_VERSION stays 7 because this is staged on top of capa86-size3's bump):
+- src/emit/lower/xcl.rs: a page group also serves `buffer_load_dwordx2` to `x4` whose offset is a constant on a dword, whose address comes from the descriptor's base plus a lane offset (no index), and whose last dword starts below 64 KiB. The key is the descriptor's two base words, the scalar offset and the lane offset's value, so several loads of one descriptor at one lane offset share one resolution of the page and the next. A `buffer_load_dword` (one dword) still resolves on its own: a group walks two pages where such a load walks one.
+- src/emit/lower/xcl.rs: a leaf index of 0 in the directory's root reads the null view instead of the root, so the directory no longer selects 0 over what that read gave: two selects fewer for each resolver, and the root's heap index is no longer kept (the root's handle is made from the same select as before).
+- src/emit/lower/xcl.rs: the dwords of an access of several dwords are read four at a time from the page of the first of the four, and those of a four that lie past the page's end from one more read of the next page's dwords at their offsets: two load calls for a four instead of one per dword, for the same number of dwords. Longer accesses read one more four from each page.
+- src/emit/lower/xcl_tests.rs: a test of a group of two buffer loads of one descriptor and lane offset, of a lane offset written between two such loads (no group), and of a single-dword buffer load on its own.
+
+capa86-m2a-cgbj-pixel (wave32 pixel programs under the XCL binding; with the binding not selected nothing below runs):
+- src/emit/shader.rs: finish() of a pixel program first calls emit::xcl::link_signatures, which under the binding moves the inputs to the rows of the stage before (xsemu's vertex program, or its rect-list GS) and declares each colour output four columns wide from column 0. Without the binding it returns at once.
+- src/emit/lower.rs: wave_wide() answers a wave-wide branch of a pixel program under the binding with the host wave's waveAnyTrue or waveAllTrue. Which pixels share a console wave is the rasteriser's choice, so any host wave is one the console could have run. Before, such a program was refused ("a wave-wide branch where not every lane runs"), since the answer was kept for compute programs with the console's lanes.
+- src/emit/lower.rs: export() of a pixel program under the binding writes an export before the last (no DONE) inside a guarded block when not every lane holds it, as the console writes it only for the lanes in EXEC. Before, it was refused ("a conditional export"). The last export still discards the lanes it does not hold.
+- src/structure.rs: on emit::xcl's retry of a pixel program (per_lane_discard), the branch of the discard idiom (an s_andn2_b32 reading EXEC sets SCC, then s_cbranch_scc0 to the end when no lane is live) is not in wave_scc, so each lane takes it alone, as before 9a4aa8d/bd8b4f5. Elsewhere it is unchanged.
+
+capa86-m2b-cgbj-pixel-wave64 (wave64 pixel programs under the XCL binding; with the binding not selected nothing below runs):
+- src/emit/xcl.rs: the stage check no longer refuses a wave64 pixel program; M2a refused every one, since nothing told a pixel program the host's lane count. A wave32 one is refused where the host's widest wave is not 32 lanes (pixel_runs_in_host_waves, from set_host_max_wave), because in a 64-lane wave the other console wave shares the host wave and its lanes would join every ballot and reduction. A wave64 program's cross-lane code is the host wave's: a whole-wave section is the wave operation it computes, and on a host of 32-lane waves each host wave is a console wave whose upper lanes are not populated, which is how xsemu's own translator's upper_lanes form runs such a program there. A lane read outside such a section is refused, as any cross-lane read outside compute.
 
 ## Known content
 

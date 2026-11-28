@@ -7,6 +7,7 @@
 
 use std::collections::VecDeque;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use windows::Win32::Graphics::Direct3D::ID3DBlob;
@@ -100,7 +101,9 @@ pub fn console_to_dxil(blob: &[u8], stage: Stage, sampler_base: u32) -> Result<C
 /// `console_to_dxil` for a GPU that runs only 32-lane waves when `split_wave64`
 /// (`wave32_only_for_device`): a wave64 compute program gets the split form
 /// (`Options::split_wave64`) instead of `[WaveSize(64)]`, which such a driver rejects.
-/// Finished shaders are also kept in memory (`ShaderCache`): pipelines share their shaders.
+/// Finished shaders are also kept in memory (`ShaderCache`): pipelines share their shaders, and
+/// the copy of one goes once the pipeline state built from it exists
+/// (`XCL_TRANSLATION_RAM_FREE`).
 pub fn console_to_dxil_for(blob: &[u8], stage: Stage, sampler_base: u32, split_wave64: bool) -> Result<Compiled, String> {
     console_to_dxil_in(blob, stage, sampler_base, split_wave64, mem_windows())
 }
@@ -128,8 +131,7 @@ pub fn console_to_dxil_in(blob: &[u8], stage: Stage, sampler_base: u32, split_wa
     if !cache_allowed(stage, |name| std::env::var_os(name).is_some()) {
         return compile_one();
     }
-    static CACHE: OnceLock<Mutex<ShaderCache>> = OnceLock::new();
-    let cache = CACHE.get_or_init(|| Mutex::new(ShaderCache::new(64 << 20)));
+    let cache = shader_cache();
     let key = ShaderKey {
         hash,
         stage,
@@ -140,7 +142,9 @@ pub fn console_to_dxil_in(blob: &[u8], stage: Stage, sampler_base: u32, split_wa
     };
     let profile = stage == Stage::Compute && super::loop_profile::enabled_for(blob);
     let from_disk = || translated::cached_in(&dxc::cache_dir(), translated_identity(blob, stage, legacy, profile), blob, stage, sampler_base, windows, split_wave64, compile_one);
-    cached_shader(cache, key, blob, from_disk).map(|shader| shader.as_ref().clone())
+    let shader = cached_shader(cache, key.clone(), blob, from_disk)?;
+    asked(&key);
+    Ok(shader.as_ref().clone())
 }
 
 /// The translated cache's identity for `blob`: a program that may traverse acceleration structures
@@ -183,6 +187,17 @@ fn legacy_compute_selected(hash: u64) -> bool {
 /// each at every start. Keyed by two hashes and the length of the bytes, the stage and the
 /// translation parameters; translator sources and the DXC toolchain identify compatible builds.
 /// `XCL_TRANSLATED_CACHE=0` turns it off.
+/// The translator's identity for a record one run leaves the next (the hung-pipeline guard): the
+/// translation's own identity, and not 0 even with the translated-shader cache off
+/// (`XCL_TRANSLATED_CACHE=0`), because it identifies the translation rather than the cache.
+pub fn translator_id() -> u64 {
+    let id = translated::identity();
+    if id != 0 {
+        return id;
+    }
+    translated::identity_for(env!("XCL_TRANSLATOR_SOURCE_ID"), &format!("{}\0{}", super::dxc::toolchain_identity(), super::dxc::opt_policy()))
+}
+
 mod translated {
     use super::{Compiled, Stage};
     use std::path::{Path, PathBuf};
@@ -239,16 +254,25 @@ mod translated {
         // xsemu: from xcl-dev/xcl nvidia-dev 67a08dbe crates/xcl/src/gpu/recomp/pso.rs
         // `XCL_X_LDS_ORDER=0`: the split wave64 form without its LDS order
         let base = if super::super::emit::lds_order_wanted() { base } else { identity_for(&format!("{base:016x}"), "xcl-x-lds-order-0") };
+        // `XCL_LDS_START=1`: other HLSL (the group's LDS set up before the program's code)
+        let base = if super::super::lds_start::lds_start_on() { identity_for(&format!("{base:016x}"), "lds-start") } else { base };
         let nan = if super::nan_guards() { "nan-guards" } else { "" };
         let nan = &["XCL_RECOMP_NO_PLAIN_LOADS", "XCL_RECOMP_PLAIN_MEMORY"].iter().filter(|v| std::env::var_os(v).is_some()).fold(nan.to_string(), |s, v| format!("{s}\0{v}"));
         let guard = super::super::loop_guard();
         let trip_counters = crate::config::guard_trips_enabled();
         let static_cap = super::super::loop_profile::static_cap();
         // the A/B switches of the structured form, the lane-guard proofs, the quad reads, the page groups, their accessors, the compact accessors, the load loop, the primitive index width and the lane-independent form change the HLSL
-        let nan = ["XCL_RECOMP_NO_CFG", "XCL_RECOMP_NO_EXEC_PROOF", "XCL_RECOMP_NO_QUAD_READS", "XCL_RECOMP_NO_PAGE_GROUPS", "XCL_RECOMP_NO_ACCESSOR_SHRINK", "XCL_RECOMP_NO_COMPACT_ACCESS", "XCL_RECOMP_NO_LOAD_LOOP", "XCL_RECOMP_NO_GROUP_FOLD", "XCL_RECOMP_NO_KEPT_PAGES", "XCL_RECOMP_NO_KEPT_PAGES_OUTLINED", "XCL_RECOMP_NO_LONE_LOADS", "XCL_RECOMP_NO_OUTLINE", "XCL_RECOMP_NO_PRIM9", "XCL_RECOMP_NO_LANE_INDEPENDENT"].iter().filter(|v| std::env::var_os(v).is_some()).fold(nan.to_string(), |s, v| format!("{s}\0{v}"));
+        let nan = ["XCL_RECOMP_NO_CFG", "XCL_RECOMP_NO_EXEC_PROOF", "XCL_RECOMP_NO_QUAD_READS", "XCL_RECOMP_NO_PAGE_GROUPS", "XCL_RECOMP_NO_ACCESSOR_SHRINK", "XCL_RECOMP_NO_COMPACT_ACCESS", "XCL_RECOMP_NO_LOAD_LOOP", "XCL_RECOMP_NO_GROUP_FOLD", "XCL_RECOMP_NO_KEPT_PAGES", "XCL_RECOMP_NO_KEPT_PAGES_OUTLINED", "XCL_RECOMP_NO_LONE_LOADS", "XCL_RECOMP_NO_OUTLINE", "XCL_RECOMP_NO_PRIM9", "XCL_RECOMP_NO_LANE_INDEPENDENT", "XCL_RECOMP_D16_HALF_BITS"].iter().filter(|v| std::env::var_os(v).is_some()).fold(nan.to_string(), |s, v| format!("{s}\0{v}"));
         let nan = std::env::var("XCL_RECOMP_OUTLINE_MIN_INSTS").map_or(nan.clone(), |n| format!("{nan}\0outline-min-insts={n}"));
         let nan = ["XCL_RECOMP_OUTLINE_RESULTS", "XCL_RECOMP_OUTLINE_ATOMICS", "XCL_RECOMP_OUTLINE_NESTED"].iter().fold(nan, |s, v| std::env::var(v).map_or(s.clone(), |x| format!("{s}\0{v}={x}")));
         let nan = format!("{nan}\0outline-above={}", super::outline_budget());
+        // xsemu: `XCL_NAN_SCRUB` (emit::nan_scrub) writes other HLSL, so a scrubbed translation must
+        // never be read as an unscrubbed one
+        let nan = if super::super::emit::nan_scrub() { format!("{nan}\0nan-scrub") } else { nan };
+        // `XCL_MESH_MULTI_WAVE=1` gives a multi-wave console group one host mesh shader instead of
+        // two passes, which is other HLSL and another pipeline at run time, so its containers must
+        // not be read as the two-pass ones
+        let nan = if super::mesh_multi_wave() { format!("{nan}\0mesh-multi-wave") } else { nan };
         if legacy {
             return identity_for(&format!("{base:016x}"), &format!("{nan}\0loop-guard={guard}\0trip-counters={trip_counters}\0loop-profile={profile}\0static-loop-cap={static_cap}\0legacy-compute-wave64"));
         }
@@ -634,6 +658,14 @@ impl ShaderCache {
         Some(shader)
     }
 
+    /// Drop the entry of `key`, if it is here: its bytes.
+    fn release(&mut self, key: &ShaderKey) -> Option<usize> {
+        let at = self.entries.iter().position(|e| &e.key == key)?;
+        let bytes = self.entries.remove(at)?.bytes();
+        self.bytes -= bytes;
+        Some(bytes)
+    }
+
     fn insert(&mut self, key: ShaderKey, blob: &[u8], shader: Arc<Compiled>) {
         let bytes = blob.len()
             + key.cache_dir.capacity()
@@ -675,6 +707,143 @@ fn cached_shader(
     }
     cache.insert(key, blob, shader.clone());
     Ok(shader)
+}
+
+/// The in-RAM translations of the pipelines being built: 64 MiB of DXIL, 128 entries at most.
+fn shader_cache() -> &'static Mutex<ShaderCache> {
+    static CACHE: OnceLock<Mutex<ShaderCache>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(ShaderCache::new(64 << 20)))
+}
+
+/// `XCL_TRANSLATION_RAM_FREE` (on; `=0` keeps everything resident as before): the in-RAM DXIL of a
+/// translated shader goes as soon as the pipeline state built from it exists. The same bytes are in
+/// the translation disk cache (`translated`), so a rebuild reads them back instead of translating
+/// again: 1 000 reads of a 100 KB program took 186 ms from cold files and 28 ms from the page cache
+/// (this build machine, ext4, 2026-11-28), against the 0.1 - 0.3 s its translation takes (this
+/// module's cache doc) and the 15 - 180 s a big compute program's driver compile does
+/// (`pso_manifest`). A retail game's ~51 000 pipelines are built from ~2 800 programs, which fill
+/// the 64 MiB early in a run and keep it for the rest of it. Nothing is freed while the translation
+/// disk cache is off (`XCL_TRANSLATED_CACHE=0`): there would be nowhere to read a freed shader back
+/// from, and CGBJ's own cache stores no file either.
+///
+/// What goes is the cache's own copy. `console_to_dxil_in` hands out an owned `Compiled` (a clone
+/// of `cached_shader`'s `Arc` contents) and `translated::cached_in` returns `Compiled`, so no
+/// pipeline holds a pointer into the cache, and the driver has read a shader's bytecode by the time
+/// `Create*PipelineState` returns - which is when `pipeline_built` runs. The DXIL is host bytecode,
+/// consumed inside that call: no submission and no fence orders this free.
+pub fn translation_ram_free() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = std::env::var("XCL_TRANSLATION_RAM_FREE").map_or(true, |v| v.trim() != "0") && translated::identity() != 0;
+        if on {
+            crate::xlog_info!("[SHADER] the in-RAM DXIL of a shader goes once the pipeline state built from it exists, and a rebuild reads the translation back from disk (XCL_TRANSLATION_RAM_FREE=0 keeps it resident)");
+        }
+        on
+    })
+}
+
+/// Whether a translation this thread asks for now goes once its pipeline exists: a build is open
+/// (`pipeline_build`) and `XCL_TRANSLATION_RAM_FREE` is on. The other caches in front of a
+/// translation file (CGBJ's own, `gpu::cgbj::cache`) ask this to be freed with it.
+pub fn freeing_after_build() -> bool {
+    translation_ram_free() && BUILDS.with(|b| !b.borrow().is_empty())
+}
+
+thread_local! {
+    /// the translations this thread asked for since the innermost `pipeline_build` began
+    static ASKED: std::cell::RefCell<Vec<ShaderKey>> = const { std::cell::RefCell::new(Vec::new()) };
+    /// where each open pipeline build's translations start in `ASKED`
+    static BUILDS: std::cell::RefCell<Vec<usize>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// One pipeline build's translations (`XCL_TRANSLATION_RAM_FREE`): every translation this thread
+/// asks for from now on is remembered, and `pipeline_built` drops them from the in-RAM cache the
+/// moment the pipeline state built from them exists. A build that makes no pipeline (one whose
+/// shaders are only prepared, one whose driver compile was put off, one the driver rejected) keeps
+/// them: its pipeline is still to come, and that build finds them here instead of on disk.
+pub struct PipelineBuild(usize);
+
+/// Begin a pipeline build on this thread (`PipelineBuild`).
+pub fn pipeline_build() -> PipelineBuild {
+    let at = ASKED.with(|a| a.borrow().len());
+    BUILDS.with(|b| b.borrow_mut().push(at));
+    PipelineBuild(at)
+}
+
+/// The pipeline state the innermost build on this thread asks for exists: the translations it asked
+/// for go from memory. Called after the driver's `Create*PipelineState` returned a pipeline, on the
+/// thread that made the call, so the bytecode is read and the caller's own copies of the shaders
+/// outlive the cache's: a twin thread that hit the same entry holds its own copy too.
+pub fn pipeline_built() {
+    let Some(at) = BUILDS.with(|b| b.borrow().last().copied()) else {
+        return;
+    };
+    let keys = ASKED.with(|a| {
+        let mut a = a.borrow_mut();
+        if at <= a.len() {
+            a.split_off(at)
+        } else {
+            Vec::new()
+        }
+    });
+    release_translations(&keys);
+}
+
+impl Drop for PipelineBuild {
+    fn drop(&mut self) {
+        BUILDS.with(|b| {
+            let mut b = b.borrow_mut();
+            if b.last() == Some(&self.0) {
+                b.pop();
+            }
+        });
+        ASKED.with(|a| a.borrow_mut().truncate(self.0));
+    }
+}
+
+/// `key` was translated for the pipeline build this thread is in (`pipeline_build`).
+fn asked(key: &ShaderKey) {
+    if !freeing_after_build() {
+        return;
+    }
+    ASKED.with(|a| a.borrow_mut().push(key.clone()));
+}
+
+/// The entries of `keys` go from the in-RAM cache (`XCL_TRANSLATION_RAM_FREE`).
+fn release_translations(keys: &[ShaderKey]) {
+    if keys.is_empty() {
+        return;
+    }
+    let mut cache = shader_cache().lock().unwrap();
+    let (mut entries, mut bytes) = (0, 0);
+    for key in keys {
+        if let Some(size) = cache.release(key) {
+            entries += 1;
+            bytes += size;
+        }
+    }
+    drop(cache);
+    if entries != 0 {
+        note_freed(entries, bytes);
+    }
+}
+
+/// the translations `XCL_TRANSLATION_RAM_FREE` dropped, their bytes, and the 64 MiB step a line was
+/// written for (the first one says what a run got back, and one line follows for every 64 MiB)
+static FREED_ENTRIES: AtomicU64 = AtomicU64::new(0);
+static FREED_BYTES: AtomicU64 = AtomicU64::new(0);
+static FREED_STEP: AtomicU64 = AtomicU64::new(0);
+
+/// `entries` in-RAM translations of `bytes` went from a cache in front of a translation file (this
+/// one, or `gpu::cgbj::cache`'s): the one line that says what a run got back.
+pub fn note_freed(entries: usize, bytes: usize) {
+    let n = FREED_ENTRIES.fetch_add(entries as u64, Ordering::Relaxed) + entries as u64;
+    let total = FREED_BYTES.fetch_add(bytes as u64, Ordering::Relaxed) + bytes as u64;
+    let step = (total >> 26) + 1;
+    let said = FREED_STEP.load(Ordering::Relaxed);
+    if step > said && FREED_STEP.compare_exchange(said, step, Ordering::Relaxed, Ordering::Relaxed).is_ok() {
+        crate::xlog_info!("[SHADER] the in-RAM DXIL of built pipelines: {n} entries and {} MB freed (XCL_TRANSLATION_RAM_FREE=0 keeps them resident)", total >> 20);
+    }
 }
 
 fn cache_allowed(stage: Stage, present: impl Fn(&str) -> bool) -> bool {
@@ -850,13 +1019,34 @@ pub fn console_mesh_native(blob: &[u8], ps: Option<&[u8]>, split_wave64: bool) -
         ps_inputs: ps.map(|p| crate::gpu::dxbc::signatures(p).0),
         lds_bytes: crate::gpu::dxbc::psv(blob).map_or(0, |p| p.ms_groupshared),
     };
-    let t = translate(code, &Options { mode, wave64: super::fssm_wave64(f, code), split_wave64, mem_windows: mem_windows(), nan_guards: nan_guards(), mesh_native: Some(native), code_data: super::code_data(f, p), ..Default::default() })?;
+    let t = translate(code, &Options { mode, wave64: super::fssm_wave64(f, code), split_wave64, mem_windows: mem_windows(), nan_guards: nan_guards(), mesh_native: Some(native), mesh_multi_wave: mesh_multi_wave(), code_data: super::code_data(f, p), ..Default::default() })?;
     if !t.complete() {
         let missing: Vec<&String> = t.unsupported.keys().collect();
         return Err(format!("incomplete translation, missing: {missing:?}"));
     }
     note_long_loops(blob, &t);
     Ok(NativeMesh { ms: dxc::compile_cached(&t.hlsl, "main", "ms_6_6")?.0, samplers: t.static_samplers })
+}
+
+/// The console waves of a mesh group of `threads` lanes and the host threads of its native form:
+/// `Some((waves, host threads))` when the group is a whole number of console waves and that host
+/// group is no larger than D3D12's 128 mesh threads. None: a group whose last console wave is
+/// only partly populated, or one too large for a host mesh group; both stay two passes.
+pub fn mesh_native_host_threads(threads: u32, wave64: bool) -> Option<(u32, u32)> {
+    let lanes = if wave64 { 64 } else { 32 };
+    if threads == 0 || threads % lanes != 0 {
+        return None;
+    }
+    let waves = threads / lanes;
+    (waves * 32 <= 128).then_some((waves, waves * 32))
+}
+
+/// `XCL_MESH_MULTI_WAVE=1`: console mesh programs whose group spans more than one console wave as
+/// one host mesh shader (the host group is ceil(threads / 32) waves of 32). Off: they stay in two
+/// passes, as they always have. A group whose last console wave is only partly populated, or one
+/// over 128 host threads, stays in two passes either way (`mesh_native_host_threads`).
+pub fn mesh_multi_wave() -> bool {
+    std::env::var("XCL_MESH_MULTI_WAVE").is_ok_and(|v| v.trim() == "1")
 }
 
 /// Whether console mesh programs can be host mesh shaders on an adapter with this wave range, and
@@ -1090,6 +1280,19 @@ mod shader_cache_tests {
 
     /// The loop guard's forms (`XCL_RECOMP_NO_LOOP_REGIONS`, `XCL_LOOP_GUARD_REGIONS`) are other HLSL:
     /// each has its own translations on disk.
+    /// `XCL_LDS_START=1` is other HLSL: each form has its own translations on disk.
+    #[test]
+    fn translated_identity_tracks_the_lds_start_switch() {
+        let off = translated::identity_for_layout(false, false);
+        super::super::lds_start::TEST_LDS_START.set(Some(true));
+        let on = translated::identity_for_layout(false, false);
+        super::super::lds_start::TEST_LDS_START.set(Some(false));
+        let off_again = translated::identity_for_layout(false, false);
+        super::super::lds_start::TEST_LDS_START.set(None);
+        assert_ne!(off, 0, "the disk cache is on in tests");
+        assert!(off != on && off == off_again, "{off:x} {on:x} {off_again:x}");
+    }
+
     #[test]
     fn translated_identity_tracks_the_loop_guards_form() {
         let lane = translated::identity_for_layout(false, false);
@@ -1339,6 +1542,98 @@ mod shader_cache_tests {
         }
         assert_eq!(cache.entries.len(), 128);
         assert!(cache.get(&key(0), b"a").is_none());
+    }
+
+    /// The translation of `blob` under `key`, made the way `console_to_dxil_in` makes one.
+    fn translate_for_build(key: ShaderKey, blob: &[u8], marker: u8) {
+        cached_shader(shader_cache(), key.clone(), blob, || Ok(compiled(marker))).unwrap();
+        asked(&key);
+    }
+
+    #[test]
+    fn a_built_pipeline_drops_its_translations() {
+        assert!(translation_ram_free(), "on by default");
+        let build = pipeline_build();
+        let (vs, ps) = (key(101), key(102));
+        translate_for_build(vs.clone(), b"vs", 1);
+        translate_for_build(ps.clone(), b"ps", 2);
+        assert!(shader_cache().lock().unwrap().get(&vs, b"vs").is_some());
+        pipeline_built();
+        assert!(shader_cache().lock().unwrap().get(&vs, b"vs").is_none(), "the DXIL of a built pipeline goes");
+        assert!(shader_cache().lock().unwrap().get(&ps, b"ps").is_none(), "every stage of it goes");
+        drop(build);
+        let again = cached_shader(shader_cache(), vs, b"vs", || Ok(compiled(3))).unwrap();
+        assert_eq!(again.dxil[0], 3, "the freed entry is made again");
+    }
+
+    #[test]
+    fn a_freed_translation_is_read_back_from_its_file() {
+        assert!(translation_ram_free(), "on by default");
+        let dir = std::env::temp_dir().join(format!("xcl-translation-ram-free-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let (blob, ident, marker) = (&b"a program a later pipeline wants again"[..], 0x5117_0000_0000_0042u64, 21);
+        let key = ShaderKey { hash: crate::gpu::shader::fnv64(blob), cache_dir: dir.clone(), ..key(0) };
+        let build = pipeline_build();
+        let first = cached_shader(shader_cache(), key.clone(), blob, || {
+            translated::cached_in(&dir, ident, blob, Stage::Compute, 0, 1, false, || Ok(compiled(marker)))
+        })
+        .unwrap();
+        assert_eq!(first.dxil[0], marker);
+        asked(&key);
+        pipeline_built();
+        assert!(shader_cache().lock().unwrap().get(&key, blob).is_none(), "freed once its pipeline exists");
+        drop(build);
+        let again = cached_shader(shader_cache(), key.clone(), blob, || {
+            translated::cached_in(&dir, ident, blob, Stage::Compute, 0, 1, false, || panic!("translated again: the freed entry's file was not read"))
+        })
+        .unwrap();
+        assert_eq!(again.dxil[0], marker, "the next build request is answered by the translation file");
+        assert!(translated::file(&dir, ident, blob, Stage::Compute, 0, 1, false).exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_build_that_made_no_pipeline_keeps_its_translations() {
+        assert!(translation_ram_free(), "on by default");
+        let build = pipeline_build();
+        let prepared = key(103);
+        translate_for_build(prepared.clone(), b"prepared", 4);
+        assert!(
+            shader_cache().lock().unwrap().get(&prepared, b"prepared").is_some(),
+            "a prepared or put-off build keeps its translations for the build that follows"
+        );
+        drop(build);
+        let hit = cached_shader(shader_cache(), prepared, b"prepared", || panic!("the prepared translation was dropped")).unwrap();
+        assert_eq!(hit.dxil[0], 4);
+    }
+
+    #[test]
+    fn a_translation_outside_a_build_is_not_remembered() {
+        assert!(translation_ram_free(), "on by default");
+        assert!(BUILDS.with(|b| b.borrow().is_empty()), "no build open");
+        let loose = key(104);
+        translate_for_build(loose.clone(), b"loose", 5);
+        assert!(!freeing_after_build(), "nothing is remembered without a pipeline build");
+        assert!(ASKED.with(|a| a.borrow().is_empty()), "nothing to free without a pipeline build");
+        assert!(shader_cache().lock().unwrap().get(&loose, b"loose").is_some());
+    }
+
+    #[test]
+    fn a_nested_build_frees_its_own_pipeline_only() {
+        assert!(translation_ram_free(), "on by default");
+        let outer = pipeline_build();
+        let (first, inner) = (key(105), key(106));
+        translate_for_build(first.clone(), b"first", 6);
+        {
+            let _inner = pipeline_build();
+            translate_for_build(inner.clone(), b"inner", 7);
+            pipeline_built();
+            assert!(shader_cache().lock().unwrap().get(&inner, b"inner").is_none());
+        }
+        assert!(shader_cache().lock().unwrap().get(&first, b"first").is_some(), "the outer build is still going");
+        pipeline_built();
+        assert!(shader_cache().lock().unwrap().get(&first, b"first").is_none());
+        drop(outer);
     }
 
     #[test]

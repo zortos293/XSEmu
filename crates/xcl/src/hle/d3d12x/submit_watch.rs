@@ -1,4 +1,4 @@
-//! The submit watch (on with `XCL_DRED=1`; `XCL_SUBMIT_WATCH=1` on, `=0` off): what XCL itself
+//! The submit watch (on by default; `XCL_SUBMIT_WATCH=0` off): what XCL itself
 //! knows of the GPU's work when DRED has nothing. Each ExecuteCommandLists on a queue is followed
 //! by a Signal of the watch's own fence for that queue (one more GPU command a submission), and
 //! the watch keeps the last 32 submissions of each queue with their lists' ops: the count of each
@@ -20,11 +20,21 @@ use std::time::{Duration, Instant};
 use windows::core::Interface;
 use windows::Win32::Graphics::Direct3D12::*;
 
+/// Whether the watch is on for `XCL_SUBMIT_WATCH`'s value: on unless it is `0`.
+fn wanted(value: Option<&str>) -> bool {
+    !value.is_some_and(|v| v.trim() == "0")
+}
+
 pub(super) fn on() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| match std::env::var("XCL_SUBMIT_WATCH") {
-        Ok(v) => v.trim() != "0",
-        Err(_) => std::env::var_os("XCL_DRED").is_some(),
+    *ON.get_or_init(|| {
+        let on = wanted(std::env::var("XCL_SUBMIT_WATCH").ok().as_deref());
+        if on {
+            crate::xlog_info!("submit watch: on (XCL's own record of the work each queue has in flight, read from its fences every 100 ms; XCL_SUBMIT_WATCH=0 turns it off)");
+        } else {
+            crate::xlog_info!("submit watch: off (XCL_SUBMIT_WATCH=0): a device removal will not name the work that was in flight");
+        }
+        on
     })
 }
 
@@ -262,6 +272,25 @@ pub(super) fn log_removal() {
     }
 }
 
+/// At the device's removal for `reason`: hand the dispatches of the submissions no fence had seen
+/// finished to the hung-pipeline guard, which records the compute pipelines among them for the next
+/// start of the same translator to skip. Taken under the watch's lock, named outside it.
+pub(super) fn record_hung(reason: u32) {
+    if !on() {
+        return;
+    }
+    let dispatches: Vec<(usize, Option<[u32; 3]>)> = {
+        let g = WATCH.lock().unwrap();
+        let Some(w) = g.as_ref() else { return };
+        w.queues
+            .values()
+            .flat_map(|q| q.ring.iter().filter(|s| s.n > q.completed))
+            .flat_map(|s| s.lists.iter().flat_map(|(_, ops)| ops.dispatches.iter().copied()))
+            .collect()
+    };
+    super::hung_skip::record_at_removal(reason, &dispatches);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -276,5 +305,16 @@ mod tests {
         ops.dispatches = vec![(0xA, Some([1, 1, 1])), (0xB, Some([80, 45, 1])), (0xA, Some([1, 1, 1])), (0xC, None)];
         let text = describe_with(&[(0x10, ops), (0x20, Ops::default())], |p| format!("P{p:x}"));
         assert_eq!(text, "list 0x10: 4 dispatch, 2 draw; dispatch indirect of Pc; dispatch 80x45x1 groups of Pb; dispatch 1x1x1 groups ×2 of Pa; list 0x20: no ops XCL recorded");
+    }
+
+    /// The watch is on unless it is switched off: a removal has to name the work in flight without
+    /// anyone having set anything, and `XCL_SUBMIT_WATCH=0` is the way out of its cost.
+    #[test]
+    fn the_watch_is_on_unless_it_is_switched_off() {
+        assert!(wanted(None));
+        assert!(wanted(Some("1")));
+        assert!(wanted(Some("")));
+        assert!(!wanted(Some("0")));
+        assert!(!wanted(Some(" 0 ")));
     }
 }

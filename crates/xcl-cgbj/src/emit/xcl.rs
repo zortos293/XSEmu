@@ -1,15 +1,18 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Written for xsemu (CAPA-86, ZOR-632). Not CGBJ code, but part of crates/xcl-cgbj, which is CGBJ's
 // shader translator (GPL-3.0-or-later, see ../../LICENSE and ../../PROVENANCE.md), so it carries that licence.
-//! The pipeline of a translation under the XCL binding ([`crate::xcl::translate_compute`]).
+//! The pipeline of a translation under the XCL binding ([`crate::xcl::translate_compute`],
+//! [`crate::xcl::translate_pixel`]).
 //!
-//! It is CGBJ's ([`super::translate`]) with three differences. The code is taken as the
+//! It is CGBJ's ([`super::translate`]) with four differences. The code is taken as the
 //! hardware runs it: a spilled user-data table is memory like any other, so its loads are
-//! not rewritten. The descriptor tracer may fail ([`tracked`]). And the result must bind
-//! nothing but io and static samplers.
+//! not rewritten. The descriptor tracer may fail ([`tracked`]). The result must bind
+//! nothing but io and static samplers. And a pixel program's signatures are xsemu's
+//! ([`link_signatures`]).
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 
+use super::container::SigElement;
 use super::{io, lower, structure};
 use crate::dxbc::{Container, FourCC};
 use crate::native::{HwStage, StageIo};
@@ -104,6 +107,7 @@ pub(super) fn packed(c: &Container, native: &crate::native::NativeProgram, p: &i
         if lanes % 64 != 0 && !cfg.thread_limits {
             return Err(refused("a group that ends inside a console wave, packed without the thread limits"));
         }
+        lower::claim_dword(lanes, cs.lds_bytes() / 4).map_err(refused)?;
         let st = structure::structure(p)?;
         let wide = (0..p.blocks.len()).filter(|&b| st.wave_any.get(b).copied().flatten().is_some()).collect();
         let st = structure::structure_wide(p, &wide)?;
@@ -131,8 +135,19 @@ pub(crate) fn tracked(p: &ir::Program, r: Result<Resources, ShaderError>) -> Res
     Ok(Resources::default())
 }
 
-/// The compute program of a container, under the binding the caller selected.
-pub(crate) fn translate(container: &[u8]) -> Result<XclShader, ShaderError> {
+/// Whether a pixel program of this wave size runs in the host's waves: a wave32 program's
+/// ballots and reductions are the console wave's only in 32-lane host waves, where no other
+/// console wave shares them; a wave64 program's are the host wave's at either size (see
+/// [`crate::xcl::translate_pixel`]).
+pub(super) fn pixel_runs_in_host_waves(wave64: bool) -> bool {
+    wave64 || lower::host_max_wave() == 32
+}
+
+/// The compute or pixel program of a container, under the binding the caller selected.
+/// `links` are what a pixel program's inputs link to ([`link_signatures`]). A pixel
+/// program's `threads` are 0; a compute program's are the console's, or in the packed form
+/// [`crate::xcl::packed_threads`] of them.
+pub(crate) fn translate(container: &[u8], stage: HwStage, links: &[&[u8]]) -> Result<XclShader, ShaderError> {
     let c = Container::parse(container)?;
     let dxil = c
         .part(FourCC::DXIL)
@@ -142,19 +157,45 @@ pub(crate) fn translate(container: &[u8]) -> Result<XclShader, ShaderError> {
         .into_iter()
         .find(|p| matches!(p.stage, HwStage::Vs | HwStage::Ps | HwStage::Cs | HwStage::Ms))
         .ok_or(refused("a container without a vertex, pixel, compute or mesh program"))?;
-    let StageIo::Cs(cs) = &native.io else {
-        return Err(refused("the XCL binding translates compute only"));
+    let console = match (&native.io, native.stage) {
+        (StageIo::Cs(cs), HwStage::Cs) => Some(cs.threads),
+        (_, HwStage::Ps) if !pixel_runs_in_host_waves(native.wave64) => {
+            return Err(refused("a wave32 pixel program where the driver may run 64-lane waves"))
+        }
+        (_, HwStage::Ps) => None,
+        (_, HwStage::Vs) => return Err(refused("a vertex program under the XCL binding")),
+        _ => return Err(refused("a mesh program under the XCL binding")),
     };
-    if native.stage != HwStage::Cs {
-        return Err(refused("the XCL binding translates compute only"));
+    if native.stage != stage {
+        return Err(refused(if stage == HwStage::Cs { "not a compute program" } else { "not a pixel program" }));
     }
+    let _link = if stage == HwStage::Ps { Some(LinkScope::enter(&c, links)?) } else { None };
+    // (as CGBJ's `super::translate` retries)
+    let r = translate_native(&c, &native);
+    let r = match r {
+        Err(ShaderError::Unsupported { what, .. }) if what == lower::FIRST_HALF => lower::with_first_half_pairs(|| translate_native(&c, &native)),
+        other => other,
+    };
+    let shader = match r {
+        Err(ShaderError::Unsupported { .. }) if stage == HwStage::Ps => with_per_lane_discard(|| translate_native(&c, &native)),
+        other => other,
+    }?;
+    let threads = match (console, &shader.form) {
+        (Some(console), Some((label, _))) if label == crate::xcl::PACKED_FORM => crate::xcl::packed_threads(console),
+        (Some(console), _) => console,
+        (None, _) => [0; 3],
+    };
+    Ok(XclShader { threads, ..shader })
+}
+
+fn translate_native(c: &Container, native: &crate::native::NativeProgram) -> Result<XclShader, ShaderError> {
     let p = ir::build(&native.patched_code(), native.wave64, native.vgprs)?;
     let st = structure::structure(&p);
     let res = crate::resource::track(&p, &native.layout, native.stage, st.as_ref().ok())?;
     let io = io::raise(&p, &native)?;
     let st = st?;
     crate::xcl::clear_stats();
-    let shader = super::emit(&c, &native, &p, &st, &io, &res)?;
+    let shader = super::emit(c, native, &p, &st, &io, &res)?;
     let (stats, _) = crate::xcl::take_stats(&shader.dxil);
     // The host binds io and the static samplers, and nothing else by register.
     if !shader.user_data.is_empty()
@@ -170,19 +211,142 @@ pub(crate) fn translate(container: &[u8]) -> Result<XclShader, ShaderError> {
         .zip(&shader.static_samplers)
         .map(|(&words, s)| (words, s.filter & 0x80 != 0))
         .collect();
-    let form = crate::xcl::take_form();
-    let threads = match &form {
-        Some((label, _)) if label == crate::xcl::PACKED_FORM => crate::xcl::packed_threads(cs.threads),
-        _ => cs.threads,
-    };
     Ok(XclShader {
         dxil: shader.dxil,
         samplers,
-        threads,
-        form,
+        threads: [0; 3],
+        form: crate::xcl::take_form(),
         stats,
     })
 }
+
+const NOT_WRITTEN: &str = "a pixel input the previous stage does not write";
+const NOT_COVERED: &str = "a pixel input wider than the output it links to";
+const DISAGREE: &str = "previous stages whose outputs are in other rows";
+
+thread_local! {
+    /// The output signatures a pixel program translated on this thread links to.
+    static LINK: RefCell<Option<Vec<Vec<SigElement>>>> = const { RefCell::new(None) };
+}
+
+/// Selects the outputs a pixel program's inputs link to, until it is dropped.
+struct LinkScope(Option<Vec<Vec<SigElement>>>);
+
+impl LinkScope {
+    /// The output signatures of the DXIL containers `links`, or with none the layout xsemu's
+    /// own translator gives the program's inputs, checked against the program's inputs.
+    fn enter(console: &Container, links: &[&[u8]]) -> Result<LinkScope, ShaderError> {
+        let part = |c: &Container, fourcc| c.part(fourcc).map_or(Ok(Vec::new()), |p| super::signature(p.data));
+        let mut inputs = part(console, FourCC::ISG1)?;
+        let outputs = if links.is_empty() {
+            vec![ours(&inputs)]
+        } else {
+            links.iter().map(|l| part(&Container::parse(l)?, FourCC::OSG1)).collect::<Result<_, _>>()?
+        };
+        link_inputs(&mut inputs, &outputs).map_err(refused)?;
+        Ok(LinkScope(LINK.with(|l| l.replace(Some(outputs)))))
+    }
+}
+
+/// Whether the program translated on this thread is a pixel program under the binding: one
+/// with its outputs selected by [`LinkScope`].
+pub(crate) fn pixel() -> bool {
+    LINK.with(|l| l.borrow().is_some())
+}
+
+thread_local! {
+    /// Set while [`with_per_lane_discard`] runs.
+    static PER_LANE_DISCARD: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Whether structurisation takes the branch of a pixel program's discard idiom per lane
+/// (`s_andn2_b32 live, live, exec` then `s_cbranch_scc0` to the end when no lane is live).
+/// By default the wave takes it, as on the console and in xsemu's translator: a lane that
+/// discarded runs on with its EXEC bit clear, so a quad read later sees its registers.
+pub(crate) fn per_lane_discard() -> bool {
+    PER_LANE_DISCARD.get()
+}
+
+/// Runs `translate` with the discard idiom's branch per lane: the retry of a pixel program
+/// refused with the wave taking it. A lane that discarded then leaves at the branch, and a
+/// quad read after it reads a lane DXIL leaves undefined.
+fn with_per_lane_discard<R>(translate: impl FnOnce() -> R) -> R {
+    let before = PER_LANE_DISCARD.replace(true);
+    let result = translate();
+    PER_LANE_DISCARD.set(before);
+    result
+}
+
+impl Drop for LinkScope {
+    fn drop(&mut self) {
+        LINK.with(|l| *l.borrow_mut() = self.0.take());
+    }
+}
+
+/// The input layout of xsemu's own pixel programs (gpu/recomp emit.rs, `ranked` in mod.rs):
+/// SV_Position in row 0, then each element of the console's signature in a row of its own,
+/// four columns wide, in the order of the console's rows; clip and cull distances last, as
+/// wide as their mask.
+fn ours(inputs: &[SigElement]) -> Vec<SigElement> {
+    let position = SigElement { name: "SV_Position".into(), index: 0, kind: 3, comp: 9, interp: 0, row: Some(0), col: 0, cols: 4, usage: 0, half: false };
+    let mut ranked: Vec<&SigElement> = inputs.iter().filter(|e| e.row.is_some() && matches!(e.kind, 0 | 6 | 7)).collect();
+    ranked.sort_by_key(|e| (e.kind != 0, e.row));
+    let rows = ranked.into_iter().zip(1..).map(|(e, row)| {
+        let (col, cols) = if e.kind == 0 { (0, 4) } else { (0, e.col + e.cols) };
+        SigElement { row: Some(row), col, cols, ..e.clone() }
+    });
+    std::iter::once(position).chain(rows).collect()
+}
+
+/// Moves pixel inputs to the rows of the outputs they link to: an element of the same
+/// semantic in each of `outputs` (a VS, and a GS behind it), keeping its columns, which must
+/// lie inside the output's. A system value no output has (front face, sample index,
+/// barycentrics) gets a row of its own after every output row.
+fn link_inputs(inputs: &mut [SigElement], outputs: &[Vec<SigElement>]) -> Result<(), &'static str> {
+    let mut free = outputs.iter().flatten().filter_map(|o| o.row).max().map_or(0, |r| r + 1);
+    for e in inputs.iter_mut().filter(|e| e.row.is_some()) {
+        let same = |o: &&SigElement| o.index == e.index && o.name.eq_ignore_ascii_case(&e.name) && o.row.is_some();
+        let found: Vec<&SigElement> = outputs.iter().filter_map(|sig| sig.iter().find(same)).collect();
+        if found.is_empty() && !matches!(e.kind, 0 | 3 | 6 | 7) {
+            e.row = Some(free);
+            free += 1;
+            continue;
+        }
+        if found.len() != outputs.len() {
+            return Err(NOT_WRITTEN);
+        }
+        if found.iter().any(|o| e.col < o.col || e.col + e.cols > o.col + o.cols) {
+            return Err(NOT_COVERED);
+        }
+        if found.iter().any(|o| o.row != found[0].row) {
+            return Err(DISAGREE);
+        }
+        e.row = found[0].row;
+    }
+    Ok(())
+}
+
+/// A pixel program's signatures as xsemu links them, under the binding: the inputs in the
+/// rows of the outputs selected by [`LinkScope`], and every colour output four columns wide
+/// from column 0, as xsemu's own translator declares it (the export stores channel n in
+/// column n).
+pub(super) fn link_signatures(inputs: &mut [SigElement], outputs: &mut [SigElement]) {
+    if crate::xcl::binding().is_none() {
+        return;
+    }
+    LINK.with(|l| {
+        let l = l.borrow();
+        let links = l.as_ref().expect("a pixel program translated under the binding has its links");
+        link_inputs(inputs, links).expect("the inputs were checked before the lowering");
+    });
+    for o in outputs.iter_mut().filter(|o| o.kind == 16) {
+        (o.col, o.cols) = (0, 4);
+    }
+}
+
+#[cfg(test)]
+#[path = "xcl_pixel_tests.rs"]
+mod pixel_tests;
 
 #[cfg(test)]
 mod tests {

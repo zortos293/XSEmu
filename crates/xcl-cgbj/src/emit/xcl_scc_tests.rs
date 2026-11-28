@@ -284,6 +284,31 @@ fn a_lane_read_past_32_takes_the_high_half() {
     assert_eq!(seen, ["lane read"]);
 }
 
+/// xsemu (M1e): a group of more than one console wave whose program already declares the D3D12
+/// limit of 32 KiB of LDS leaves no dword for the counter the host waves take their console
+/// threads from, so the packed form refuses it instead of making a container dxil.dll rejects.
+/// One console wave needs no counter, and a program below the limit gets its dword.
+#[test]
+fn the_packed_form_refuses_a_claim_dword_past_32_kib() {
+    let shaped = |threads: [u32; 3], lds_blocks: u32| {
+        let mut n = nested_mask_scc(SccUse::Branch);
+        n.io = StageIo::Cs(ComputeIo { rsrc2: 5 << 1 | lds_blocks << 15, threads });
+        n
+    };
+    let full = shaped([128, 1, 1], 64);
+    let StageIo::Cs(cs) = &full.io else { unreachable!() };
+    assert_eq!(cs.lds_bytes(), 32768);
+    let (out, _) = packed(&full);
+    assert!(matches!(out, Err(crate::ShaderError::Unsupported { what, .. }) if what == lower::NO_CLAIM_DWORD), "{out:?}");
+    for (threads, blocks) in [([64, 1, 1], 64), ([128, 1, 1], 63), ([8, 8, 2], 0)] {
+        let (out, _) = packed(&shaped(threads, blocks));
+        assert!(out.is_ok(), "{threads:?} with {blocks} blocks of LDS: {out:?}");
+    }
+    assert_eq!(lower::claim_dword(128, 8191), Ok(Some(8191)));
+    assert_eq!(lower::claim_dword(64, 8192), Ok(None));
+    assert_eq!(lower::claim_dword(65, 8192), Err(lower::NO_CLAIM_DWORD));
+}
+
 /// xsemu (M1d): writes the packed containers of the SCC fixtures, the ballot and the lane read
 /// to the folder `XCL_M1D_FIXTURES` names, to be run on an interpreter: every lane below s0 stores
 /// 2 when lane s1 is one of them and 1 otherwise, the ballot stores min(s0, 64) and the lane read 40.

@@ -194,7 +194,7 @@ impl Recipe {
         }
         static COUNT: AtomicUsize = AtomicUsize::new(0);
         COUNT
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
                 (v < 8).then_some(v + 1)
             })
             .map_err(|_| "private PSO cap")?;
@@ -214,6 +214,7 @@ impl Recipe {
         if hr < 0 || p.is_null() {
             return Err(format!("driver HRESULT {hr:#x}"));
         }
+        MESH_DRIVER_COMPILES.fetch_add(1, Ordering::Relaxed);
         let root = ext.as_raw() as usize;
         let raster = ID3D12PipelineState::from_raw(p);
         drop(_slot);
@@ -247,6 +248,7 @@ impl Recipe {
             if hr < 0 || c.is_null() {
                 return Err(format!("private producer driver HRESULT {hr:#x}"));
             }
+            MESH_DRIVER_COMPILES.fetch_add(1, Ordering::Relaxed);
             compute = (c as usize, rs.as_raw() as usize);
             KEEP.lock()
                 .unwrap()

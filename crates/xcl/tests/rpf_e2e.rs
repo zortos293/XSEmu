@@ -14,7 +14,7 @@ fn full_scan_and_streaming_probe_agree_on_header_evidence() {
     std::fs::write(&archive, data).unwrap();
 
     let run = |mode| {
-        Command::new(env!("CARGO_BIN_EXE_XSEmu"))
+        Command::new(env!("CARGO_BIN_EXE_xcl"))
             .arg("rpf")
             .arg(&archive)
             .arg(mode)
@@ -59,7 +59,7 @@ fn explicit_probe_rejects_conflicting_options() {
         &["--out", "unused"],
     ];
     let outputs = options.map(|args| {
-        Command::new(env!("CARGO_BIN_EXE_XSEmu"))
+        Command::new(env!("CARGO_BIN_EXE_xcl"))
             .arg("rpf")
             .arg(&archive)
             .arg("--probe")

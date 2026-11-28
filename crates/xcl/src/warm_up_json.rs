@@ -26,10 +26,8 @@ pub enum Event {
         phase: &'static str,
         paused_for_ram: bool,
     },
-    /// the last line; `left` counts the pipelines the pass did not build (failed, too big for the
-    /// memory limits, a giant left for a full pass, or not started when a budget or cancel stopped
-    /// it), so a launcher can say what running it again would still build
-    WarmupDone { built: usize, failed: usize, left: usize, too_big: usize, took_s: f64, complete: bool, cancelled: bool, code: i32 },
+    /// the last line
+    WarmupDone { built: usize, failed: usize, too_big: usize, took_s: f64, complete: bool, cancelled: bool, code: i32 },
     /// refused or failed before starting
     Error { message: String },
 }
@@ -137,8 +135,8 @@ mod tests {
         assert!(!line(&unknown).contains("eta_s"), "no ETA is left out, not invented");
         assert!(line(&unknown).ends_with(r#""paused_for_ram":true}"#));
         assert_eq!(
-            line(&Event::WarmupDone { built: 41890, failed: 16, left: 16, too_big: 0, took_s: 812.4, complete: true, cancelled: false, code: 0 }),
-            r#"{"ev":"warmup_done","built":41890,"failed":16,"left":16,"too_big":0,"took_s":812.4,"complete":true,"cancelled":false,"code":0}"#
+            line(&Event::WarmupDone { built: 41890, failed: 16, too_big: 0, took_s: 812.4, complete: true, cancelled: false, code: 0 }),
+            r#"{"ev":"warmup_done","built":41890,"failed":16,"too_big":0,"took_s":812.4,"complete":true,"cancelled":false,"code":0}"#
         );
         assert_eq!(
             line(&Event::Error { message: "another XSEmu process is running (xcl.exe 1234)".into() }),

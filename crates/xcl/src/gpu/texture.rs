@@ -195,6 +195,9 @@ struct Uploader {
     /// (buffer, its mapped bytes – written only –, capacity, its bytes in video memory when
     /// `rebar` placed it there)
     staging: Option<(ID3D12Resource, *mut u8, u64, super::rebar::Placed)>,
+    /// when a batch last went through it: `release_idle_staging` gives back the buffer of a queue
+    /// no batch has fed for a while (`XCL_UNLOAD_UNUSED`)
+    last_use: std::time::Instant,
 }
 
 // D3D12 objects are free-threaded; the mapped pointer is only used by the holder of the uploader
@@ -228,11 +231,12 @@ impl Uploader {
         let list: ID3D12GraphicsCommandList = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &alloc, None).map_err(err)?;
         list.Close().map_err(err)?;
         let fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).map_err(err)?;
-        Ok(Uploader { alloc, list, fence, value: 0, staging: None })
+        Ok(Uploader { alloc, list, fence, value: 0, staging: None, last_use: std::time::Instant::now() })
     }
 
     /// An upload buffer of at least `bytes`, mapped: the one kept, or a bigger one.
     unsafe fn staging(&mut self, dev: &ID3D12Device, bytes: u64) -> Result<(ID3D12Resource, *mut u8), String> {
+        self.last_use = std::time::Instant::now();
         if let Some((b, p, cap, _)) = &self.staging {
             if *cap >= bytes {
                 return Ok((b.clone(), *p));
@@ -507,6 +511,17 @@ mod tests {
     use super::*;
     use std::collections::HashMap;
     use windows::Win32::Graphics::Dxgi::Common::*;
+
+    /// `release_idle_staging` gives back a queue's upload buffer once no batch has fed it for the
+    /// limit, and keeps the small one a burst starts from (`XCL_UNLOAD_UNUSED`).
+    #[test]
+    fn an_upload_buffer_goes_back_once_no_batch_has_fed_it_for_the_limit() {
+        let limit = std::time::Duration::from_secs(30);
+        assert!(stale_staging(STAGING_MIN * 4, limit, limit));
+        assert!(!stale_staging(STAGING_MIN, limit * 4, limit), "the small pool stays");
+        assert!(!stale_staging(STAGING_MIN * 4, limit - std::time::Duration::from_millis(1), limit), "a batch fed it just now");
+        assert!(!stale_staging(0, limit * 4, limit), "no buffer, nothing to give back");
+    }
 
     fn image(format: u32, ty: ImageType, w: u32, h: u32, slices: u32, mips: u32, mode: u32, address: u64) -> Image {
         Image {
@@ -1130,4 +1145,30 @@ mod tests {
                 .clone()
         }
     }
+}
+/// Gives back the upload buffer of every queue no batch has fed for `idle` (`XCL_UNLOAD_UNUSED`):
+/// 4 to 64 MiB of mapped system memory each, made again by the batch that needs it. The buffer of
+/// `STAGING_MIN` or less stays, the pool a burst of uploads starts from. An uploader in the map is
+/// between batches – `upload_batch` takes it out for its batch and waits for its copies before
+/// putting it back – so nothing on the GPU reads the buffer this drops.
+pub fn release_idle_staging(idle: std::time::Duration) -> (usize, u64) {
+    let mut g = UPLOADERS.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(ups) = g.as_mut() else { return (0, 0) };
+    let (mut n, mut bytes) = (0, 0u64);
+    for up in ups.values_mut() {
+        if stale_staging(up.staging.as_ref().map_or(0, |s| s.2), up.last_use.elapsed(), idle) {
+            if let Some((_, _, cap, _)) = up.staging.take() {
+                n += 1;
+                bytes += cap;
+            }
+        }
+    }
+    (n, bytes)
+}
+
+/// Whether a queue's upload buffer of `cap` bytes, `idle` since the last batch fed it, goes back
+/// (`release_idle_staging`): one of `STAGING_MIN` or less stays, the pool a burst of uploads starts
+/// from, and one a batch fed within `limit` stays too.
+fn stale_staging(cap: u64, idle: std::time::Duration, limit: std::time::Duration) -> bool {
+    cap > STAGING_MIN && idle >= limit
 }
