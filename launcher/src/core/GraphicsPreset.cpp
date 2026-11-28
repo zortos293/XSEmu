@@ -23,6 +23,11 @@ const Preset* find(const QString& key)
     return nullptr;
 }
 
+bool supported()
+{
+    return qEnvironmentVariable("XSEMU_QUALITY_PRESETS") == QLatin1String("1");
+}
+
 QList<QPair<QString, QString>> environment(const Preset& preset)
 {
     return {{QStringLiteral("XCL_UPSCALER"), QStringLiteral("dlss")}, {QStringLiteral("XCL_DLSS_MODE"), preset.dlssMode}};

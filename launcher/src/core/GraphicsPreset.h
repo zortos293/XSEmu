@@ -29,6 +29,11 @@ const QList<Preset>& all();
 // The preset a stored value names; nullptr for Clear and any value this build does not know.
 const Preset* find(const QString& key);
 
+// True when the Core this launcher starts reads XCL_UPSCALER and XCL_DLSS_MODE. No Core build does
+// yet (crates/xcl has neither switch), so the row stays disabled and no title budget is written;
+// XSEMU_QUALITY_PRESETS=1 enables it for tests and for a Core built from that patch.
+bool supported();
+
 // The environment one preset adds; empty for Clear.
 QList<QPair<QString, QString>> environment(const Preset& preset);
 

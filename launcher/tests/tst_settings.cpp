@@ -358,6 +358,7 @@ void TestSettings::titleConfigAtLaunch()
 
 void TestSettings::qualityPresets()
 {
+    qputenv("XSEMU_QUALITY_PRESETS", "1"); // the Core switches have not landed; the row is gated until they do
     QTemporaryDir dir;
     qputenv("XCL_DATA_ROOT", dir.filePath(QStringLiteral("xcl")).toUtf8());
     const QString ini = dir.filePath(QStringLiteral("s.ini"));
@@ -399,6 +400,17 @@ void TestSettings::qualityPresets()
     QCOMPARE(env.value(QStringLiteral("XCL_UPSCALER")), QStringLiteral("dlss"));
     QCOMPARE(env.value(QStringLiteral("XCL_DLSS_MODE")), QStringLiteral("ultra-performance"));
 
+    // a profile that replaces both switches leaves the warm-up identity unchanged across presets
+    reread.setRunProfile({QStringLiteral("XCL_UPSCALER=dlss"), QStringLiteral("XCL_DLSS_MODE=quality")});
+    const QString forced = LaunchConfig::profileIdentity(reread, id);
+    reread.setGameOverride(id, QStringLiteral("qualityPreset"), QStringLiteral("quality"));
+    QCOMPARE(LaunchConfig::profileIdentity(reread, id), forced);
+    // with no profile override the preset is part of the identity
+    reread.resetRunProfile();
+    const QString quality = LaunchConfig::profileIdentity(reread, id);
+    reread.setGameOverride(id, QStringLiteral("qualityPreset"), QStringLiteral("balanced"));
+    QVERIFY(LaunchConfig::profileIdentity(reread, id) != quality);
+
     // a title_memory_mb the user set on purpose beats the preset's number
     reread.setGameOverride(id, QStringLiteral("title_memory_mb"), 2048);
     QCOMPARE(LaunchConfig::titleValues(reread, id).value(QStringLiteral("title_memory_mb")).toLongLong(), 2048);
@@ -410,6 +422,13 @@ void TestSettings::qualityPresets()
     QVERIFY(!LaunchConfig::qualityPreset(reread, id));
     env = LaunchConfig::runEnvironment(QProcessEnvironment(), reread, id);
     QVERIFY(!env.contains(QStringLiteral("XCL_UPSCALER")) && !env.contains(QStringLiteral("XCL_DLSS_MODE")));
+
+    // without a Core that reads the switches nothing applies, not even a stored choice
+    reread.setGameOverride(id, QStringLiteral("qualityPreset"), QStringLiteral("quality"));
+    qunsetenv("XSEMU_QUALITY_PRESETS");
+    QVERIFY(!LaunchConfig::qualityPreset(reread, id));
+    QVERIFY(!LaunchConfig::runEnvironment(QProcessEnvironment(), reread, id).contains(QStringLiteral("XCL_UPSCALER")));
+    QVERIFY(!LaunchConfig::titleValues(reread, id).contains(QStringLiteral("title_memory_mb")));
 }
 
 void TestSettings::warmupClassification()

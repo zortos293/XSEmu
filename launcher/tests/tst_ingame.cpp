@@ -47,6 +47,7 @@ private slots:
     void xsemuWarmupIsOff();
     void warmupFailureOffersContinueAndPlay();
     void qualityPresetsShowAndApply();
+    void qualityPresetsOffWithoutCore();
 
 private:
     QAbstractButton* button(const char* name) const;
@@ -433,6 +434,7 @@ void TestInGame::warmupFailureOffersContinueAndPlay()
 // hands LaunchConfig the two switches and the title budget; Default takes both back.
 void TestInGame::qualityPresetsShowAndApply()
 {
+    qputenv("XSEMU_QUALITY_PRESETS", "1"); // the test stands in for a Core that reads the switches
     const Game garden = fixtureGame(QStringLiteral("Signal Garden"));
     QTRY_VERIFY_WITH_TIMEOUT(m_s->library.game(garden.titleId()).isValid(), 10000);
     m_w->showGameDetails(garden);
@@ -487,6 +489,31 @@ void TestInGame::qualityPresetsShowAndApply()
     QTRY_VERIFY(!m_s->settings.gameOverrides(id).contains(QStringLiteral("qualityPreset")));
     QTRY_COMPARE(m_s->settings.gameOverrides(id).value(QStringLiteral("title_memory_mb")).toLongLong(), 0);
     QVERIFY(!LaunchConfig::runEnvironment(QProcessEnvironment(), m_s->settings, id).contains(QStringLiteral("XCL_DLSS_MODE")));
+    qunsetenv("XSEMU_QUALITY_PRESETS");
+}
+
+// No Core build reads XCL_UPSCALER or XCL_DLSS_MODE, so the row is disabled and a stored choice
+// applies neither switch nor a smaller title budget.
+void TestInGame::qualityPresetsOffWithoutCore()
+{
+    qunsetenv("XSEMU_QUALITY_PRESETS");
+    const Game garden = fixtureGame(QStringLiteral("Signal Garden"));
+    QTRY_VERIFY_WITH_TIMEOUT(m_s->library.game(garden.titleId()).isValid(), 10000);
+    const QString id = garden.titleId();
+    m_s->settings.setGameOverride(id, QStringLiteral("qualityPreset"), QStringLiteral("performance"));
+    m_w->showGameDetails(garden);
+    QApplication::processEvents();
+
+    SegmentedControl* preset = nullptr;
+    for (SegmentedControl* seg : m_w->gameDetailsPage()->findChildren<SegmentedControl*>()) {
+        if (seg->items().contains(QStringLiteral("Quality")))
+            preset = seg;
+    }
+    QVERIFY2(preset, "Game details has a quality preset row");
+    QVERIFY2(!preset->isEnabled(), "the row stays off until Core reads the switches");
+    QVERIFY(!LaunchConfig::qualityPreset(m_s->settings, id));
+    QVERIFY(!LaunchConfig::runEnvironment(QProcessEnvironment(), m_s->settings, id).contains(QStringLiteral("XCL_UPSCALER")));
+    QVERIFY(!LaunchConfig::titleValues(m_s->settings, id).contains(QStringLiteral("title_memory_mb")));
 }
 
 int main(int argc, char** argv)

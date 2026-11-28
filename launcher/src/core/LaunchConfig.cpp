@@ -7,6 +7,7 @@
 #include <QCryptographicHash>
 #include <QDir>
 #include <QHash>
+#include <QMap>
 #include <QRegularExpression>
 
 namespace {
@@ -68,6 +69,8 @@ QVariant typed(const QString& tomlKey, const QVariant& value)
 
 const GraphicsPreset::Preset* qualityPreset(const AppSettings& settings, const QString& titleId)
 {
+    if (!GraphicsPreset::supported())
+        return nullptr;
     return GraphicsPreset::find(settings.gameOverrides(titleId).value(QStringLiteral("qualityPreset")).toString());
 }
 
@@ -211,17 +214,21 @@ QProcessEnvironment runEnvironment(const QProcessEnvironment& base, const AppSet
 
 QString profileIdentity(const AppSettings& settings, const QString& titleId)
 {
-    QStringList applied;
+    // Keyed, so a run profile line replacing a preset's switch leaves one entry: the identity changes
+    // only when the environment XSEmu gets changes.
+    QMap<QString, QString> applied;
     if (const GraphicsPreset::Preset* preset = qualityPreset(settings, titleId)) {
         for (const auto& [key, value] : GraphicsPreset::environment(*preset))
-            applied << key + QLatin1Char('=') + value;
+            applied.insert(key, value);
     }
     for (const auto& [key, value] : parseProfile(runProfile(settings, titleId).join(QLatin1Char('\n'))).entries) {
         if (settingOwning(key).isEmpty())
-            applied << key + QLatin1Char('=') + value;
+            applied.insert(key, value);
     }
-    applied.sort();
-    return QString::fromLatin1(QCryptographicHash::hash(applied.join(QLatin1Char('\n')).toUtf8(), QCryptographicHash::Sha1).toHex().left(16));
+    QStringList lines;
+    for (auto it = applied.cbegin(); it != applied.cend(); ++it)
+        lines << it.key() + QLatin1Char('=') + it.value();
+    return QString::fromLatin1(QCryptographicHash::hash(lines.join(QLatin1Char('\n')).toUtf8(), QCryptographicHash::Sha1).toHex().left(16));
 }
 
 QString environmentOverride(const AppSettings& settings, const QString& variable)

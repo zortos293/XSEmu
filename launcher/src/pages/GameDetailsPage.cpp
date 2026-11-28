@@ -895,7 +895,7 @@ void GameDetailsPage::refreshOverrides()
         {QStringLiteral("raytracing"), QStringLiteral("Raytracing"),
          {QStringLiteral("Default"), QStringLiteral("Tier 1.1"), QStringLiteral("Tier 1.0"), QStringLiteral("Off")},
          {QVariant(), QStringLiteral("tier1_1"), QStringLiteral("tier1_0"), QStringLiteral("off")}, QStringLiteral("auto")},
-        {QStringLiteral("qualityPreset"), QStringLiteral("Quality preset"), qualityPresetLabels(), qualityPresetValues(), {}, true},
+        {QStringLiteral("qualityPreset"), QStringLiteral("Quality preset"), qualityPresetLabels(), qualityPresetValues(), {}, true, GraphicsPreset::supported()},
         {QStringLiteral("keyboard_mouse"), QStringLiteral("Keyboard & mouse"), {QStringLiteral("Default"), QStringLiteral("On"), QStringLiteral("Off")},
          {QVariant(), true, false}, true},
         {QStringLiteral("mouse_sensitivity"), QStringLiteral("Mouse speed"),
