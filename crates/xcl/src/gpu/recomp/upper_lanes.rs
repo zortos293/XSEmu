@@ -22,6 +22,14 @@
 //! put there: a spill slot < 32 is read from its shadow too – whatever the wave size – as long
 //! as no other instruction has written the VGPR since its `v_writelane`.
 //!
+//! The analysis also carries, per SGPR word, whether its bits lie inside the lanes the wave
+//! launched (`State::subset`): EXEC's low word at entry is that set, a saved EXEC copies it,
+//! `and` narrows it, a lane mask a VALU instruction writes is inside it, and every other
+//! write loses it. A `v_cndmask` whose mask is such a word, whose upper word is 0 and which
+//! runs with EXEC's upper word all ones gives every lane the mask leaves out its own
+//! constant – a lane the wave did not launch included (`UpperLanes::outside_const`, read by
+//! `upper_reduce`).
+//!
 //! Which instructions write lanes 32..63 depends on EXEC's upper word, followed through the
 //! SGPRs as 32-bit words known to be 0, all ones, or anything: 0 at the start; a VALU mask
 //! (`v_cmp*`, carries) has a 0 upper word while EXEC's is 0; bitwise SALU and the saveexec
@@ -141,6 +149,9 @@ struct State {
     lo: BTreeMap<u64, u32>,
     /// (VGPR, lane) → the word the slot's last `v_writelane` put there (absent: anything)
     slots: BTreeMap<(u64, u32), Word>,
+    /// SGPR words whose bits lie inside the lanes the wave launched: a lane that was not
+    /// launched reads 0 in them (`UpperLanes::outside_const`)
+    subset: BTreeSet<u64>,
 }
 
 impl State {
@@ -148,7 +159,8 @@ impl State {
         let mut s = [Word::Any; 128];
         s[125] = Word::Zero; // NULL
         s[127] = Word::Zero; // EXEC's upper word: lanes 32..63 are not populated
-        State { s, hi: BTreeMap::new(), lo: BTreeMap::new(), slots: BTreeMap::new() }
+        // EXEC's low word is the lanes the wave launched (every form starts from a ballot)
+        State { s, hi: BTreeMap::new(), lo: BTreeMap::new(), slots: BTreeMap::new(), subset: BTreeSet::from([126]) }
     }
 
     fn join(&self, o: &State) -> State {
@@ -172,7 +184,8 @@ impl State {
             })
             .collect();
         let slots = self.slots.iter().filter_map(|(k, w)| o.slots.get(k).map(|x| (*k, w.join(*x)))).collect();
-        State { s, hi, lo, slots }
+        let subset = self.subset.intersection(&o.subset).copied().collect();
+        State { s, hi, lo, slots, subset }
     }
 
     fn upper(&self, v: u64) -> [Hi; 32] {
@@ -240,6 +253,10 @@ pub struct UpperLanes {
     pub reads: BTreeMap<u64, Read>,
     /// (VGPR, lane) slots read from their shadow: their `v_writelane`s also write it
     pub shadows: BTreeSet<(u64, u32)>,
+    /// pc → the constant a `v_cndmask_b32` gives every lane its mask leaves out, when the
+    /// mask holds only launched lanes and the instruction runs with EXEC's upper word all
+    /// ones: a lane the wave did not launch holds it too (`upper_reduce`)
+    pub outside_const: BTreeMap<u64, u32>,
 }
 
 impl UpperLanes {
@@ -544,8 +561,88 @@ fn vgpr_writes(d: &Decoded) -> Vec<u64> {
     w
 }
 
-/// One instruction's effect.
+/// One instruction's effect, and what is left of the launched-lane proofs it can make.
 fn step(d: &Decoded, st: &mut State) {
+    let before = st.subset.clone();
+    effects(d, st);
+    // every word this instruction writes loses its proof unless the rule below keeps it
+    for (r, n) in sgpr_outputs(d) {
+        for w in r..r + n {
+            st.subset.remove(&w);
+        }
+    }
+    // `s_movreld_b32 s[dst + m0]`: any SGPR
+    if d.inst.name.starts_with("S_MOVRELD") {
+        st.subset.clear();
+    }
+    st.subset.extend(subset_after(d, &before));
+}
+
+/// Whether an operand code is an SGPR word.
+fn word_of(code: u64) -> Option<u64> {
+    matches!(code, 0..=124 | 126 | 127).then_some(code)
+}
+
+/// The words after this instruction whose bits lie inside the lanes the wave launched
+/// (`State::subset`), from the words that did before it.
+fn subset_after(d: &Decoded, before: &BTreeSet<u64>) -> Vec<u64> {
+    let fv = |f: &str| rdna2::field_value(d.enc, &d.words, f).unwrap_or(0);
+    let name = d.inst.name;
+    let (op, b64) = (name.split('_').nth(1).unwrap_or(""), name.ends_with("_B64"));
+    let (dst, a, b) = (fv("SDST"), word_of(fv("SSRC0")), word_of(fv("SSRC1")));
+    let sub = |w: Option<u64>| w.is_some_and(|w| before.contains(&w));
+    let mut out = Vec::new();
+    if name.contains("SAVEEXEC") || name.contains("WREXEC") {
+        // the EXEC this instruction replaces, in the mask's lane set: the wave's launched
+        // lanes minus those it has left since
+        if before.contains(&126) {
+            out.push(dst);
+        }
+        return out;
+    }
+    // the word-wise rule of an SGPR operation
+    let rule = |a: Option<u64>, b: Option<u64>| -> bool {
+        match (d.enc.name, op) {
+            // a copy of one operand
+            ("ENC_SOP1", "MOV" | "WQM") => sub(a),
+            // the conditional selects either operand
+            ("ENC_SOP1", "CMOV") | ("ENC_SOP2", "CSELECT") => sub(a) && sub(b),
+            // and: inside either operand; andn2: inside its first
+            ("ENC_SOP2", "AND") => sub(a) || sub(b),
+            ("ENC_SOP2", "ANDN2") => sub(a),
+            // or / xor: inside them only when both are
+            ("ENC_SOP2", "OR" | "XOR") => sub(a) && sub(b),
+            _ => false,
+        }
+    };
+    if d.enc.name == "ENC_SOP1" || d.enc.name == "ENC_SOP2" {
+        if rule(a, b) {
+            out.push(dst);
+            if b64 {
+                // a 64-bit operand's high word sits in the next register
+                if rule(a.map(|w| w + 1).filter(|&w| w < 128), b.map(|w| w + 1).filter(|&w| w < 128)) {
+                    out.push(dst + 1);
+                }
+            }
+        }
+    } else if is_valu(d) {
+        // a lane mask: the bits of lanes the instruction does not run are 0
+        for (r, n) in sgpr_outputs(d) {
+            if n == 2 {
+                if before.contains(&126) {
+                    out.push(r);
+                }
+                if before.contains(&127) {
+                    out.push(r + 1);
+                }
+            }
+        }
+    }
+    out
+}
+
+/// One instruction's effect.
+fn effects(d: &Decoded, st: &mut State) {
     let name = d.inst.name;
     let fv = |f: &str| rdna2::field_value(d.enc, &d.words, f).unwrap_or(0);
     let exec_hi = st.s[127];
@@ -692,6 +789,36 @@ fn step(d: &Decoded, st: &mut State) {
     }
 }
 
+/// The constant a `v_cndmask_b32` gives every lane its mask leaves out, in state `st`
+/// (before the instruction): a constant source 0, a mask whose bits lie inside the lanes the
+/// wave launched (`State::subset`) and whose upper word is 0, and EXEC's upper word all ones
+/// (the whole-wave section, so the lanes ≥ 32 are written as well).
+fn outside_const(d: &Decoded, st: &State) -> Option<u32> {
+    if d.inst.name != "V_CNDMASK_B32" || st.s[127] != Word::Ones {
+        return None;
+    }
+    let fv = |f: &str| rdna2::field_value(d.enc, &d.words, f).unwrap_or(0);
+    let c = match fv("SRC0") {
+        0..=124 | 126 | 127 => st.s[fv("SRC0") as usize].value(),
+        125 | 128 => Some(0),
+        129..=192 => Some((fv("SRC0") - 128) as u32),
+        193..=208 => Some((-(fv("SRC0") as i64 - 192)) as u32),
+        240..=248 => f32_inline(fv("SRC0")),
+        255 => d.literal,
+        _ => None,
+    }?;
+    // the mask: VCC (VOP2) or SRC2 (VOP3)
+    let (m, hi) = match d.enc.name {
+        "ENC_VOP2" => (106, st.s[107]),
+        "ENC_VOP3" => {
+            let code = fv("SRC2");
+            (word_of(code)?, st.src64(d, code).1)
+        }
+        _ => return None,
+    };
+    (hi == Word::Zero && st.subset.contains(&m)).then_some(c)
+}
+
 /// The resolution of a cross-lane read in state `st` (before the instruction), if it is one.
 fn classify(d: &Decoded, st: &State) -> Option<(Read, Option<(u64, u32)>)> {
     let fv = |f: &str| rdna2::field_value(d.enc, &d.words, f).unwrap_or(0);
@@ -824,6 +951,9 @@ pub fn analyze(insts: &[Decoded]) -> UpperLanes {
                 out.shadows.insert(s);
             }
             out.reads.insert(d.pc, r);
+        }
+        if let Some(c) = outside_const(d, st) {
+            out.outside_const.insert(d.pc, c);
         }
     }
     out

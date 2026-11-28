@@ -521,6 +521,7 @@ pub(super) fn start_code_release() {
         crate::xlog_info!("D3D12.X: compiled shader code budget {budget} MB (XCL_SHADER_CODE_MB; unset or 0: none): over it, {kind}pipelines no list took for {idle_s} s are released and built again at their next bind{also}");
         let _ = std::thread::Builder::new().name("xcl-pso-code".into()).spawn(move || {
             let (mut rounds, mut stuck) = (0usize, 0usize);
+            let mut held: Option<std::time::Instant> = None;
             loop {
                 std::thread::sleep(std::time::Duration::from_secs(1));
                 super::shader_code::frame_mark(super::present::presents());
@@ -529,7 +530,25 @@ pub(super) fn start_code_release() {
                 let (in_use, over) = super::shader_code::over_budget();
                 if over == 0 {
                     stuck = 0;
+                    held = None;
                     continue;
+                }
+                // (`queue_hold`: a release during a compile storm costs a giant compile at the
+                // next bind, so rounds wait for the backlog to drain, at most `queue_hold_ms`)
+                if let Some(most) = queue_hold() {
+                    let (waiting, _) = waiting_builds();
+                    let since = *held.get_or_insert_with(std::time::Instant::now);
+                    if waiting >= most && since.elapsed().as_millis() < queue_hold_ms() as u128 {
+                        continue;
+                    }
+                    if waiting >= most {
+                        crate::xlog_info!(
+                            "D3D12.X: shader code {:.0} MB over its budget with {waiting} builds waiting: the releases this round went ahead after {:?} (XCL_SHADER_CODE_QUEUE_HOLD_MS)",
+                            over as f64 / (1 << 20) as f64,
+                            since.elapsed()
+                        );
+                    }
+                    held = None;
                 }
                 // (a member of a pass chain stays: while one is not built no pass of its chain
                 // runs, `pass_chain`)
@@ -2438,6 +2457,36 @@ fn pace(pool: usize, workers: mpsc::Receiver<Arc<BoostToken>>) {
         super::real::sample_background_headroom();
         (at, before, ran) = (now, after, read);
     }
+}
+
+/// How many builds wait in the backlog, and how many of those wait for memory
+/// (`ahead_summary`'s counts): what a round of the shader-code budget looks at before it takes
+/// pipelines away (`queue_hold`).
+pub(super) fn waiting_builds() -> (usize, usize) {
+    Q.get().and_then(|q| q.as_ref()).map_or((0, 0), |q| {
+        let list = q.lock();
+        list.waiting()
+    })
+}
+
+/// `XCL_SHADER_CODE_QUEUE_HOLD` (0, the default: off): how many builds must be waiting before a
+/// round of the shader-code budget is put off. A release during a compile storm buys little — the
+/// code of pipelines nobody is binding — and costs a giant compile at its next bind: play-129 saw
+/// 301 of its 548 bind-waited builds rebuilt after a release from a 320 MB budget. `XCL_SHADER_CODE_QUEUE_HOLD_MS`
+/// (default 30000) caps how long rounds are put off, so the code heap still comes down in the end.
+fn queue_hold() -> Option<usize> {
+    static MOST: OnceLock<usize> = OnceLock::new();
+    let most = *MOST.get_or_init(|| {
+        std::env::var("XCL_SHADER_CODE_QUEUE_HOLD").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(0)
+    });
+    (most > 0).then_some(most)
+}
+
+fn queue_hold_ms() -> u64 {
+    static MS: OnceLock<u64> = OnceLock::new();
+    *MS.get_or_init(|| {
+        std::env::var("XCL_SHADER_CODE_QUEUE_HOLD_MS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(30_000)
+    })
 }
 
 /// For the 30 s line: what the preload workers have built, what waits for them, what waits for

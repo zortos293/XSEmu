@@ -355,7 +355,7 @@ impl Cx<'_> {
 
 impl<'a> Group<'a> {
     /// A thread group with id `id` (SV_GroupID), every lane at the entry.
-    pub fn new(p: &'a Program, world: &'a mut World, id: [u32; 3], budget: u64) -> Group<'a> {
+    pub fn new(p: &'a Program, world: &'a mut World, id: [u32; 3], budget: u64, live: Option<u32>) -> Group<'a> {
         let w = p.wave_size as usize;
         let threads = p.threads() as usize;
         // the clock runs on from the group before: what that one wrote is older than
@@ -375,6 +375,17 @@ impl<'a> Group<'a> {
                 }
             }
             waves.push(Wave { regs, frame, next: vec![0; lanes], key: vec![forward_key(0); lanes], held: vec![IDLE; lanes], pred: vec![DONE; lanes], lanes, live: lanes, first_thread: (k * w) as u32, region_start: tick, clobber: tick, ballots: 0, dead: 0 });
+        }
+        // a partial launch (`Config::live`): the lanes past it never run
+        if let Some(live) = live {
+            for wave in &mut waves {
+                let n = (live as usize).min(wave.lanes);
+                for l in n..wave.lanes {
+                    wave.next[l] = DONE;
+                    wave.key[l] = IDLE;
+                }
+                wave.live = n;
+            }
         }
         world.clock = res::Clock { tick, epoch_start: tick, ..Default::default() };
         world.covered.resize(p.blocks.len(), false);

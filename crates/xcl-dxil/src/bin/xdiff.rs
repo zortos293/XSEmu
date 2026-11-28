@@ -12,6 +12,7 @@
 //!   --jobs J      worker threads (all cores)       --wave W     wave size when a program declares none (32);
 //!                                                               the vertices or pixels of a vs / ps run
 //!   --explore R   input variants tried per seed to reach more code (see interp::explore)
+//!   --lanes L     only the lowest L lanes of each wave run (a partial launch, see interp::Config)
 //!   --natural     do not force empty ballots on odd seeds (see interp::Config)
 //!   -v            per-seed lines; in a batch, a line per pair that is equal too
 //! ~~~
@@ -43,7 +44,7 @@ struct Options {
 }
 
 fn usage() -> ! {
-    eprintln!("usage: xdiff a.dxil b.dxil | --batch A_DIR [B_DIR] | --run a.dxil  [--seeds N] [--seed S] [--groups G] [--budget B] [--jobs J] [--wave W] [-v]");
+    eprintln!("usage: xdiff a.dxil b.dxil | --batch A_DIR [B_DIR] | --run a.dxil  [--seeds N] [--seed S] [--groups G] [--budget B] [--jobs J] [--wave W] [--lanes L] [-v]");
     std::process::exit(3);
 }
 
@@ -361,6 +362,7 @@ fn main() {
             "--jobs" => o.jobs = number("--jobs").max(1) as usize,
             "--wave" => o.wave = number("--wave") as u32,
             "--explore" => o.explore = number("--explore") as u32,
+            "--lanes" => o.cfg.live = Some(number("--lanes") as u32),
             "--natural" => o.cfg.force_ballots = false,
             "--batch" => mode = "batch",
             "--run" => mode = "run",

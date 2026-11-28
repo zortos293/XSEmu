@@ -34,8 +34,12 @@ mod xcl;
 // xsemu: the packed form of a wave64 program on 32-lane waves (not CGBJ code), likewise.
 mod packed;
 #[cfg(test)]
-pub(super) use packed::{NO_CLAIM_DWORD, SEEN as PACKED_SEEN};
-pub(super) use packed::{claim_dword, with_packed};
+mod packed_tests;
+#[cfg(test)]
+pub(super) use packed::{
+    F64_SUM, NO_CLAIM_DWORD, SEEN as PACKED_SEEN, TEST_F64_SUM, TEST_FLAT_BASE, ThreadBase, claim_dword, f64_sum,
+};
+pub(super) use packed::{flat_thread_base, thread_base, with_packed};
 
 type Why = &'static str;
 

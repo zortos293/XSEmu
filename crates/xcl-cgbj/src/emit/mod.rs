@@ -300,6 +300,17 @@ pub fn translation_fingerprint() -> Vec<u8> {
             out.extend_from_slice(value.as_encoded_bytes());
         }
         out.push(0);
+        // xsemu: `XCL_CGBJ_` names the same switch this tree's own switches use, so its value
+        // belongs in the key as well
+        if let Some(rest) = name.strip_prefix("VICTORY_XCL_") {
+            let alias = format!("XCL_CGBJ_{rest}");
+            if let Some(value) = std::env::var_os(&alias) {
+                out.extend_from_slice(alias.as_bytes());
+                out.push(b'=');
+                out.extend_from_slice(value.as_encoded_bytes());
+                out.push(0);
+            }
+        }
     }
     out.extend_from_slice(&lower::host_max_wave().to_le_bytes());
     out.extend_from_slice(&lower::host_rdna().to_le_bytes());

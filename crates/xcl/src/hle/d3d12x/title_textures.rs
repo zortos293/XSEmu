@@ -23,7 +23,8 @@
 use std::collections::BTreeMap;
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 use windows::core::Interface;
 use windows::Win32::Graphics::Direct3D12::*;
@@ -67,6 +68,24 @@ struct Entry {
     unmapped: bool,
     /// monotonic registration order (newest wins when uncovering shadowed textures)
     seq: u64,
+    /// when, and in which presented frame, the tree last saw this texture used: an upload, a
+    /// transition the title recorded (or submitted), a GPU write. `evict_cold` counts the free
+    /// bounds from it.
+    last_used: Instant,
+    last_frame: u64,
+    /// its decoded tiles were let go (`evict_cold`): it reads zero until an upload decodes it
+    /// again, and every path that can sample it marks it `pending` first
+    evicted: bool,
+    /// the bytes that eviction gave back (0 unless `evicted`; for the cap)
+    evicted_bytes: usize,
+}
+
+impl Entry {
+    /// The tree just saw this texture used: now, and in the frame the title is presenting.
+    fn used_now(&mut self) {
+        self.last_used = Instant::now();
+        self.last_frame = super::free_policy::frame();
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -487,6 +506,10 @@ unsafe fn track(device: *mut c_void, res: *mut c_void, va: usize, tex: xg::Textu
         placed,
         unmapped: false,
         seq: 0,
+        last_used: Instant::now(),
+        last_frame: super::free_policy::frame(),
+        evicted: false,
+        evicted_bytes: 0,
     };
     let to_unmap = {
         let mut t = TEXTURES.lock().unwrap();
@@ -690,8 +713,24 @@ pub fn note_transitions(list: usize, transitions: &[Transition]) {
         return;
     }
     let kept: Vec<Transition> = {
-        let t = TEXTURES.lock().unwrap();
-        transitions.iter().filter(|(r, _, _)| t.by_res.contains_key(r) || t.shadowed.contains_key(r) || super::image_writeback::tracks(*r)).copied().collect()
+        let mut g = TEXTURES.lock().unwrap();
+        let mut kept = Vec::new();
+        for &(res, sub, after) in transitions {
+            if !(g.by_res.contains_key(&res) || g.shadowed.contains_key(&res) || super::image_writeback::tracks(res)) {
+                continue;
+            }
+            kept.push((res, sub, after));
+            // the title is recording work that names this texture: it is used from the submit this
+            // list goes to, and one whose tiles were let go is decoded again before that submit
+            if let Some(e) = g.by_res.get_mut(&res) {
+                e.used_now();
+                if e.evicted && !e.pending {
+                    e.pending = true;
+                    PENDING.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+        }
+        kept
     };
     if !kept.is_empty() {
         LIST_NOTES.lock().unwrap().entry(list).or_default().extend(kept);
@@ -734,6 +773,13 @@ pub fn submitted(lists: &[*mut c_void]) {
         if let Some(e) = t.get_mut(res) {
             let n = subresource_count(&e.tex);
             apply_transition(&mut e.states, n, sub, after);
+            // a closed list may run again with the transitions it recorded: its submit is a use,
+            // and one of a texture whose tiles were let go decodes it at the next refresh
+            e.used_now();
+            if e.evicted && !e.pending {
+                e.pending = true;
+                PENDING.fetch_add(1, Ordering::Relaxed);
+            }
         }
     }
 }
@@ -930,13 +976,17 @@ unsafe fn refresh_once(queue: *mut c_void) {
         }
     }
     // the title's own memory: what the CPU wrote goes to its video memory first
-    if let Some(q) = ID3D12CommandQueue::from_raw_borrowed(&queue) {
-        DIRTY_BUF.with(|dcell| {
-            let dirty = dcell.borrow();
+    DIRTY_BUF.with(|dcell| {
+        let dirty = dcell.borrow();
+        // the tiles of textures nothing has used for the free bounds go back before this submit's
+        // uploads (one that is used again in this submit is decoded by them) and before the
+        // queue's wait, so this submit is ordered after their unmapping too (`evict_cold`)
+        evict_cold(&dirty, page as usize);
+        if let Some(q) = ID3D12CommandQueue::from_raw_borrowed(&queue) {
             super::sparse::before_execute(q, &dirty, page as usize);
             super::vram::before_execute(q);
-        });
-    }
+        }
+    });
     if dirty_len == 0 && PENDING.load(Ordering::Relaxed) == 0 {
         return;
     }
@@ -954,8 +1004,7 @@ unsafe fn refresh_once(queue: *mut c_void) {
                 if e.gpu_written {
                     return false;
                 }
-                let i = dirty.partition_point(|&p| p + page as usize <= e.src);
-                dirty.get(i).is_some_and(|&p| p < e.src + e.tex.size() as usize)
+                written(&dirty, page as usize, e.src, e.tex.size() as usize)
             })
             .filter_map(|(&res, e)| {
                 let Some(r) = super::real::reference(res) else {
@@ -970,12 +1019,485 @@ unsafe fn refresh_once(queue: *mut c_void) {
                     e.pending = false;
                     PENDING.fetch_sub(1, Ordering::Relaxed);
                 }
+                // it is published to the GPU again from here on
+                e.used_now();
+                if e.evicted {
+                    // the tiles `evict_cold` gave back are decoded again by this upload
+                    e.evicted = false;
+                    let bytes = std::mem::take(&mut e.evicted_bytes);
+                    EVICT.lock().unwrap().redecoded(bytes);
+                }
                 super::physical_directory::note_native_texture_access(e.va as u64, e.tex.size(), false);
                 Some((r, (e.device, e.src, Arc::clone(&e.tex), e.states.clone())))
             })
             .collect()
     });
     upload_all(todo);
+}
+
+/// `XCL_TEX_EVICT=1`: the decoded tiles of a texture nothing has used may go back to video memory
+/// and an upload decodes them again from the title's memory. Off by default: the tiles are the
+/// PC's copy of the title's console-layout texels, and letting them go costs the decode of the
+/// whole texture the next time the title's GPU work reads it.
+fn evict_on() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = std::env::var("XCL_TEX_EVICT").is_ok_and(|v| v.trim() == "1");
+        if on {
+            crate::xlog_info!(
+                "D3D12.X: a decoded texture's tiles are let go when nothing has used it for the free bounds and no submission can read them, {} MiB out at once at most; an upload decodes it again (XCL_TEX_EVICT, XCL_TEX_EVICT_MB)",
+                cap_bytes() >> 20,
+            );
+            if !super::residency::eviction_enabled() {
+                crate::xlog_warn!(
+                    "D3D12.X: XCL_TEX_EVICT without XCL_VRAM_BUDGET=1 (or XCL_VRAM_EVICT=1): no fence proves that the submission that last used a texture has completed, so nothing is let go"
+                );
+            }
+        }
+        on
+    })
+}
+
+/// `XCL_TEX_EVICT_MB` in bytes: the decoded tiles out of video memory at once at most (1536 MiB
+/// by default, about what a title's decoded textures take). 0 lets nothing go.
+fn cap_bytes() -> usize {
+    static CAP: OnceLock<usize> = OnceLock::new();
+    *CAP.get_or_init(|| cap_limit(std::env::var("XCL_TEX_EVICT_MB").ok().as_deref()))
+}
+
+/// The cap `raw` asks for, in bytes: unset or not a number is `CAP_MB`, and a value too large for
+/// the machine's `usize` is clamped rather than wrapped into a small cap. 0 is no room at all.
+fn cap_limit(raw: Option<&str>) -> usize {
+    const CAP_MB: u64 = 1536;
+    let mib = raw.and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(CAP_MB);
+    usize::try_from(mib.saturating_mul(1 << 20)).unwrap_or(usize::MAX / 2).min(usize::MAX / 2)
+}
+
+/// Whether a shader can read a texture in one of `states` without a transition the tree would see.
+///
+/// Only `COPY_DEST` is safe. D3D12 lets nothing but a copy into a resource in it: a shader read, a
+/// copy out of it and a shader write into it are all invalid, and a copy into a texture it keeps in
+/// step is noted (`vram::note_gpu_write`: its lazy units go and its pages become the GPU's, which
+/// refuses that texture here). Every other state can be sampled by a submission that records no
+/// transition for the texture – the shader-visible ones directly, `COMMON` through D3D12's implicit
+/// promotion, and `COPY_SOURCE` / `RESOLVE_*` by a copy or a resolve this module does not note – so
+/// a texture in one of them keeps its tiles.
+///
+/// An empty list (it never is: an entry starts with one state) is taken as readable.
+fn sampleable(states: &[D3D12_RESOURCE_STATES]) -> bool {
+    states.is_empty() || !states.iter().all(|&s| s == D3D12_RESOURCE_STATE_COPY_DEST)
+}
+
+/// Why a decoded texture's tiles stay. The pass checks them in this order and counts the first
+/// that stops it, so a census line says the most that a fix would have to prove for that memory.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Refusal {
+    /// the title's GPU wrote it: the guest pages are stale and the tiles are the only copy
+    GpuWritten,
+    /// its pages were written this submit, or it is being uploaded
+    Busy,
+    /// not a placed texture at all: a resource of its own
+    NotOnPages,
+    /// the presentation's own plane
+    Presented,
+    /// written back to the guest pages (`image_writeback`)
+    Writeback,
+    /// a shader, a copy or a resolve can read it without a transition the tree would see
+    Sampleable,
+    /// a live PC list still holds a transition of it to a state a shader reads: that list may run
+    /// again and read the texture after re-applying it
+    Noted,
+    /// the free bounds (`XCL_FREE_AFTER_MS`, `XCL_FREE_AFTER_FRAMES`) are not due
+    NotDue,
+    /// `XCL_TEX_EVICT_MB` is all out
+    Cap,
+    /// out already: this pass gave its tiles back and no upload has decoded it since
+    Out,
+    /// `vram`: the placement is the GPU's, not a sampled texture's
+    NotSampled,
+    /// `vram`: another target stands on one of its pages
+    Shared,
+    /// `vram`: a page under it is GPU-written
+    GpuPage,
+    /// `vram`: no fence proves that the submission that last used its pool completed
+    NoFence,
+    /// `vram`: no tile under it
+    Empty,
+}
+
+/// How many reasons there are (`Refusal::ALL`), and the length of a tally's arrays.
+const REFUSALS: usize = Refusal::ALL.len();
+
+impl Refusal {
+    /// Every reason, in the order `refusal` checks them.
+    const ALL: [Refusal; 15] = [
+        Refusal::GpuWritten, Refusal::Busy, Refusal::NotOnPages, Refusal::Presented, Refusal::Writeback,
+        Refusal::Sampleable, Refusal::Noted, Refusal::NotDue, Refusal::Cap, Refusal::Out,
+        Refusal::NotSampled, Refusal::Shared, Refusal::GpuPage, Refusal::NoFence, Refusal::Empty,
+    ];
+
+    /// Its place in a tally's arrays: the discriminant (`ALL` is in that order).
+    fn index(self) -> usize {
+        self as usize
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Refusal::GpuWritten => "GPU-written",
+            Refusal::Busy => "busy this submit",
+            Refusal::NotOnPages => "not on pages",
+            Refusal::Presented => "presented",
+            Refusal::Writeback => "a writeback source",
+            Refusal::Sampleable => "readable without a transition",
+            Refusal::Noted => "in a live list's transition",
+            Refusal::NotDue => "not due",
+            Refusal::Cap => "the cap",
+            Refusal::Out => "out now",
+            Refusal::NotSampled => "not a sampled placement",
+            Refusal::Shared => "shared",
+            Refusal::GpuPage => "a GPU-written page",
+            Refusal::NoFence => "no fence",
+            Refusal::Empty => "no tile",
+        }
+    }
+}
+
+/// What the tree knows about one texture when `evict_cold` looks at it: the facts `refusal` judges,
+/// and nothing that would need a lock while it judges them.
+struct Facts<'a> {
+    states: &'a [D3D12_RESOURCE_STATES],
+    pending: bool,
+    gpu_written: bool,
+    placed: bool,
+    evicted: bool,
+    written: bool,
+    presented: bool,
+    writeback: bool,
+    noted: bool,
+    last_used: Instant,
+    last_frame: u64,
+}
+
+/// Why `f`'s tiles stay this pass, or `None` when they may go.
+///
+/// The order is the picture's safety first: the bytes the GPU wrote (which no decode can rebuild),
+/// a copy this submit makes into it or an upload in flight, a placement that is not the decoded
+/// copy at all, a plane that is on screen or a source being written back, then a read that no
+/// transition would announce, then a list that could run its transition again, and only then the
+/// texture's age.
+fn refusal(f: &Facts, now: Instant, frame: u64, cold: super::free_policy::Wait) -> Option<Refusal> {
+    if f.gpu_written {
+        return Some(Refusal::GpuWritten);
+    }
+    if f.evicted {
+        return Some(Refusal::Out);
+    }
+    if f.pending || f.written {
+        return Some(Refusal::Busy);
+    }
+    if !f.placed {
+        return Some(Refusal::NotOnPages);
+    }
+    if f.presented {
+        return Some(Refusal::Presented);
+    }
+    if f.writeback {
+        return Some(Refusal::Writeback);
+    }
+    if sampleable(f.states) {
+        return Some(Refusal::Sampleable);
+    }
+    if f.noted {
+        return Some(Refusal::Noted);
+    }
+    if !cold.due(now, frame, f.last_used, f.last_frame) {
+        return Some(Refusal::NotDue);
+    }
+    None
+}
+
+/// Whether `dirty` (page addresses, sorted, `page` bytes each) holds a page of `[src, src + size)`:
+/// what the upload scan and the eviction pass both ask.
+fn written(dirty: &[usize], page: usize, src: usize, size: usize) -> bool {
+    let i = dirty.partition_point(|&p| p + page <= src);
+    dirty.get(i).is_some_and(|&p| p < src + size)
+}
+
+/// Whether `want` more bytes fit under `cap` with `out` already given back.
+fn room(out: usize, want: usize, cap: usize) -> bool {
+    out.saturating_add(want) <= cap
+}
+
+/// How long after one eviction pass the next may look: the table is walked once a pass, and the
+/// free bounds it compares against are seconds.
+const PASS_EVERY: Duration = Duration::from_millis(500);
+
+/// How often the summary line is printed (`XCL_TEX_EVICT`), at most.
+const REPORT_EVERY: Duration = Duration::from_secs(30);
+
+/// Whether a pass may look now.
+fn due_for_pass(now: Instant) -> bool {
+    static BASE: OnceLock<Instant> = OnceLock::new();
+    static LAST: AtomicU64 = AtomicU64::new(0);
+    let base = *BASE.get_or_init(|| now);
+    let ms = now.saturating_duration_since(base).as_millis() as u64;
+    let last = LAST.load(Ordering::Relaxed);
+    if last != 0 && ms.saturating_sub(last) < PASS_EVERY.as_millis() as u64 {
+        return false;
+    }
+    LAST.store(ms, Ordering::Relaxed);
+    true
+}
+
+/// What the eviction has done since the summary line, and what it refused.
+struct EvictTally {
+    /// the summary line's clock (None: no pass has run since it started)
+    at: Option<Instant>,
+    evicted: u64,
+    evicted_bytes: usize,
+    redecoded: u64,
+    redecoded_bytes: usize,
+    /// bytes and textures refused per reason (`Refusal::index`)
+    refused: [usize; REFUSALS],
+    refused_count: [u64; REFUSALS],
+}
+
+impl EvictTally {
+    const fn new() -> Self {
+        Self {
+            at: None,
+            evicted: 0,
+            evicted_bytes: 0,
+            redecoded: 0,
+            redecoded_bytes: 0,
+            refused: [0; REFUSALS],
+            refused_count: [0; REFUSALS],
+        }
+    }
+
+    /// `bytes` came back.
+    fn evicted(&mut self, bytes: usize) {
+        self.evicted += 1;
+        self.evicted_bytes = self.evicted_bytes.saturating_add(bytes);
+    }
+
+    /// A texture that was out was decoded again.
+    fn redecoded(&mut self, bytes: usize) {
+        self.redecoded += 1;
+        self.redecoded_bytes = self.redecoded_bytes.saturating_add(bytes);
+    }
+
+    /// `bytes` of a texture's decoded copy stay for `why`.
+    fn refused(&mut self, why: Refusal, bytes: usize) {
+        // (what is out now is the line's own figure, not a refusal)
+        if why == Refusal::Out {
+            return;
+        }
+        self.refused[why.index()] = self.refused[why.index()].saturating_add(bytes);
+        self.refused_count[why.index()] += 1;
+    }
+
+    /// Another pass's counts (a pass tallies on its own and merges here, outside the table's lock).
+    fn merge(&mut self, other: &EvictTally) {
+        self.evicted += other.evicted;
+        self.evicted_bytes = self.evicted_bytes.saturating_add(other.evicted_bytes);
+        self.redecoded += other.redecoded;
+        self.redecoded_bytes = self.redecoded_bytes.saturating_add(other.redecoded_bytes);
+        for i in 0..REFUSALS {
+            self.refused[i] = self.refused[i].saturating_add(other.refused[i]);
+            self.refused_count[i] += other.refused_count[i];
+        }
+    }
+
+    /// The summary line, once every `REPORT_EVERY` and only when something happened: what was let
+    /// go, what came back and what is still out, and the first reason each refused texture stays
+    /// for – the sizes a fix would have to prove before it could take that memory.
+    fn report(&mut self, now: Instant, cap: usize, out: usize) {
+        let Some(at) = self.at else {
+            self.at = Some(now);
+            return;
+        };
+        if now.saturating_duration_since(at) < REPORT_EVERY {
+            return;
+        }
+        if self.evicted == 0 && self.redecoded == 0 && self.refused.iter().all(|&b| b == 0) {
+            self.at = Some(now);
+            return;
+        }
+        let mut refused = String::new();
+        for &why in &Refusal::ALL {
+            let bytes = self.refused[why.index()];
+            if bytes == 0 {
+                continue;
+            }
+            if !refused.is_empty() {
+                refused.push_str(", ");
+            }
+            refused.push_str(&format!("{} MiB {} ({} textures)", bytes >> 20, why.label(), self.refused_count[why.index()]));
+        }
+        if refused.is_empty() {
+            refused.push_str("nothing");
+        }
+        crate::xlog_info!(
+            "D3D12.X: texture tiles: {} let go ({} MiB; {} MiB out now of the {} MiB cap), {} decoded again ({} MiB); refused {refused}",
+            self.evicted, self.evicted_bytes >> 20, out >> 20, cap >> 20, self.redecoded, self.redecoded_bytes >> 20,
+        );
+        self.at = Some(now);
+        self.evicted = 0;
+        self.evicted_bytes = 0;
+        self.redecoded = 0;
+        self.redecoded_bytes = 0;
+        self.refused = [0; REFUSALS];
+        self.refused_count = [0; REFUSALS];
+    }
+}
+
+static EVICT: Mutex<EvictTally> = Mutex::new(EvictTally::new());
+
+/// The decoded tiles of the coldest textures go back to video memory, to be decoded again by the
+/// next upload that publishes them.
+///
+/// It runs in `refresh_once`, before the uploads of the same submit and with `REFRESH` held, so no
+/// submit can come between a decision and the unmapping. Each texture that passes is marked
+/// `evicted` first (from then on the upload path decodes it, and `note_transitions` and
+/// `submitted` mark it `pending`), its tiles are unmapped (`vram::evict_sampled`), and on a refusal
+/// from `vram` the mark is taken back.
+///
+/// A texture's tiles are let go only when all of this holds, checked in `refusal`'s order:
+///
+/// * the title's GPU did not write it (`gpu_written`: the guest pages are stale, the tiles are the
+///   copy);
+/// * no upload or copy is in flight for it, and none of its pages was written this submit;
+/// * it is a placed texture (`vram` then proves it is a *sampled* placement on shared pages);
+/// * it is not the presented plane and not a writeback source;
+/// * its state is `COPY_DEST` (`sampleable`): nothing but a copy into it may touch it, and a copy
+///   into a texture kept in step is noted (`vram::note_gpu_write`: its lazy units go and its pages
+///   become the GPU's, which refuses it here). Every other state can be read by a submission that
+///   records no transition for it, which is exactly what the tree cannot see;
+/// * no live PC command list still holds a transition of it *to a state a shader reads*
+///   (`LIST_NOTES`): a closed list may run again and re-apply that transition – at its submit,
+///   after its GPU work – so that texture can be read without a refresh in between. A list that
+///   only ever transitions it out of a readable state (a streaming refill) does not stop it: the
+///   list that reads it next must transition it back, which is noted and marks it `pending`;
+/// * the free bounds (`free_policy`: `XCL_FREE_AFTER_MS`, `XCL_FREE_AFTER_FRAMES`) are due since
+///   the last upload, transition or GPU write (`Entry::used_now`);
+/// * it fits under `XCL_TEX_EVICT_MB` together with what is out already.
+///
+/// `vram::evict_sampled` proves the rest: pages of its own, not GPU-written, and the submission
+/// that last used the pool completed (`residency::completed`; without the residency tracker that
+/// answer is always "no", so the pass does not run at all).
+fn evict_cold(dirty: &[usize], page: usize) {
+    if !evict_on() || !super::residency::eviction_enabled() {
+        return;
+    }
+    let now = Instant::now();
+    if !due_for_pass(now) {
+        return;
+    }
+    let cold = super::free_policy::wait();
+    let frame = super::free_policy::frame();
+    let cap = cap_bytes();
+    // the transitions to a state a shader reads that live lists recorded: each is applied when its
+    // list is submitted, after that list's GPU work, so the list may run again and read the texture
+    let noted: std::collections::HashSet<usize> = {
+        let g = LIST_NOTES.lock().unwrap();
+        g.values().flatten()
+            .filter(|(_, _, after)| sampleable(std::slice::from_ref(after)))
+            .map(|&(res, _, _)| res)
+            .collect()
+    };
+    let mut go: Vec<(usize, usize)> = Vec::new();
+    let mut tally = EvictTally::new();
+    let mut out: usize;
+    {
+        let mut g = TEXTURES.lock().unwrap();
+        out = g.by_res.values().map(|e| e.evicted_bytes).sum();
+        let keys: Vec<usize> = g.by_res.keys().copied().collect();
+        for res in keys {
+            let Some(e) = g.by_res.get(&res) else { continue };
+            let size = e.tex.size() as usize;
+            let facts = Facts {
+                states: &e.states,
+                pending: e.pending,
+                gpu_written: e.gpu_written,
+                placed: e.placed,
+                evicted: e.evicted,
+                written: written(dirty, page, e.src, size),
+                presented: super::present::is_presented(res),
+                writeback: super::image_writeback::tracks(res),
+                noted: noted.contains(&res),
+                last_used: e.last_used,
+                last_frame: e.last_frame,
+            };
+            let why = refusal(&facts, now, frame, cold);
+            match why {
+                Some(why) => tally.refused(why, size),
+                None if !room(out, size, cap) => tally.refused(Refusal::Cap, size),
+                None => {
+                    if let Some(e) = g.by_res.get_mut(&res) {
+                        e.evicted = true;
+                        out += size;
+                    }
+                    // its texels are not what its last upload left there: the upload that decodes
+                    // it again must not be left out as "the same bytes as at its last upload"
+                    LAST_CONTENT.lock().unwrap().remove(&res);
+                    go.push((res, size));
+                }
+            }
+        }
+    }
+    for (res, size) in go {
+        // a transition applied on another thread since the walk changes the answer: one that is
+        // no longer cold and unreadable stays entirely
+        let still = {
+            let mut g = TEXTURES.lock().unwrap();
+            match g.by_res.get_mut(&res) {
+                Some(e) if !e.pending && !e.gpu_written && !sampleable(&e.states) => true,
+                Some(e) => {
+                    e.evicted = false;
+                    false
+                }
+                None => false,
+            }
+        };
+        if !still {
+            tally.refused(Refusal::Busy, size);
+            continue;
+        }
+        let Some(r) = (unsafe { super::real::reference(res) }) else {
+            if let Some(e) = TEXTURES.lock().unwrap().by_res.get_mut(&res) {
+                e.evicted = false;
+            }
+            tally.refused(Refusal::Busy, size);
+            continue;
+        };
+        match unsafe { super::vram::evict_sampled(&r) } {
+            Ok(bytes) => {
+                if let Some(e) = TEXTURES.lock().unwrap().by_res.get_mut(&res) {
+                    e.evicted_bytes = bytes;
+                }
+                tally.evicted(bytes);
+            }
+            Err(why) => {
+                if let Some(e) = TEXTURES.lock().unwrap().by_res.get_mut(&res) {
+                    e.evicted = false;
+                }
+                let why = match why {
+                    super::vram::EvictRefused::NotOnPages => Refusal::NotOnPages,
+                    super::vram::EvictRefused::NotSampled => Refusal::NotSampled,
+                    super::vram::EvictRefused::Shared => Refusal::Shared,
+                    super::vram::EvictRefused::GpuPage => Refusal::GpuPage,
+                    super::vram::EvictRefused::NoFence => Refusal::NoFence,
+                    super::vram::EvictRefused::Empty => Refusal::Empty,
+                };
+                tally.refused(why, size);
+            }
+        }
+    }
+    let out = TEXTURES.lock().unwrap().by_res.values().map(|e| e.evicted_bytes).sum();
+    let mut g = EVICT.lock().unwrap();
+    g.merge(&tally);
+    g.report(now, cap, out);
 }
 
 /// The textures `texture_gate` held back while the local segment was at its cap, uploaded again
@@ -1713,7 +2235,7 @@ mod tests {
             d[0x24..0x28].copy_from_slice(&1u32.to_le_bytes());
             d[0x2C..0x30].copy_from_slice(&0x105u32.to_le_bytes());
             let tex = Arc::new(xg::Texture::new(&d).unwrap());
-            let mut e = Entry { device: 0, va: at, src: mirror_source(at), in_gpu_view: true, tex, states: vec![D3D12_RESOURCE_STATE_COMMON], pending: false, gpu_written: false, placed: false, unmapped: false, seq: 0 };
+            let mut e = Entry { device: 0, va: at, src: mirror_source(at), in_gpu_view: true, tex, states: vec![D3D12_RESOURCE_STATE_COMMON], pending: false, gpu_written: false, placed: false, unmapped: false, seq: 0, last_used: Instant::now(), last_frame: 0, evicted: false, evicted_bytes: 0 };
             assert_eq!(e.src, cpu + 0x2_0000);
             assert!(!recheck_source(&mut e), "nothing changed yet");
             assert_eq!(kernelx::MapTitlePhysicalPages(at as *mut c_void, 1, 0, 4, pages.as_mut_ptr()) as usize, at);
@@ -1859,7 +2381,7 @@ mod tests {
         assert_eq!(subresource_count(&tex), 6);
         // fake resource / list keys, never dereferenced: GPU-written, so no refresh uploads it
         let (res, other, l1, l2) = (0x7E57_0000_1000usize, 0x7E57_0000_2000usize, 0x7E57_0000_3000usize, 0x7E57_0000_4000usize);
-        TEXTURES.lock().unwrap().insert(res, Entry { device: 0, va: 0x7E57_0000_0000, src: 0x7E57_0000_0000, in_gpu_view: false, tex, states: vec![D3D12_RESOURCE_STATE_COMMON], pending: false, gpu_written: true, placed: false, unmapped: false, seq: 0 });
+        TEXTURES.lock().unwrap().insert(res, Entry { device: 0, va: 0x7E57_0000_0000, src: 0x7E57_0000_0000, in_gpu_view: false, tex, states: vec![D3D12_RESOURCE_STATE_COMMON], pending: false, gpu_written: true, placed: false, unmapped: false, seq: 0, last_used: Instant::now(), last_frame: 0, evicted: false, evicted_bytes: 0 });
         TEXTURES_LEN.fetch_add(1, Ordering::Relaxed);
         let states = || TEXTURES.lock().unwrap().by_res.get(&res).unwrap().states.clone();
         let (p1, p2) = (l1 as *mut c_void, l2 as *mut c_void);
@@ -1937,7 +2459,7 @@ mod tests {
         let va = 0x7E57_0010_0000usize;
         {
             let mut t = TEXTURES.lock().unwrap();
-            t.insert(res, Entry { device: 0, va, src: va, in_gpu_view: false, tex, states: vec![D3D12_RESOURCE_STATE_COMMON], pending: false, gpu_written: true, placed: false, unmapped: false, seq: 0 });
+            t.insert(res, Entry { device: 0, va, src: va, in_gpu_view: false, tex, states: vec![D3D12_RESOURCE_STATE_COMMON], pending: false, gpu_written: true, placed: false, unmapped: false, seq: 0, last_used: Instant::now(), last_frame: 0, evicted: false, evicted_bytes: 0 });
             TEXTURES_LEN.store(t.by_res.len(), Ordering::Relaxed);
         }
         unsafe {
@@ -2014,7 +2536,7 @@ mod tests {
         let va = 0x7E57_0020_0000usize;
         {
             let mut t = TEXTURES.lock().unwrap();
-            t.insert(res, Entry { device: 0, va, src: va, in_gpu_view: false, tex, states: vec![D3D12_RESOURCE_STATE_COMMON], pending: false, gpu_written: true, placed: false, unmapped: false, seq: 0 });
+            t.insert(res, Entry { device: 0, va, src: va, in_gpu_view: false, tex, states: vec![D3D12_RESOURCE_STATE_COMMON], pending: false, gpu_written: true, placed: false, unmapped: false, seq: 0, last_used: Instant::now(), last_frame: 0, evicted: false, evicted_bytes: 0 });
             TEXTURES_LEN.store(t.by_res.len(), Ordering::Relaxed);
         }
         std::thread::scope(|s| {
@@ -2141,6 +2663,10 @@ mod tests {
             placed,
             unmapped: false,
             seq: 0,
+            last_used: Instant::now(),
+            last_frame: 0,
+            evicted: false,
+            evicted_bytes: 0,
         };
         let mut tbl = Table::new();
         // Two adjacent placed 16 KiB textures + one placed 64 KiB texture after them.
@@ -2192,6 +2718,7 @@ mod tests {
         let entry = |gpus: bool| Entry {
             device: 0, va: 0x30_4000, src: 0x30_4000, in_gpu_view: false, tex: Arc::clone(&tex), states: vec![D3D12_RESOURCE_STATE_COMMON],
             pending: !gpus, gpu_written: gpus, placed: true, unmapped: false, seq: 0,
+            last_used: Instant::now(), last_frame: 0, evicted: false, evicted_bytes: 0,
         };
         let mut tbl = Table::new();
         assert_eq!(tbl.insert(1, entry(true)), (0, vec![]));
@@ -2719,5 +3246,184 @@ mod tests {
             mutator.join().unwrap();
             VirtualFree(base as *mut c_void, 0, MEM_RELEASE);
         }
+    }
+
+    /// The decoded tiles of a texture may go only in a state a shader cannot read without a
+    /// transition the tree would see: `COPY_DEST` alone. Everything else – the shader-visible
+    /// states, `COMMON` (D3D12 promotes implicitly), a copy source, a resolve – can be read by a
+    /// submission that records no transition for the texture, so it keeps its tiles. An entry with
+    /// no state at all (it never has one) is taken as readable.
+    #[test]
+    fn only_a_copy_dest_texture_can_lose_its_decoded_tiles() {
+        for state in [
+            D3D12_RESOURCE_STATE_COMMON,
+            D3D12_RESOURCE_STATE_GENERIC_READ,
+            D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER,
+            D3D12_RESOURCE_STATE_INDEX_BUFFER,
+            D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
+            D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+            D3D12_RESOURCE_STATE_ALL_SHADER_RESOURCE,
+            D3D12_RESOURCE_STATE_COPY_SOURCE,
+            D3D12_RESOURCE_STATE_RESOLVE_SOURCE,
+            D3D12_RESOURCE_STATE_RESOLVE_DEST,
+            D3D12_RESOURCE_STATE_RENDER_TARGET,
+            D3D12_RESOURCE_STATE_DEPTH_WRITE,
+            D3D12_RESOURCE_STATE_DEPTH_READ,
+            D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+            D3D12_RESOURCE_STATE_PRESENT,
+        ] {
+            assert!(sampleable(&[state]), "{state:?} can be read without a transition");
+        }
+        assert!(!sampleable(&[D3D12_RESOURCE_STATE_COPY_DEST]), "nothing but a copy into it may touch it");
+        assert!(!sampleable(&[D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COPY_DEST]));
+        // one subresource in a readable state is enough for the whole texture to stay
+        assert!(sampleable(&[D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE]));
+        assert!(sampleable(&[]), "no state is no proof that it cannot be read");
+    }
+
+    const COPY: [D3D12_RESOURCE_STATES; 1] = [D3D12_RESOURCE_STATE_COPY_DEST];
+    const READ: [D3D12_RESOURCE_STATES; 1] = [D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE];
+
+    /// A texture that may go: cold for ten seconds by both bounds in `eviction_keeps_the_picture`,
+    /// not written this submit, placed, in `COPY_DEST`, in no live list's transition.
+    fn cold(now: Instant) -> Facts<'static> {
+        Facts {
+            states: &COPY,
+            pending: false,
+            gpu_written: false,
+            placed: true,
+            evicted: false,
+            written: false,
+            presented: false,
+            writeback: false,
+            noted: false,
+            last_used: now - Duration::from_secs(10),
+            last_frame: 0,
+        }
+    }
+
+    /// Every fact that must stop an eviction does, before the texture's age is looked at: the
+    /// bytes the GPU wrote, a copy or upload in flight, a placement that is not the decoded copy,
+    /// the presented plane, a writeback source, a state a shader can read without a transition, and
+    /// a live list that could run its transition again.
+    #[test]
+    fn eviction_keeps_the_picture_and_counts_the_age_last() {
+        let now = Instant::now();
+        let wait = super::super::free_policy::Wait { frames: 2, idle: Duration::from_millis(2000) };
+        let frame = 100u64;
+        assert_eq!(refusal(&cold(now), now, frame, wait), None, "cold in COPY_DEST and held by nothing: it may go");
+
+        let refused = |change: &dyn Fn(&mut Facts)| refusal(&{ let mut f = cold(now); change(&mut f); f }, now, frame, wait);
+        assert_eq!(refused(&|f| f.gpu_written = true), Some(Refusal::GpuWritten), "the tiles are the only copy");
+        assert_eq!(refused(&|f| f.gpu_written = true), Some(Refusal::GpuWritten), "and it outranks the rest");
+        assert_eq!(refused(&|f| { f.gpu_written = true; f.noted = true; f.pending = true; }), Some(Refusal::GpuWritten));
+        assert_eq!(refused(&|f| f.evicted = true), Some(Refusal::Out));
+        assert_eq!(refused(&|f| f.pending = true), Some(Refusal::Busy));
+        assert_eq!(refused(&|f| f.written = true), Some(Refusal::Busy), "a copy into it this submit");
+        assert_eq!(refused(&|f| f.placed = false), Some(Refusal::NotOnPages));
+        assert_eq!(refused(&|f| f.presented = true), Some(Refusal::Presented));
+        assert_eq!(refused(&|f| f.writeback = true), Some(Refusal::Writeback));
+        assert_eq!(refused(&|f| f.states = &READ), Some(Refusal::Sampleable));
+        assert_eq!(refused(&|f| f.noted = true), Some(Refusal::Noted));
+        // the bounds: both must pass (free_policy::Wait::due)
+        assert_eq!(refused(&|f| f.last_used = now - Duration::from_millis(1999)), Some(Refusal::NotDue));
+        assert_eq!(refused(&|f| f.last_used = now - Duration::from_millis(2000)), None);
+        assert_eq!(refused(&|f| f.last_frame = 99), Some(Refusal::NotDue), "two frames without use, or none");
+        assert_eq!(refused(&|f| f.last_frame = 98), None);
+    }
+
+    /// The cap is `XCL_TEX_EVICT_MB` (1536 MiB), a typo is the default and not a small cap, 0 is no
+    /// room at all, and what is out counts against it.
+    #[test]
+    fn the_cap_is_the_switch_and_what_is_out_counts_against_it() {
+        assert_eq!(cap_limit(None), 1536 << 20);
+        assert_eq!(cap_limit(Some("256")), 256 << 20);
+        assert_eq!(cap_limit(Some(" 64 ")), 64 << 20);
+        assert_eq!(cap_limit(Some("0")), 0);
+        assert_eq!(cap_limit(Some("soon")), 1536 << 20);
+        assert_eq!(cap_limit(Some("18446744073709551615")), usize::MAX / 2);
+        assert!(room(0, 1 << 20, 2 << 20) && room(1 << 20, 1 << 20, 2 << 20));
+        assert!(!room(1 << 20, (1 << 20) + 1, 2 << 20));
+        assert!(!room(0, 1, 0), "a cap of 0 lets nothing go");
+    }
+
+    /// Every reason has its own counter, and `ALL` is in the order the pass checks them.
+    #[test]
+    fn every_refusal_has_its_own_counter() {
+        assert_eq!(Refusal::ALL.len(), REFUSALS);
+        for (i, &why) in Refusal::ALL.iter().enumerate() {
+            assert_eq!(why.index(), i, "{why:?} is counted where a tally expects it");
+        }
+    }
+
+    /// The summary counts both directions: what was let go and what was decoded again; what is out
+    /// now is the line's own figure and not a refusal.
+    #[test]
+    fn the_summary_counts_what_was_let_go_and_what_came_back() {
+        let mut a = EvictTally::new();
+        a.evicted(1 << 20);
+        a.evicted(2 << 20);
+        a.redecoded(1 << 20);
+        a.refused(Refusal::Sampleable, 4 << 20);
+        a.refused(Refusal::Out, 8 << 20);
+        let mut b = EvictTally::new();
+        b.refused(Refusal::Sampleable, 2 << 20);
+        b.refused(Refusal::NotDue, 1 << 20);
+        a.merge(&b);
+        assert_eq!((a.evicted, a.evicted_bytes, a.redecoded, a.redecoded_bytes), (2, 3 << 20, 1, 1 << 20));
+        assert_eq!(a.refused[Refusal::Sampleable.index()], 6 << 20);
+        assert_eq!(a.refused_count[Refusal::Sampleable.index()], 2);
+        assert_eq!(a.refused[Refusal::NotDue.index()], 1 << 20);
+        assert_eq!(a.refused[Refusal::Out.index()], 0, "out now is the line's own figure");
+        assert_eq!(a.refused_count[Refusal::Out.index()], 0);
+    }
+
+    /// A texture whose tiles were let go is decoded again before the submit that reads it: the
+    /// recording of a transition marks it pending (the upload of the same submit decodes it), and
+    /// so does a list that runs again with a transition it recorded.
+    #[test]
+    fn a_texture_whose_tiles_were_let_go_is_decoded_before_the_submit_that_reads_it() {
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let d = console_desc(3, 64, 64, 1, 1, 28, 0x105);
+        let tex = Arc::new(xg::Texture::new(&d).unwrap());
+        // fake resource and list keys, never dereferenced: not placed, so nothing unmaps it
+        let (res, list) = (0x7E57_0000_5000usize, 0x7E57_0000_6000usize);
+        {
+            let mut t = TEXTURES.lock().unwrap();
+            t.insert(res, Entry {
+                device: 0,
+                va: 0x7E57_0000_7000,
+                src: 0x7E57_0000_7000,
+                in_gpu_view: false,
+                tex,
+                states: vec![D3D12_RESOURCE_STATE_COPY_DEST],
+                pending: false,
+                gpu_written: false,
+                placed: false,
+                unmapped: false,
+                seq: 0,
+                last_used: Instant::now(),
+                last_frame: 0,
+                evicted: true,
+                evicted_bytes: 0x4000,
+            });
+            TEXTURES_LEN.fetch_add(1, Ordering::Relaxed);
+        }
+        let pending = || TEXTURES.lock().unwrap().by_res.get(&res).is_some_and(|e| e.pending);
+        assert!(!pending(), "out of video memory, not being uploaded");
+        note_transitions(list, &[(res, ALL, SRV)]);
+        assert!(pending(), "the list that will read it is recorded first: the upload decodes it");
+        // (the upload cleared the mark and the pending count; the same list runs again)
+        {
+            let mut t = TEXTURES.lock().unwrap();
+            let e = t.by_res.get_mut(&res).unwrap();
+            e.pending = false;
+            e.evicted = true;
+        }
+        PENDING.fetch_sub(1, Ordering::Relaxed);
+        submitted(&[list as *mut c_void]);
+        assert!(pending(), "a closed list that runs again re-applies its transition: a use too");
+        list_reset(list);
+        forget(res);
     }
 }

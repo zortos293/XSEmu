@@ -107,7 +107,7 @@ pub(super) fn packed(c: &Container, native: &crate::native::NativeProgram, p: &i
         if lanes % 64 != 0 && !cfg.thread_limits {
             return Err(refused("a group that ends inside a console wave, packed without the thread limits"));
         }
-        lower::claim_dword(lanes, cs.lds_bytes() / 4).map_err(refused)?;
+        lower::thread_base(cs.threads, cs.lds_bytes() / 4, lower::flat_thread_base()).map_err(refused)?;
         let st = structure::structure(p)?;
         let wide = (0..p.blocks.len()).filter(|&b| st.wave_any.get(b).copied().flatten().is_some()).collect();
         let st = structure::structure_wide(p, &wide)?;

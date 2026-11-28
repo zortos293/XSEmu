@@ -89,9 +89,8 @@ pub(super) struct Packed {
     other: Half,
     /// Console threads in a group.
     group: u32,
-    /// With more than one console wave in a group: the LDS dword the host waves take their
-    /// console threads from.
-    claim: Option<u32>,
+    /// How each host wave finds the first console thread of its console wave.
+    thread_base: ThreadBase,
     /// The host lane, and the first console thread of this host wave, made in the entry block.
     host_lane: Option<V>,
     base: Option<V>,
@@ -121,6 +120,74 @@ pub(in super::super) fn claim_dword(group: u32, lds_dwords: u32) -> Result<Optio
     Ok(Some(lds_dwords))
 }
 
+/// Whether a one-dimensional group of more than one console wave takes its console threads
+/// from the host thread index instead of from the LDS counter (`XCL_CGBJ_PACKED_THREAD_BASE=1`).
+/// `SV_GroupThreadID.x` of the 1-D host group is the host wave's place in the group and the
+/// thread's place in that wave, so console thread `t + 32 * (t >> 5)` needs no counter and no
+/// LDS ([`ThreadBase::Flat`]). Read under an `XCL_` name first and the binding's own
+/// `VICTORY_` name second, both collected into the translation fingerprint, so cached
+/// containers follow the setting.
+pub(in super::super) fn flat_thread_base() -> bool {
+    #[cfg(test)]
+    if let Some(on) = TEST_FLAT_BASE.get() {
+        return on;
+    }
+    switch_on("XCL_CGBJ_PACKED_THREAD_BASE") || switch_on("VICTORY_XCL_PACKED_THREAD_BASE")
+}
+
+#[cfg(test)]
+thread_local! {
+    /// A test's setting of [`flat_thread_base`], for its thread only (the process's is the
+    /// variable, which tests must not set under one another).
+    pub(in super::super) static TEST_FLAT_BASE: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+    /// The same for [`f64_sum`].
+    pub(in super::super) static TEST_F64_SUM: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+/// Whether a switch is on: the variable set to `1`.
+fn switch_on(name: &str) -> bool {
+    std::env::var_os(name).is_some_and(|v| v == "1")
+}
+
+/// The refusal of a wave sum of 64-bit floats while [`f64_sum`] is off.
+pub(in super::super) const F64_SUM: Why = "a wave sum of 64-bit floats in the packed form";
+
+/// Whether the packed form lowers a whole-wave sum of 64-bit floats
+/// (`XCL_CGBJ_PACKED_F64_SUM=1`) instead of refusing it ([`Lower::p_shape`]). Read under an
+/// `XCL_` name first and the binding's own `VICTORY_` name second, both collected into the
+/// translation fingerprint, so cached containers follow the setting.
+pub(in super::super) fn f64_sum() -> bool {
+    #[cfg(test)]
+    if let Some(on) = TEST_F64_SUM.get() {
+        return on;
+    }
+    switch_on("XCL_CGBJ_PACKED_F64_SUM") || switch_on("VICTORY_XCL_PACKED_F64_SUM")
+}
+
+/// Where a host wave of a group finds the first console thread of its console wave.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(in super::super) struct ThreadBase {
+    /// The LDS dword of the counter the host waves take their turns on, for a group of more
+    /// than one console wave whose console threads do not follow the host thread index.
+    pub claim: Option<u32>,
+    /// Whether the console thread follows the host thread index ([`flat_thread_base`], a
+    /// one-dimensional group): console thread `t + 32 * (t >> 5)`, so the base is
+    /// `64 * (t >> 5)`.
+    pub flat: bool,
+}
+
+/// How a group of `threads` threads finds each host wave's console thread: the host thread
+/// index in a one-dimensional group when `flat` is on and the group is more than one console
+/// wave, else the counter dword [`claim_dword`] gives. Pure, for testing.
+pub(in super::super) fn thread_base(threads: [u32; 3], lds_dwords: u32, flat: bool) -> Result<ThreadBase, Why> {
+    let group = threads.iter().product::<u32>();
+    if group > 64 && flat && threads[1] == 1 && threads[2] == 1 {
+        return Ok(ThreadBase { claim: None, flat: true });
+    }
+    let claim = claim_dword(group, lds_dwords)?;
+    Ok(ThreadBase { claim, flat: false })
+}
+
 /// What [`Lower::section_inst`] says of a value it does not know.
 const UNKNOWN: Why = "a whole-wave section step the simulation does not follow";
 
@@ -137,15 +204,15 @@ impl<'a> Lower<'a> {
         self.console_lanes = true;
         self.s.wave_size = Some(32);
         self.s.host_threads = Some([group.div_ceil(64) * 32, 1, 1]);
-        let claim = claim_dword(group, self.s.lds_dwords).expect("emit::xcl::packed refuses a group whose claim dword does not fit");
-        if claim.is_some() {
+        let base = thread_base(cs.threads, self.s.lds_dwords, flat_thread_base()).expect("emit::xcl::packed refuses a group whose thread base does not fit");
+        if base.claim.is_some() {
             self.s.lds_dwords += 1;
         }
         self.packed = Some(Box::new(Packed {
             half: 0,
             other: Half::default(),
             group,
-            claim,
+            thread_base: base,
             host_lane: None,
             base: None,
             lanes: [None; 2],
@@ -258,35 +325,46 @@ impl<'a> Lower<'a> {
         self.s.m.bin(self.cur, Bin::And, lane, k31)
     }
 
-    /// The first console thread of this host wave: 0 with one console wave in a group, else
-    /// the next 64 from an LDS counter, which is CGBJ's `wave_base` with steps of 64. Every
-    /// thread zeroes the counter, the group meets, and each host wave's first lane adds 64.
+    /// The first console thread of this host wave: the host thread's console wave
+    /// (`64 * (t >> 5)`) where the group is one-dimensional and
+    /// [`flat_thread_base`] is on, 0 with one console wave in a group, else the next 64 from
+    /// an LDS counter, which is CGBJ's `wave_base` with steps of 64. Every thread zeroes the
+    /// counter, the group meets, and each host wave's first lane adds 64.
     /// In the entry block, which every thread runs.
     fn p_base(&mut self) -> V {
         if let Some(v) = self.pk().base {
             return v;
         }
-        let Some(slot) = self.pk().claim else {
-            let z = self.s.m.i32(0);
-            self.pk().base = Some(z);
-            return z;
+        let e = self.s.entry;
+        if let Some(slot) = self.pk().thread_base.claim {
+            let lds = self.s.lds();
+            let k = self.s.m.i32(slot);
+            let ptr = self.s.m.element(e, lds, k);
+            let zero = self.s.m.i32(0);
+            self.s.m.store(e, ptr, zero);
+            self.group_sync(e);
+            let lane = self.p_host_lane_index();
+            let first = self.s.m.cmp(e, pred::EQ, lane, zero);
+            let k64 = self.s.m.i32(64);
+            let add = self.s.m.select(e, first, k64, zero);
+            let ptr = self.s.m.element(e, lds, k);
+            let old = self.s.m.atomic(e, super::super::bitcode::Rmw::Add, ptr, add);
+            let base = self.s.op(e, "waveReadLaneFirst.i32", Attr::NoUnwind, self.s.t.i32, 118, &[old]);
+            self.pk().base = Some(base);
+            return base;
+        }
+        let v = if self.pk().thread_base.flat {
+            // console thread = t + 32 * (t >> 5), and the halves' lanes add 0 and 32 to the base
+            let Val::I32(t) = self.compute_id("threadIdInGroup.i32", 95, 0) else { unreachable!() };
+            let k5 = self.s.m.i32(5);
+            let wave = self.s.m.bin(e, Bin::LShr, t, k5);
+            let k64 = self.s.m.i32(64);
+            self.s.m.bin(e, Bin::Mul, wave, k64)
+        } else {
+            self.s.m.i32(0)
         };
-        let (e, i32t) = (self.s.entry, self.s.t.i32);
-        let lds = self.s.lds();
-        let k = self.s.m.i32(slot);
-        let ptr = self.s.m.element(e, lds, k);
-        let zero = self.s.m.i32(0);
-        self.s.m.store(e, ptr, zero);
-        self.group_sync(e);
-        let lane = self.p_host_lane_index();
-        let first = self.s.m.cmp(e, pred::EQ, lane, zero);
-        let k64 = self.s.m.i32(64);
-        let add = self.s.m.select(e, first, k64, zero);
-        let ptr = self.s.m.element(e, lds, k);
-        let old = self.s.m.atomic(e, super::super::bitcode::Rmw::Add, ptr, add);
-        let base = self.s.op(e, "waveReadLaneFirst.i32", Attr::NoUnwind, i32t, 118, &[old]);
-        self.pk().base = Some(base);
-        base
+        self.pk().base = Some(v);
+        v
     }
 
     /// The console thread in the group of the half being lowered.
@@ -630,8 +708,39 @@ impl<'a> Lower<'a> {
                 Ok((r, r))
             }
             Shape::Prefix(op, src, mask, ident, inclusive) => self.p_prefix(op, src, mask, ident, inclusive),
-            Shape::ActiveF64(..) => Err("a wave sum of 64-bit floats in the packed form"),
+            Shape::ActiveF64(lo, hi, mask, high) => {
+                if !f64_sum() {
+                    return Err(F64_SUM);
+                }
+                let v = self.p_f64_sum(lo, hi, mask, high)?;
+                Ok((v, v))
+            }
         }
+    }
+
+    /// `Shape::ActiveF64`: the sum of the console lanes' `mask ? f64(lo, hi) : 0.0`, returning
+    /// the low (`!high`) or high (`high`) 32-bit word. One wave operation per half, then one
+    /// add of the two halves: the split form's tree (`Lower::active_f64_sum`), so the two forms'
+    /// results are the same bits. Adding each host lane's two console lanes first would be
+    /// another tree.
+    fn p_f64_sum(&mut self, lo: Value, hi: Value, mask: Value, high: bool) -> Result<V, Why> {
+        // per half: the two words of its lanes' masked terms
+        let (lower, upper) = self.p_halves(|l| Ok((l.p_masked(lo, mask, 0)?, l.p_masked(hi, mask, 0)?)))?;
+        seen("wave sum of 64-bit floats");
+        self.s.flags |= flags::WAVE_OPS | flags::DOUBLES;
+        let (i32t, f64t) = (self.s.t.i32, self.s.m.double());
+        let c = self.cur;
+        let sum = |l: &mut Self, lo: V, hi: V| {
+            let x = l.s.op(c, "makeDouble.f64", Attr::ReadNone, f64t, 101, &[lo, hi]);
+            let (k0, k0b) = (l.s.m.i8(0), l.s.m.i8(0));
+            l.s.op(c, "waveActiveOp.f64", Attr::NoUnwind, f64t, 119, &[x, k0, k0b])
+        };
+        let lower = sum(self, lower.0, lower.1);
+        let upper = sum(self, upper.0, upper.1);
+        let total = self.s.m.bin(c, Bin::Add, lower, upper);
+        let split_ty = self.s.m.named_struct("dx.types.splitdouble", vec![i32t, i32t]);
+        let split = self.s.op(c, "splitDouble.f64", Attr::ReadNone, split_ty, 102, &[total]);
+        Ok(self.s.m.extract(c, split, u32::from(high)))
     }
 
     /// The lane's own `mask ? src : ident` in the half being lowered.

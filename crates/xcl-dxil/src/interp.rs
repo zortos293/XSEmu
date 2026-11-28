@@ -58,11 +58,17 @@ pub struct Config {
     /// programs of a pair, so they must still agree, but a run no longer shows what the
     /// program computes on a GPU.
     pub force_ballots: bool,
+    /// Lanes of each wave that start live, the lowest ones; None: all of them. A wave with
+    /// fewer live lanes than it has is a partial launch (a primitive's edge in a pixel
+    /// shader): the other lanes never run, and their registers keep what the run started
+    /// them with. What a GPU leaves in a lane it did not launch is undefined, so a program
+    /// that reads one has no defined result there; this shows what it reads.
+    pub live: Option<u32>,
 }
 
 impl Default for Config {
     fn default() -> Config {
-        Config { groups: 1, budget: 1 << 31, force_ballots: true }
+        Config { groups: 1, budget: 1 << 31, force_ballots: true, live: None }
     }
 }
 
@@ -110,7 +116,7 @@ pub fn run_input(p: &Program, input: &Input, cfg: &Config, trace: bool) -> (Run,
     let budget = if cfg.budget == 0 { u64::MAX } else { cfg.budget };
     math::take_nan_open();
     for g in 0..cfg.groups {
-        let mut group = exec::Group::new(p, &mut world, [g, 0, 0], budget.saturating_sub(steps));
+        let mut group = exec::Group::new(p, &mut world, [g, 0, 0], budget.saturating_sub(steps), cfg.live);
         let result = group.run();
         steps += group.steps;
         ub |= group.ub;

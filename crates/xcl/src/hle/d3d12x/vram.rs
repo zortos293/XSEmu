@@ -1954,6 +1954,111 @@ pub(super) unsafe fn note_content(res: &ID3D12Resource, texels: &[bool]) -> bool
     held_back > 0
 }
 
+/// Why a sampled texture's decoded tiles could not be let go (`evict_sampled`).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(super) enum EvictRefused {
+    /// no tiled placement of it is mapped (`Pages::targets`): an arena, a slab, a resource of its
+    /// own, or one a placement over it unmapped
+    NotOnPages,
+    /// placed as the GPU's (a render target, a depth buffer or a UAV texture), not as a sampled
+    /// texture with memory only where it has texels
+    NotSampled,
+    /// another target stands on one of its pages: the tiles are that target's too
+    Shared,
+    /// one of its pages is GPU-written: what a texture on it shows there is the GPU's bytes
+    GpuPage,
+    /// the submission that last used the pool could not be shown to have completed (without the
+    /// residency tracker `completed` proves nothing, and it says so)
+    NoFence,
+    /// no tile under it: nothing to give back
+    Empty,
+}
+
+/// The decoded tiles of the sampled texture `res` let go: every tile unmapped and its page given
+/// back to the pool at once (not kept `IDLE` for the next placement at that address), and the
+/// pool's next queue work ordered after the unmapping (`pages.value`, as every mapping here is).
+///
+/// What must hold, all of it checked here because only this module knows it:
+///
+/// * `res` is a sampled placement on `Pages` with tiles of its own (`Target::sampled` and
+///   `Target::wanted`: `note_content` maps memory only under the units that have texels);
+/// * every page under those tiles is this texture's alone (`Page::users` is 1: no other target
+///   stands on it, so no other consumer holds the tiles) and not GPU-written (`Page::gpu`: what a
+///   texture on such a page shows is the GPU's bytes, which no decoded copy can rebuild);
+/// * the submission that last used the pool holding them has completed – `residency::completed`
+///   on that pool's heap, the fence this tree already keeps. A submission that names the texture
+///   is linked to the heaps its tiles stand in (`link_pages`), and an opaque submission
+///   (`note_list_untracked`, every draw) blocks the answer until its fence signals, so this is
+///   "no GPU work at all is in flight" whenever what the frame does is unknown.
+///
+/// The caller proves the rest: the title's GPU did not write it (`title_textures::Entry::
+/// gpu_written`), it is not a target, display or writeback source, it is cold for the free bounds
+/// and it is in a state a shader cannot read without a transition the tree would see
+/// (`title_textures::sampleable`). What it reads afterwards is what a texture with no tile under
+/// it reads: zero, until an upload maps the tiles of its texels again (`vram::note_content`).
+pub(super) unsafe fn evict_sampled(res: &ID3D12Resource) -> Result<usize, EvictRefused> {
+    let key = res.as_raw() as usize;
+    let Some(dev) = device_of(res) else { return Err(EvictRefused::NotOnPages) };
+    let mut g = PAGES.lock().unwrap();
+    let Some(Some(pages)) = g.get_mut(&(dev.as_raw() as usize)) else { return Err(EvictRefused::NotOnPages) };
+    let Some(mut t) = pages.targets.remove(&key) else { return Err(EvictRefused::NotOnPages) };
+    let done = evict_tiles(pages, res, &mut t);
+    pages.targets.insert(key, t);
+    done
+}
+
+/// `evict_sampled`'s body, with `t` taken out of `pages.targets` (the caller puts it back).
+unsafe fn evict_tiles(pages: &mut Pages, res: &ID3D12Resource, t: &mut Target) -> Result<usize, EvictRefused> {
+    if !t.mapped {
+        return Err(EvictRefused::NotOnPages);
+    }
+    // (a copy into it, a render into it or a UAV bind took its lazy units away: `note_gpu_write`)
+    if !t.sampled || t.wanted.is_none() {
+        return Err(EvictRefused::NotSampled);
+    }
+    let mut bytes = 0usize;
+    let mut heaps: Vec<u32> = Vec::new();
+    for i in 0..t.total as usize {
+        let Some(tile) = t.held[i] else { continue };
+        let Some(page) = pages.page(t.key(i)) else { continue };
+        if page.users > 1 {
+            return Err(EvictRefused::Shared);
+        }
+        if page.gpu {
+            return Err(EvictRefused::GpuPage);
+        }
+        bytes += PAGE;
+        if !heaps.contains(&tile.0) {
+            heaps.push(tile.0);
+        }
+    }
+    if bytes == 0 {
+        return Err(EvictRefused::Empty);
+    }
+    for h in &heaps {
+        let Some(pool) = pages.pools.get(*h as usize).and_then(Option::as_ref) else { return Err(EvictRefused::NoFence) };
+        if !super::residency::completed(pool.heap.as_raw() as usize) {
+            return Err(EvictRefused::NoFence);
+        }
+    }
+    let used = Used::now();
+    for u in 0..t.units.len() {
+        let range = t.tiles(u);
+        if t.held[range.clone()].iter().all(Option::is_none) {
+            continue;
+        }
+        let unit = t.units[u];
+        pages.unmap_unit(res, unit);
+        pages.release(t, range, used, true);
+    }
+    pages.value += 1;
+    let _ = pages.queue.Signal(&pages.fence, pages.value);
+    // the tiles are the pool's again: `XCL_PLACED_CACHE_MB` may give back the heaps that hold
+    // nothing now (that is what moves DXGI's local usage, not the tiles alone)
+    pages.trim();
+    Ok(bytes)
+}
+
 /// The title's GPU work writes `resource` (a copy or a resolve into it): a sampled texture on
 /// pages has memory under every tile from here on, as a render target has.
 pub(super) unsafe fn note_gpu_write(resource: usize) {
@@ -2163,19 +2268,31 @@ pub(super) unsafe fn link_pages() {
     }
 }
 
+/// The tests that touch a device, its pages or its arenas share that state: they run one at
+/// a time, whichever module they live in (`gpu::recomp`'s sparse test takes it too, because
+/// it opens the same vram windows). `vram::tests` holds it for every test, so a test that
+/// counts device memory cannot see another test's pages appear or go.
 #[cfg(test)]
-pub(super) static VRAM_TEST_LOCK: Mutex<()> = Mutex::new(());
+pub(crate) static VRAM_TEST_LOCK: Mutex<()> = Mutex::new(());
 
-/// (tests) The pages of `device` that no resource uses go back to the pools now, not after
-/// `IDLE`: a test that counts the device's pages (`page_bytes_for`) starts from those in use.
-/// Tests of one adapter share its device, and the pages an earlier test left idle are swept
-/// while the next one counts – in a run one test at a time, 2 s later: its count fell below
-/// where it started.
+/// (tests) The one way to take `VRAM_TEST_LOCK`.
+#[cfg(test)]
+pub(crate) fn serial() -> std::sync::MutexGuard<'static, ()> {
+    VRAM_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// (tests) The pages and arenas of `device` that no resource uses go back now, not after
+/// `IDLE`: a test that counts the device's memory (`page_bytes_for`, `arena_bytes`) starts
+/// from what is in use. Tests of one adapter share its device, and the memory an earlier test
+/// left idle is swept while the next one counts – in a run one test at a time, 2 s later: its
+/// count fell below where it started.
 #[cfg(test)]
 pub(super) fn sweep_idle_now(device: usize) {
-    let mut g = PAGES.lock().unwrap();
-    let Some(Some(p)) = g.get_mut(&device) else { return };
-    p.sweep(std::time::Instant::now() + super::free_policy::wait().idle);
+    let now = std::time::Instant::now() + super::free_policy::wait().idle;
+    if let Some(Some(p)) = PAGES.lock().unwrap().get_mut(&device) {
+        p.sweep(now);
+    }
+    drop(ARENAS.lock().unwrap().sweep(now));
 }
 
 #[cfg(test)]
@@ -3000,6 +3117,7 @@ mod tests {
     /// One call per heap: its tiles in runs, the other heaps' skipped.
     #[test]
     fn tile_ranges_per_heap() {
+        let _serial = super::serial();
         let tiles = [(0, 5), (0, 6), (1, 0), (1, 1), (0, 9), (0, 10), (0, 11)].map(Some);
         assert_eq!(heap_ranges(0, &tiles), [(true, 5, 2), (false, 0, 2), (true, 9, 3)]);
         assert_eq!(heap_ranges(1, &tiles), [(false, 0, 2), (true, 0, 2), (false, 0, 3)]);
@@ -3013,6 +3131,7 @@ mod tests {
     /// its packed mips; a texture whose mips cannot be told apart is one unit (and its tail).
     #[test]
     fn units_are_mips_when_the_tiling_tells_them_apart() {
+        let _serial = super::serial();
         // 1024x1024 BC7, 9 mips: 16 + 4 + 1 standard tiles, 6 packed mips in 1 tile
         let t = Tiling { total: 22, single_slice: true, standard_mips: 3, packed_mips: 6, packed_tiles: 1, packed_start: 21 };
         let per_mip = [Unit { sub: 0, start: 0, count: 16 }, Unit { sub: 1, start: 16, count: 4 }, Unit { sub: 2, start: 20, count: 1 }, Unit { sub: 3, start: 21, count: 1 }];
@@ -3042,6 +3161,7 @@ mod tests {
     /// free again `COOL` after the last resource went, and an empty slab's heap goes.
     #[test]
     fn small_textures_take_slots_of_shared_slabs() {
+        let _serial = super::serial();
         let t0 = Instant::now();
         let at = |ms: u64| t0 + Duration::from_millis(ms);
         let mut made = 0u32;
@@ -3087,6 +3207,7 @@ mod tests {
     /// page at each of them: 4 000 000 000 looks).
     #[test]
     fn idle_pages_are_swept_from_their_queue() {
+        let _serial = super::serial();
         use std::collections::{HashMap, VecDeque};
         let t0 = Instant::now();
         let at = |ms: u64| t0 + Duration::from_millis(ms);
@@ -3141,6 +3262,7 @@ mod tests {
     /// frames since its last target, and goes once it has – even with the time bound long past.
     #[test]
     fn a_frame_bound_keeps_a_page_the_title_may_make_again() {
+        let _serial = super::serial();
         use std::collections::{HashMap, VecDeque};
         let t0 = Instant::now();
         let wait = free_policy::Wait { frames: 3, idle: Duration::from_millis(100) };
@@ -3161,6 +3283,7 @@ mod tests {
     /// number is no bound (unset: off, as before).
     #[test]
     fn the_cache_cap_is_mebibytes_or_off() {
+        let _serial = super::serial();
         assert_eq!(cap_of(None), None);
         assert_eq!(cap_of(Some("")), None);
         assert_eq!(cap_of(Some("256")), Some(256 << 20));
@@ -3176,6 +3299,7 @@ mod tests {
     /// only, until the free bytes fit the cap: 64 MiB a pool (`POOL_PAGES` of 64 KiB).
     #[test]
     fn the_cache_bound_gives_back_the_coldest_pools_until_it_fits() {
+        let _serial = super::serial();
         let pool = |index: u32, last_used: u64, held: bool, system: bool| Cached { index, last_used, held, system, cooled: true };
         let mib = |n: usize| n << 20;
         let all = [pool(0, 10, false, false), pool(1, 40, false, false), pool(2, 20, false, false), pool(3, 30, false, false)];
@@ -3200,6 +3324,7 @@ mod tests {
     /// the cache bound are the tiles no page holds – the ones a giveback takes with the heap.
     #[test]
     fn a_pools_cache_is_its_tiles_no_page_holds() {
+        let _serial = super::serial();
         let held = |p: u32| (POOL_PAGES - p) as usize * PAGE;
         assert_eq!(held(0), POOL_BYTES, "nothing on it: the whole heap is cache");
         assert_eq!(held(POOL_PAGES), 0, "every tile on a page: none of it is");
@@ -3210,6 +3335,7 @@ mod tests {
     /// non-overlapping ranges never share an owned page even when only 4 KiB aligned.
     #[test]
     fn owned_pages_never_alias_disjoint_ranges() {
+        let _serial = super::serial();
         assert_eq!(owned_pages(0x1_0000, Some(0x1_0000), 4), Some((0x1_0000, 1)));
         assert_eq!(owned_pages(0x1_0000, Some(0x1_4000), 4), Some((0x1_0000, 2)));
         assert_eq!(owned_pages(0x1_4000, Some(0x4000), 4), Some((0x2_0000, 0)));
@@ -3245,6 +3371,7 @@ mod tests {
 
     #[test]
     fn compact_neighbors_and_overlaps_use_one_64k_heap() {
+        let _serial = super::serial();
         let mut arenas = Arenas::new();
         let now = Instant::now();
         let base = 0x8_0000;
@@ -3264,6 +3391,7 @@ mod tests {
 
     #[test]
     fn compact_alias_cannot_split_live_content() {
+        let _serial = super::serial();
         let mut arenas = Arenas::new();
         let now = Instant::now();
         let base = 0x8_0000;
@@ -3285,6 +3413,7 @@ mod tests {
 
     #[test]
     fn placement_reservations_only_conflict_on_shared_device_pages() {
+        let _serial = super::serial();
         let same_page = PendingPlacement::enter(0, SMALL, 2 * SMALL);
         let next_page = PendingPlacement::enter(0, PAGE, PAGE + SMALL);
         let other_device = PendingPlacement::enter(1, SMALL, 2 * SMALL);
@@ -3296,6 +3425,7 @@ mod tests {
 
     #[test]
     fn known_suballocations_share_the_enclosing_page_only_if_their_extent_fits() {
+        let _serial = super::serial();
         let page = 8 * PAGE;
         let a = Placement::new(page + SMALL, SMALL, SMALL, None).unwrap();
         let b = Placement::new(page + 2 * SMALL, SMALL, SMALL, None).unwrap();
@@ -3307,6 +3437,7 @@ mod tests {
 
     #[test]
     fn compact_host_overlap_cannot_turn_disjoint_title_ranges_into_aliases() {
+        let _serial = super::serial();
         let mut arenas = Arenas::new();
         let now = Instant::now();
         let first = Placement::new(0x8_0000, 2 * SMALL, SMALL, Some(SMALL as u64)).unwrap();
@@ -3320,6 +3451,7 @@ mod tests {
 
     #[test]
     fn an_arena_is_shared_at_its_addresses_and_otherwise_its_placements_size() {
+        let _serial = super::serial();
         let (t, a0) = (Instant::now(), 0x1_0000_0000);
         let mut a = Arenas::new();
         let first = take(&mut a, a0, 70 * MIB, PAGE, t);
@@ -3338,6 +3470,7 @@ mod tests {
 
     #[test]
     fn an_arena_no_resource_uses_goes_after_two_seconds() {
+        let _serial = super::serial();
         let (t, a0) = (Instant::now(), 0x1_0000_0000);
         let mut a = Arenas::new();
         let p = Placement::new(a0, 70 * MIB, PAGE, None).unwrap();
@@ -3355,6 +3488,7 @@ mod tests {
     /// device or another alignment is not that class.
     #[test]
     fn a_released_arena_heap_is_reused_before_a_new_one_is_made() {
+        let _serial = super::serial();
         let (t, a0, cap) = (Instant::now(), 0x1_0000_0000, 256 * MIB);
         let mut a = Arenas::new();
         let mut made = 0u32;
@@ -3388,6 +3522,7 @@ mod tests {
     /// returned for the caller to let go of, and a block larger than the cap is never kept.
     #[test]
     fn the_pool_cap_pushes_the_oldest_heap_out() {
+        let _serial = super::serial();
         let (t, a0) = (Instant::now(), 0x1_0000_0000);
         let mut a = Arenas::new();
         let mut made = 0u32;
@@ -3417,6 +3552,7 @@ mod tests {
     /// placement no shape is told of (`XCL_TEXTURE_ALIAS=0`) goes by its addresses alone.
     #[test]
     fn a_placement_of_another_shape_at_an_address_gets_an_arena_of_its_own() {
+        let _serial = super::serial();
         let (t, a0) = (Instant::now(), 0x1_0000_0000);
         let mut a = Arenas::new();
         let take = |a: &mut Arenas<u32>, va: usize, bytes: usize, shape: u64| {
@@ -3459,6 +3595,7 @@ mod tests {
     /// they go, and then there is room again.
     #[test]
     fn a_split_arena_is_made_within_the_budget_and_shared_by_address_past_it() {
+        let _serial = super::serial();
         let (t, a0, budget) = (Instant::now(), 0x1_0000_0000, 6 * MIB);
         let mut a = Arenas::new();
         let take = |a: &mut Arenas<u32>, bytes: usize, shape: u64| {
@@ -3503,6 +3640,7 @@ mod tests {
     /// the split takes no arena from it.
     #[test]
     fn a_small_placement_over_targets_of_two_shapes_is_refused_as_before() {
+        let _serial = super::serial();
         let (t, a0) = (Instant::now(), 0x1_0000_0000);
         for (shapes, arenas) in [((7, 9), 2), ((0, 0), 1)] {
             let mut a = Arenas::new();
@@ -3520,6 +3658,7 @@ mod tests {
     /// target: to another target on those tiles while there is one, else it is to be unmapped.
     #[test]
     fn a_kept_texture_goes_with_its_target() {
+        let _serial = super::serial();
         let mut kept = Kept::default();
         kept.tie(1, 10);
         kept.tie(1, 11);
@@ -3544,6 +3683,7 @@ mod tests {
     /// other tiles does not, and a texture released while it waits is forgotten.
     #[test]
     fn a_waiting_texture_is_kept_with_the_next_target_on_its_tiles() {
+        let _serial = super::serial();
         let mut kept = Kept::default();
         for view in [10, 11, 12] {
             kept.tie(1, view);
@@ -3570,6 +3710,7 @@ mod tests {
     /// many times the tiles the console has pages for it.
     #[test]
     fn textures_on_one_address_agree_on_their_pages() {
+        let _serial = super::serial();
         assert_eq!(peer_own(&[]), None);
         assert_eq!(peer_own(&[(false, 14)]), Some(14));
         assert_eq!(peer_own(&[(false, 14), (true, 15), (true, 16)]), Some(15));
@@ -3590,6 +3731,7 @@ mod tests {
     /// shares by address is, nor one of another class.
     #[test]
     fn a_target_kept_apart_stands_on_pages_of_its_own() {
+        let _serial = super::serial();
         let target = |own, apart| Target {
             va: 0x10_4000, shape: (0, 0, 0, 0, 0), console_bytes: Some(0x3_0000), total: 4, mapped: true, first: 0x11_0000, own,
             held: vec![None; 4], units: vec![Unit { sub: 0, start: 0, count: 4 }], per_mip: false, wanted: None, sampled: false, grid: None, apart,
@@ -3612,6 +3754,7 @@ mod tests {
     /// nothing.
     #[test]
     fn the_alias_census_counts_shared_target_tiles() {
+        let _serial = super::serial();
         let page = |tile: u32, users: u32| Page { tile: (0, tile), users, idle: None, gpu: true };
         let pages = std::collections::HashMap::from([
             (0x11_0000, page(1, 2)),
@@ -3649,6 +3792,7 @@ mod tests {
     /// straddled arenas into growing unions while the old ones lived on (15 GB in 2 s).
     #[test]
     fn streamed_targets_stay_bounded() {
+        let _serial = super::serial();
         const S: usize = 64 * MIB; // a 3840x2160 D32S8, rounded
         const K: usize = 8; // targets a round
         const SPAN: usize = 3584 * MIB;
@@ -3681,13 +3825,13 @@ mod tests {
 
     #[test]
     fn compact_gpu_textures_share_an_arena_without_neighbor_crosstalk() {
+        let _serial = super::serial();
         use std::mem::ManuallyDrop;
         use crate::gpu::texture::{self, Subresource};
         use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0;
         use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_SAMPLE_DESC};
         use windows::Win32::Graphics::Dxgi::{CreateDXGIFactory1, DXGI_ADAPTER_FLAG_SOFTWARE, IDXGIFactory4};
 
-        let _guard = VRAM_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         unsafe {
             let factory: IDXGIFactory4 = CreateDXGIFactory1().expect("DXGI factory");
             let Ok(adapter) = factory.EnumAdapters1(0) else { return };
@@ -3714,6 +3858,7 @@ mod tests {
             let base = uma.reserve(PAGE, PAGE).expect("small texture reservation") as usize;
             let va = base + SMALL;
             super::super::real::adopt(dev.as_raw(), super::super::real::Kind::Device);
+            super::sweep_idle_now(dev.as_raw() as usize);
             let riid = &ID3D12Resource::IID as *const windows::core::GUID as *const windows_sys::core::GUID;
             let state = D3D12_RESOURCE_STATE_COMMON;
             let place_at = |va| {
@@ -3771,7 +3916,7 @@ mod tests {
     /// hardware adapter (skips on WARP); the texels are compared where the targets are on pages.
     #[test]
     fn targets_of_another_layout_at_an_address_get_memory_of_their_own() {
-        let _vram_guard = VRAM_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _serial = super::serial();
         use crate::gpu::texture::{self, Subresource};
         use super::super::texture_alias::Memory;
         use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0;
@@ -3790,6 +3935,7 @@ mod tests {
                 return;
             }
             super::super::real::adopt(dev.as_raw(), super::super::real::Kind::Device);
+            super::sweep_idle_now(dev.as_raw() as usize);
             let riid = &ID3D12Resource::IID as *const windows::core::GUID as *const windows_sys::core::GUID;
             let state = D3D12_RESOURCE_STATE_COMMON;
             let va = 0x5_A11A_0000usize;
@@ -3847,7 +3993,7 @@ mod tests {
     /// arenas no target uses go. Needs a hardware adapter (skips on WARP).
     #[test]
     fn d32s8_targets_take_their_own_size_of_video_memory() {
-        let _vram_guard = VRAM_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _serial = super::serial();
         use windows::core::Interface;
         use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0;
         use windows::Win32::Graphics::Dxgi::Common::*;
@@ -3862,6 +4008,7 @@ mod tests {
             let _ = D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_11_0, &mut dev);
             let Some(dev) = dev.filter(|d| tier2(d)) else { return };
             super::super::real::adopt(dev.as_raw(), super::super::real::Kind::Device);
+            super::sweep_idle_now(dev.as_raw() as usize);
             let memory: IDXGIAdapter3 = adapter.cast().unwrap();
             let local = || {
                 let mut i = DXGI_QUERY_VIDEO_MEMORY_INFO::default();

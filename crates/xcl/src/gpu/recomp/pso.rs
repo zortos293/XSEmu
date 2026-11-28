@@ -273,6 +273,9 @@ mod translated {
         // two passes, which is other HLSL and another pipeline at run time, so its containers must
         // not be read as the two-pass ones
         let nan = if super::mesh_multi_wave() { format!("{nan}\0mesh-multi-wave") } else { nan };
+        // `XCL_UPPER_LANES_REDUCTION=1` reads a whole-wave reduction as a wave operation
+        // (`upper_reduce`): other HLSL, so its containers must not be read as the folded ones
+        let nan = if super::super::upper_reduce::on() { format!("{nan}\0upper-lanes-reduction") } else { nan };
         if legacy {
             return identity_for(&format!("{base:016x}"), &format!("{nan}\0loop-guard={guard}\0trip-counters={trip_counters}\0loop-profile={profile}\0static-loop-cap={static_cap}\0legacy-compute-wave64"));
         }

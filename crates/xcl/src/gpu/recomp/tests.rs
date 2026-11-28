@@ -5918,6 +5918,7 @@ fn gpu_uma_import_check_at_init() {
 #[test]
 fn gpu_sparse_vram_descriptors_buffers_and_xmem() {
     use windows::core::Interface;
+    let _serial = crate::hle::d3d12x::vram::serial();
     use windows::Win32::Graphics::Direct3D12::*;
 
     if !gpu_ready() {

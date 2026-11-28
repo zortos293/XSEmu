@@ -92,6 +92,7 @@ mod loop_guard_tests;
 #[cfg(test)]
 mod lane_independent_tests;
 pub mod upper_lanes;
+mod upper_reduce;
 mod loop_profile;
 mod lds_start;
 mod structure;
@@ -103,6 +104,10 @@ mod lane_independent_form_tests;
 mod d16_tests;
 #[cfg(test)]
 mod lds_start_tests;
+#[cfg(test)]
+mod upper_reduce_tests;
+#[cfg(test)]
+mod wave64_reduce_corpus_tests;
 #[cfg(test)]
 mod loop_skip_tests;
 pub use loop_profile::{loop_profile_enabled, LOOP_PROFILE_SITES, LOOP_PROFILE_WORDS};
@@ -2268,6 +2273,12 @@ fn emit_program_with(program: &DecodedProgram<'_>, opt: &Options, kept: kept_pag
     // program with a read to change gets the form
     if opt.wave64 && opt.split_wave64 && matches!(opt.mode, Mode::Vertex(_) | Mode::Pixel(_)) {
         let a = upper_lanes::analyze(insts);
+        // `XCL_UPPER_LANES_REDUCTION`: a whole-wave reduction as a wave operation over the
+        // lanes the wave runs (`upper_reduce`)
+        em.upper_reduce = if upper_reduce::on() { upper_reduce::plan(insts, &a, &leaders) } else { Default::default() };
+        if !em.upper_reduce.is_empty() {
+            upper_reduce::note(em.upper_reduce.reds.len());
+        }
         if a.reads.values().any(|r| matches!(r, upper_lanes::Read::Const(_) | upper_lanes::Read::Shadow)) {
             em.upper = Some(a);
         }

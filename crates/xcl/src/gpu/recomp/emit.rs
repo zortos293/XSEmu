@@ -72,6 +72,9 @@ pub(super) struct Em {
     /// wave64 VS / PS on a GPU with 32-lane waves only: what the console's lanes 32..63 hold
     /// where the program reads them (`upper_lanes`), used when the wave has 32 lanes
     pub upper: Option<super::upper_lanes::UpperLanes>,
+    /// `XCL_UPPER_LANES_REDUCTION`: the program's whole-wave reductions, each read as a wave
+    /// operation over the lanes the wave runs (`upper_reduce`)
+    pub upper_reduce: super::upper_reduce::Plan,
     /// pc of the instruction being emitted
     cur_pc: u64,
     /// the program addresses the data in its code region (`Options::code_data`): an
@@ -1368,6 +1371,7 @@ impl Em {
             cur_loose: Vec::new(),
             quad_reads: quad_reads(),
             upper: None,
+            upper_reduce: Default::default(),
             cur_pc: 0,
             code_loads: false,
             static_ss: BTreeMap::new(),
@@ -2157,6 +2161,12 @@ impl Em {
         self.cur_pc = d.pc;
         let (start, indent, ended) = (self.out.len(), self.indent, self.blocks_ended);
         let flow = self.inst_body(d, next);
+        // `XCL_UPPER_LANES_REDUCTION`: the seed of a whole-wave reduction, kept for its read
+        // (the fold overwrites its register)
+        if let Some(&i) = self.upper_reduce.seeds.get(&d.pc) {
+            let (name, v) = (self.upper_reduce.name(i), self.vreg(self.upper_reduce.reds[i].vgpr));
+            self.line(&format!("uint {name} = {v};"));
+        }
         self.drop_page_groups(d);
         if let Some(record) = &mut self.kept_record {
             // text after the instruction's runs whenever the instruction did: not after a branch,
@@ -5450,6 +5460,13 @@ impl Em {
                 return Ok(());
             }
             "v_readlane_b32" => {
+                // `XCL_UPPER_LANES_REDUCTION`: lane 0 of a recognised whole-wave reduction is
+                // the reduction over the lanes the wave runs (`upper_reduce`)
+                if let Some(&i) = self.upper_reduce.sites.get(&d.pc) {
+                    let value = self.upper_reduce.reds[i].op.expr(&self.upper_reduce.name(i));
+                    self.write32(&dst, &value);
+                    return Ok(());
+                }
                 let t = self.t();
                 let rla = self.rla_uniform_fn();
                 if self.packed_wave() {
