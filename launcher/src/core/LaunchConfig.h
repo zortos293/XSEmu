@@ -1,5 +1,7 @@
 #pragma once
 
+#include "GraphicsPreset.h"
+
 #include <QProcessEnvironment>
 #include <QString>
 #include <QVariantMap>
@@ -12,7 +14,9 @@ class AppSettings;
 // profile naming one wins over its xcl.toml key. Precedence for an xcl.toml key: the
 // game's own launcher override (AppSettings::gameOverrides(titleId), keyed by the xcl.toml key name),
 // else the launcher default from Settings, else whatever the title's xcl.toml already says.
-// device_type always has a launcher default (lockhart, Series S).
+// device_type always has a launcher default (lockhart, Series S). A quality preset adds
+// XCL_UPSCALER/XCL_DLSS_MODE to the environment and title_memory_mb to the xcl.toml values; a run
+// profile line naming a switch wins over the preset.
 //
 //   LaunchConfig::prepareTitle(settings, game.titleId());   // before XSEmu.exe run
 //   env = LaunchConfig::runEnvironment(QProcessEnvironment::systemEnvironment(), settings, game.titleId());
@@ -28,6 +32,9 @@ const QList<XclKey>& xclKeys(); // device_type first
 
 // Converts a stored value (QSettings returns strings from the ini) to the key's TOML type.
 QVariant typed(const QString& tomlKey, const QVariant& value);
+
+// The quality preset chosen for a game (its "qualityPreset" per-game override); nullptr for Clear.
+const GraphicsPreset::Preset* qualityPreset(const AppSettings& settings, const QString& titleId);
 
 // The values to write into the title's xcl.toml before it starts (tested).
 QVariantMap titleValues(const AppSettings& settings, const QString& titleId);

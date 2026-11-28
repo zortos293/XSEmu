@@ -4,6 +4,7 @@
 // Kelvaroq) is never embedded: it keeps its own window and the floating bar follows it.
 #include "DevFixtures.h"
 #include "EmulatorController.h"
+#include "LaunchConfig.h"
 #include "Library.h"
 #include "Runner.h"
 #include "RunnerManager.h"
@@ -14,6 +15,8 @@
 #include "shell/LaunchErrors.h"
 #include "shell/MainWindow.h"
 #include "theme/Theme.h"
+#include "widgets/SegmentedControl.h"
+#include "widgets/Text.h"
 
 #include <QAbstractButton>
 #include <QApplication>
@@ -43,6 +46,8 @@ private slots:
     void crashScreen();
     void xsemuWarmupIsOff();
     void warmupFailureOffersContinueAndPlay();
+    void qualityPresetsShowAndApply();
+    void qualityPresetsOffWithoutCore();
 
 private:
     QAbstractButton* button(const char* name) const;
@@ -423,6 +428,92 @@ void TestInGame::warmupFailureOffersContinueAndPlay()
     QVERIFY2(m_s->warmup.progress().full, "the idle Continue kept the pass the stop belonged to");
     m_s->warmup.cancel();
     QTRY_VERIFY_WITH_TIMEOUT(!m_s->warmup.isActive(), 20000);
+}
+
+// The quality preset row of Per-game overrides: choosing one stores it, shows what it sets, and
+// hands LaunchConfig the two switches and the title budget; Default takes both back.
+void TestInGame::qualityPresetsShowAndApply()
+{
+    qputenv("XSEMU_QUALITY_PRESETS", "1"); // the test stands in for a Core that reads the switches
+    const Game garden = fixtureGame(QStringLiteral("Signal Garden"));
+    QTRY_VERIFY_WITH_TIMEOUT(m_s->library.game(garden.titleId()).isValid(), 10000);
+    m_w->showGameDetails(garden);
+    QApplication::processEvents();
+
+    SegmentedControl* preset = nullptr;
+    for (SegmentedControl* seg : m_w->gameDetailsPage()->findChildren<SegmentedControl*>()) {
+        if (seg->items().contains(QStringLiteral("Quality")))
+            preset = seg;
+    }
+    QVERIFY2(preset, "Game details has a quality preset row");
+    QCOMPARE(preset->currentIndex(), 0);
+
+    const QString id = garden.titleId();
+    preset->setCurrentIndex(1); // Quality
+    QTRY_COMPARE(m_s->settings.gameOverrides(id).value(QStringLiteral("qualityPreset")).toString(), QStringLiteral("quality"));
+    QCOMPARE(LaunchConfig::titleValues(m_s->settings, id).value(QStringLiteral("title_memory_mb")).toLongLong(), 8192);
+    const QProcessEnvironment env = LaunchConfig::runEnvironment(QProcessEnvironment(), m_s->settings, id);
+    QCOMPARE(env.value(QStringLiteral("XCL_UPSCALER")), QStringLiteral("dlss"));
+    QCOMPARE(env.value(QStringLiteral("XCL_DLSS_MODE")), QStringLiteral("quality"));
+    QString note;
+    for (const Label* label : m_w->gameDetailsPage()->findChildren<Label*>()) {
+        if (label->text().contains(QStringLiteral("XCL_DLSS_MODE=quality")))
+            note = label->text();
+    }
+    QVERIFY2(!note.isEmpty(), "the active preset names the switches it sets");
+
+    preset->setCurrentIndex(0); // Default (blit)
+    QTRY_VERIFY(!m_s->settings.gameOverrides(id).contains(QStringLiteral("qualityPreset")));
+    // the budget the preset wrote goes back to the standard one
+    QTRY_COMPARE(m_s->settings.gameOverrides(id).value(QStringLiteral("title_memory_mb")).toLongLong(), 0);
+    QCOMPARE(LaunchConfig::titleValues(m_s->settings, id).value(QStringLiteral("title_memory_mb")).toLongLong(), 0);
+    QVERIFY(!LaunchConfig::runEnvironment(QProcessEnvironment(), m_s->settings, id).contains(QStringLiteral("XCL_UPSCALER")));
+    QVERIFY(!LaunchConfig::runEnvironment(QProcessEnvironment(), m_s->settings, id).contains(QStringLiteral("XCL_DLSS_MODE")));
+    QString cleared;
+    for (const Label* label : m_w->gameDetailsPage()->findChildren<Label*>()) {
+        if (label->text().contains(QStringLiteral("XCL_UPSCALER and XCL_DLSS_MODE unset")))
+            cleared = label->text();
+    }
+    QVERIFY2(!cleared.isEmpty(), "Default says the switches are unset");
+
+    // Use defaults takes the preset, and the budget it wrote, with everything else
+    preset->setCurrentIndex(2); // Balanced
+    QTRY_COMPARE(m_s->settings.gameOverrides(id).value(QStringLiteral("qualityPreset")).toString(), QStringLiteral("balanced"));
+    QAbstractButton* reset = nullptr;
+    for (QAbstractButton* b : m_w->gameDetailsPage()->findChildren<QAbstractButton*>()) {
+        if (b->isVisibleTo(m_w->gameDetailsPage()) && b->text() == QLatin1String("Use defaults"))
+            reset = b;
+    }
+    QVERIFY2(reset, "Per-game overrides has a Use defaults button");
+    reset->click();
+    QTRY_VERIFY(!m_s->settings.gameOverrides(id).contains(QStringLiteral("qualityPreset")));
+    QTRY_COMPARE(m_s->settings.gameOverrides(id).value(QStringLiteral("title_memory_mb")).toLongLong(), 0);
+    QVERIFY(!LaunchConfig::runEnvironment(QProcessEnvironment(), m_s->settings, id).contains(QStringLiteral("XCL_DLSS_MODE")));
+    qunsetenv("XSEMU_QUALITY_PRESETS");
+}
+
+// No Core build reads XCL_UPSCALER or XCL_DLSS_MODE, so the row is disabled and a stored choice
+// applies neither switch nor a smaller title budget.
+void TestInGame::qualityPresetsOffWithoutCore()
+{
+    qunsetenv("XSEMU_QUALITY_PRESETS");
+    const Game garden = fixtureGame(QStringLiteral("Signal Garden"));
+    QTRY_VERIFY_WITH_TIMEOUT(m_s->library.game(garden.titleId()).isValid(), 10000);
+    const QString id = garden.titleId();
+    m_s->settings.setGameOverride(id, QStringLiteral("qualityPreset"), QStringLiteral("performance"));
+    m_w->showGameDetails(garden);
+    QApplication::processEvents();
+
+    SegmentedControl* preset = nullptr;
+    for (SegmentedControl* seg : m_w->gameDetailsPage()->findChildren<SegmentedControl*>()) {
+        if (seg->items().contains(QStringLiteral("Quality")))
+            preset = seg;
+    }
+    QVERIFY2(preset, "Game details has a quality preset row");
+    QVERIFY2(!preset->isEnabled(), "the row stays off until Core reads the switches");
+    QVERIFY(!LaunchConfig::qualityPreset(m_s->settings, id));
+    QVERIFY(!LaunchConfig::runEnvironment(QProcessEnvironment(), m_s->settings, id).contains(QStringLiteral("XCL_UPSCALER")));
+    QVERIFY(!LaunchConfig::titleValues(m_s->settings, id).contains(QStringLiteral("title_memory_mb")));
 }
 
 int main(int argc, char** argv)

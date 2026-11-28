@@ -7,6 +7,7 @@
 #include <QCryptographicHash>
 #include <QDir>
 #include <QHash>
+#include <QMap>
 #include <QRegularExpression>
 
 namespace {
@@ -66,6 +67,13 @@ QVariant typed(const QString& tomlKey, const QVariant& value)
     return value;
 }
 
+const GraphicsPreset::Preset* qualityPreset(const AppSettings& settings, const QString& titleId)
+{
+    if (!GraphicsPreset::supported())
+        return nullptr;
+    return GraphicsPreset::find(settings.gameOverrides(titleId).value(QStringLiteral("qualityPreset")).toString());
+}
+
 QVariantMap titleValues(const AppSettings& settings, const QString& titleId)
 {
     const QVariantMap overrides = settings.gameOverrides(titleId);
@@ -78,6 +86,17 @@ QVariantMap titleValues(const AppSettings& settings, const QString& titleId)
         if (v.isValid())
             out.insert(key, typed(key, v));
     }
+    // The preset's title budget, unless the game or Settings names one itself; Clear's reset (0,
+    // the device's standard budget) is an override like any other, so it is written too.
+    QVariant budget = overrides.value(QStringLiteral("title_memory_mb"));
+    if (!budget.isValid())
+        budget = settings.xclDefault(QStringLiteral("title_memory_mb"));
+    if (!budget.isValid()) {
+        if (const GraphicsPreset::Preset* preset = qualityPreset(settings, titleId))
+            budget = preset->titleMemoryMb;
+    }
+    if (budget.isValid())
+        out.insert(QStringLiteral("title_memory_mb"), budget.toLongLong());
     return out;
 }
 
@@ -168,6 +187,11 @@ QStringList runProfile(const AppSettings& settings, const QString& titleId)
 QProcessEnvironment runEnvironment(const QProcessEnvironment& base, const AppSettings& settings, const QString& titleId)
 {
     QProcessEnvironment env = base;
+    // the preset goes under the run profile: a profile line naming a switch is the more specific choice
+    if (const GraphicsPreset::Preset* preset = qualityPreset(settings, titleId)) {
+        for (const auto& [key, value] : GraphicsPreset::environment(*preset))
+            env.insert(key, value);
+    }
     for (const auto& [key, value] : parseProfile(runProfile(settings, titleId).join(QLatin1Char('\n'))).entries) {
         if (settingOwning(key).isEmpty())
             env.insert(key, value);
@@ -190,13 +214,21 @@ QProcessEnvironment runEnvironment(const QProcessEnvironment& base, const AppSet
 
 QString profileIdentity(const AppSettings& settings, const QString& titleId)
 {
-    QStringList applied;
+    // Keyed, so a run profile line replacing a preset's switch leaves one entry: the identity changes
+    // only when the environment XSEmu gets changes.
+    QMap<QString, QString> applied;
+    if (const GraphicsPreset::Preset* preset = qualityPreset(settings, titleId)) {
+        for (const auto& [key, value] : GraphicsPreset::environment(*preset))
+            applied.insert(key, value);
+    }
     for (const auto& [key, value] : parseProfile(runProfile(settings, titleId).join(QLatin1Char('\n'))).entries) {
         if (settingOwning(key).isEmpty())
-            applied << key + QLatin1Char('=') + value;
+            applied.insert(key, value);
     }
-    applied.sort();
-    return QString::fromLatin1(QCryptographicHash::hash(applied.join(QLatin1Char('\n')).toUtf8(), QCryptographicHash::Sha1).toHex().left(16));
+    QStringList lines;
+    for (auto it = applied.cbegin(); it != applied.cend(); ++it)
+        lines << it.key() + QLatin1Char('=') + it.value();
+    return QString::fromLatin1(QCryptographicHash::hash(lines.join(QLatin1Char('\n')).toUtf8(), QCryptographicHash::Sha1).toHex().left(16));
 }
 
 QString environmentOverride(const AppSettings& settings, const QString& variable)

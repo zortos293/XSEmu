@@ -9,6 +9,7 @@
 #include "app/Services.h"
 #include "core/EmulatorBuild.h"
 #include "core/Format.h"
+#include "core/GraphicsPreset.h"
 #include "core/LaunchConfig.h"
 #include "core/Paths.h"
 #include "core/ShaderCacheInfo.h"
@@ -347,12 +348,31 @@ namespace {
 // " XCL_DISPLAY_MODE in the run profile wins over Display mode.": XSEmu reads these variables over xcl.toml.
 QString profileWins(const AppSettings& settings, const QString& titleId)
 {
-    const QHash<QString, QString> rows{{QStringLiteral("XCL_DISPLAY_MODE"), QStringLiteral("Display mode")}, {QStringLiteral("XCL_RAYTRACING"), QStringLiteral("Raytracing")}};
+    const QHash<QString, QString> rows{{QStringLiteral("XCL_DISPLAY_MODE"), QStringLiteral("Display mode")},
+                                       {QStringLiteral("XCL_RAYTRACING"), QStringLiteral("Raytracing")},
+                                       {QStringLiteral("XCL_UPSCALER"), QStringLiteral("the quality preset")},
+                                       {QStringLiteral("XCL_DLSS_MODE"), QStringLiteral("the quality preset")}};
     QString out;
     for (const auto& e : LaunchConfig::parseProfile(LaunchConfig::runProfile(settings, titleId).join(QLatin1Char('\n'))).entries) {
         if (rows.contains(e.first))
             out += QStringLiteral(" %1 in the run profile wins over %2.").arg(e.first, rows.value(e.first));
     }
+    return out;
+}
+
+QStringList qualityPresetLabels()
+{
+    QStringList out{QStringLiteral("Default (blit)")};
+    for (const GraphicsPreset::Preset& preset : GraphicsPreset::all())
+        out << preset.label;
+    return out;
+}
+
+QVariantList qualityPresetValues()
+{
+    QVariantList out{QVariant()};
+    for (const GraphicsPreset::Preset& preset : GraphicsPreset::all())
+        out << preset.key;
     return out;
 }
 
@@ -875,6 +895,7 @@ void GameDetailsPage::refreshOverrides()
         {QStringLiteral("raytracing"), QStringLiteral("Raytracing"),
          {QStringLiteral("Default"), QStringLiteral("Tier 1.1"), QStringLiteral("Tier 1.0"), QStringLiteral("Off")},
          {QVariant(), QStringLiteral("tier1_1"), QStringLiteral("tier1_0"), QStringLiteral("off")}, QStringLiteral("auto")},
+        {QStringLiteral("qualityPreset"), QStringLiteral("Quality preset"), qualityPresetLabels(), qualityPresetValues(), {}, true, GraphicsPreset::supported()},
         {QStringLiteral("keyboard_mouse"), QStringLiteral("Keyboard & mouse"), {QStringLiteral("Default"), QStringLiteral("On"), QStringLiteral("Off")},
          {QVariant(), true, false}, true},
         {QStringLiteral("mouse_sensitivity"), QStringLiteral("Mouse speed"),
@@ -918,6 +939,10 @@ void GameDetailsPage::refreshOverrides()
             if (!spec.backed) {
                 seg->setEnabled(false);
                 note = new Label(QStringLiteral("Not in this XSEmu Core build yet"), Label::Style::Caption, Theme::Role::Text3);
+            } else if (spec.key == QLatin1String("qualityPreset")) {
+                note = new Label({}, Label::Style::Caption, Theme::Role::Text3);
+                note->setWordWrap(true);
+                m_presetNote = note;
             }
             const QString tip = spec.launcherSide ? QString() : QStringLiteral("%1 in xcl.toml").arg(spec.key);
             m_overrides->addRow(spec.label, seg, note, {}, Qt::AlignLeft)->setToolTip(tip);
@@ -929,10 +954,24 @@ void GameDetailsPage::refreshOverrides()
                 connect(seg, &SegmentedControl::currentChanged, this, [this, key, values](int index) {
                     if (index >= values.size())
                         return;
-                    if (index == 0)
-                        m_s.settings.clearGameOverride(m_game.titleId(), key);
-                    else
-                        m_s.settings.setGameOverride(m_game.titleId(), key, values[index]);
+                    const QString titleId = m_game.titleId();
+                    if (key == QLatin1String("qualityPreset")) {
+                        // Clear puts the standard title budget back when a preset wrote one;
+                        // choosing a preset drops that reset so the preset's number applies.
+                        const bool hadPreset = m_s.settings.gameOverrides(titleId).contains(key);
+                        if (index == 0) {
+                            m_s.settings.clearGameOverride(titleId, key);
+                            if (hadPreset)
+                                m_s.settings.setGameOverride(titleId, QStringLiteral("title_memory_mb"), 0);
+                        } else {
+                            m_s.settings.clearGameOverride(titleId, QStringLiteral("title_memory_mb"));
+                            m_s.settings.setGameOverride(titleId, key, values[index]);
+                        }
+                    } else if (index == 0) {
+                        m_s.settings.clearGameOverride(titleId, key);
+                    } else {
+                        m_s.settings.setGameOverride(titleId, key, values[index]);
+                    }
                     QTimer::singleShot(0, this, &GameDetailsPage::refreshOverrides);
                 });
             }
@@ -944,6 +983,13 @@ void GameDetailsPage::refreshOverrides()
         seg->setCurrentIndex(current);
     }
 
+    if (m_presetNote) {
+        if (const GraphicsPreset::Preset* preset = GraphicsPreset::find(chosen.value(QStringLiteral("qualityPreset")).toString()))
+            m_presetNote->setText(QStringLiteral("XCL_UPSCALER=dlss · XCL_DLSS_MODE=%1 · title memory %2 MB").arg(preset->dlssMode).arg(preset->titleMemoryMb));
+        else
+            m_presetNote->setText(QStringLiteral("XCL_UPSCALER and XCL_DLSS_MODE unset"));
+    }
+
     if (build) {
         m_overrideCount = new Label({}, Label::Style::Caption, Theme::Role::Text3);
         m_overrideReset = new Button(QStringLiteral("Use defaults"), Button::Variant::Link, Button::Size::Tiny);
@@ -953,8 +999,12 @@ void GameDetailsPage::refreshOverrides()
                 keys << spec.key;
         }
         connect(m_overrideReset, &Button::clicked, this, [this, keys] {
+            const QString titleId = m_game.titleId();
+            const bool hadPreset = m_s.settings.gameOverrides(titleId).contains(QStringLiteral("qualityPreset"));
             for (const QString& k : keys)
-                m_s.settings.clearGameOverride(m_game.titleId(), k);
+                m_s.settings.clearGameOverride(titleId, k);
+            if (hadPreset)
+                m_s.settings.setGameOverride(titleId, QStringLiteral("title_memory_mb"), 0);
             QTimer::singleShot(0, this, &GameDetailsPage::refreshOverrides);
         });
         m_overrides->setTrailing({m_overrideCount, m_overrideReset});
@@ -966,7 +1016,7 @@ void GameDetailsPage::refreshOverrides()
     const RunnerSpec& runner = m_s.emulator.runnerFor(m_game);
     m_overridesNote->setText(playingThis ? QStringLiteral("Changes apply the next time %1 starts.").arg(m_game.title())
                                          : runner.isBuiltIn()
-                                         ? QStringLiteral("Console, display mode, raytracing, keyboard and mouse and log level are written to %1 when the game starts.%2")
+                                         ? QStringLiteral("These choices apply when the game starts. Console, display mode, raytracing, keyboard and mouse and log level go into %1; the quality preset also sets the launch environment.%2")
                                                .arg(QDir::toNativeSeparators(tomlPath), profileWins(m_s.settings, id))
                                          : QStringLiteral("%1 gets the console when the game starts; the other choices apply when it runs with XSEmu Core.").arg(runner.name));
 }
